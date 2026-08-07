@@ -1,6 +1,11 @@
 # YB-GO-Script-i
 
-适配 [YYB-Go-Enhanced](https://github.com/525815266/YYB-Go-Enhanced) 的青龙脚本仓库。
+首先感谢以下两个项目的作者：
+
+- 感谢 [525815266/YYB-Go-Enhanced](https://github.com/525815266/YYB-Go-Enhanced) 作者提供应用宝协议服务增强版，以及微信账号管理和 `wx.login` code 获取能力。
+- 感谢 [SuperNaiBA/YYB-GO-Script](https://github.com/SuperNaiBA/YYB-GO-Script) 作者提供 YYB Go 青龙适配脚本及仓库订阅范例。
+
+本项目是 **YYB-GO-Script 项目的脚本补充**，沿用其 `YYB_SERVER` 配置与青龙订阅方式，为 YYB-Go-Enhanced 补充更多可直接在青龙面板运行的脚本。
 
 当前包含：
 
