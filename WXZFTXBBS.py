@@ -118,7 +118,7 @@ class AutoTask:
             return [self.dict_keys_to_lower(i) for i in obj]
         else:
             return obj
-        
+
     def hide_phone(self, phone):
         """
         隐藏手机号中间4位
@@ -138,7 +138,7 @@ class AutoTask:
         proxy = response.text
         self.log(f"[获取代理] {proxy}")
         return proxy
-    
+
     def check_proxy(self, proxy, session):
         """
         检查代理
@@ -180,7 +180,7 @@ class AutoTask:
         except Exception as e:
             self.log(f"[检查环境变量] 发生错误: {str(e)}\n{traceback.format_exc()}", level="error")
             raise
-        
+
     def save_account_info(self, account_info):
         """
         保存账号信息
@@ -228,7 +228,7 @@ class AutoTask:
             return account_info
         else:
             return []
-            
+
     def login(self, session, code):
         """
         登录
@@ -256,7 +256,7 @@ class AutoTask:
         except Exception as e:
             self.log(f"[登录] 发生错误: {str(e)}\n{traceback.format_exc()}", level="error")
             return False
-        
+
     def get_balance(self, session):
         """
         获取用户余额
@@ -277,7 +277,7 @@ class AutoTask:
         except Exception as e:
             self.log(f"[{self.nickname}] 获取用户余额 发生错误: {str(e)}\n{traceback.format_exc()}", level="error")
             return None
-        
+
     def get_gifts_list(self, session):
         """
         获取优惠券列表
@@ -298,7 +298,7 @@ class AutoTask:
         except Exception as e:
             self.log(f"[{self.nickname}] 获取优惠券列表 发生错误: {str(e)}\n{traceback.format_exc()}", level="error")
             return []
-        
+
     def redeem_gift(self, session, gift_id):
         """
         领取优惠券
@@ -324,7 +324,7 @@ class AutoTask:
         except Exception as e:
             self.log(f"[{self.nickname}] 领取优惠券发生错误: {str(e)}\n{traceback.format_exc()}", level="error")
             return False
-        
+
     def run(self):
         """
         运行任务
@@ -358,7 +358,7 @@ class AutoTask:
                         # while not self.check_proxy(proxy, session):
                         #     proxy = self.get_proxy()
                         #     session.proxies.update({"http": f"http://{proxy}", "https": f"http://{proxy}"})
-                
+
                 token = None
                 # 查找本地账号
                 if local_account_info:
