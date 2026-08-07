@@ -37,7 +37,7 @@ ql repo https://github.com/lcmovie/YB-GO-Script-i.git "" "" "main" ""
 --- | ---
 `WXZFTXBBS.py` | 微信支付提现笔笔省
 
-`wxapp/` 中包含以下 55 个 YYB-Go-Enhanced 适配脚本：
+仓库根目录还包含以下 55 个 YYB-Go-Enhanced 适配脚本：
 
 ```text
 爱玛会员俱乐部.js        白马智选.js              倍轻松.py
@@ -64,8 +64,8 @@ stokke.js
 任务命令示例：
 
 ```bash
-task lcmovie_YB-GO-Script-i/wxapp/创维.js
-task lcmovie_YB-GO-Script-i/wxapp/东风日产.py
+task lcmovie_YB-GO-Script-i/创维.js
+task lcmovie_YB-GO-Script-i/东风日产.py
 task lcmovie_YB-GO-Script-i/WXZFTXBBS.py
 ```
 
@@ -96,7 +96,7 @@ brotli
 
 ## 适配方式
 
-- `wxapp/getCode.py` 和 `wxapp/getCode.js` 是统一兼容层。
+- `getCode.py` 和 `getCode.js` 是统一兼容层。
 - 兼容层从 `YYB_SERVER` 解析服务地址和账号 `ref`，并调用 `/wxapp/getCode`。
 - 需要手机号授权或 `operateWxData` 的脚本会调用 YYB-Go-Enhanced 对应接口。
 - 兼容层会为旧脚本生成仅包含账号 `ref` 的 `WX_ID` 进程变量；用户无需再配置 `WX_ID`、`WECHAT_SERVER` 或旧 `soy_*` 变量。

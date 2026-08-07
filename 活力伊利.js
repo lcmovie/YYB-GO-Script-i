@@ -1,22 +1,20 @@
-// name:金典
-// cron:30 11,15 * * *
+// name:活力伊利
+// cron:57 9,16 * * *
 
 /**
- * 金典每日签到任务
+ * 活力伊利每日签到任务
  * 变量：
  * 1. WX_ID
  *    格式：wxid#备注
- *    多账号用换行或 @ 分隔（兼容旧变量 wxjindian）
+ *    多账号用换行或 @ 分隔（兼容旧变量 wxhlyili）
  * 2. WECHAT_SERVER
  *    协议服务（可选，在 getCode.js 中配置）
- * 3. JINDIAN_APPID（可选）
- *    若协议服务需要指定 appid，通过此变量覆盖
  *
  * 逻辑：
- * 1. 读取 jdlck.txt 缓存（格式：token#备注，每行一个）
+ * 1. 读取 hlylck.txt 缓存（格式：token#备注，每行一个）
  * 2. 按备注匹配账号，用缓存 token 验证，有效则跳过 code 登录
  * 3. 缓存失效则走 code → 登录 → 更新缓存
- * 4. 执行每日签到
+ * 4. 执行每日签到（isUseNewLogic=1）
  * 5. 刷新积分、签到状态并走 sendNotify 通知
  */
 
@@ -24,24 +22,18 @@ const fs = require('fs');
 const path = require('path');
 const { getSingleCode } = require('./getCode');
 
-const APP_NAME = '金典';
-const CACHE_FILE = path.join(__dirname, 'jdlck.txt');
-
-// ⚠️ APPID 需要抓包确认，通过环境变量 JINDIAN_APPID 覆盖
-const DEFAULT_APPID = 'wxf32616183fb4511e';
+const APP_NAME = '活力伊利';
+const CACHE_FILE = path.join(__dirname, 'hlylck.txt');
+const APPID = 'wx06af0ef532292cd3';
 const HOST = 'https://msmarket.msx.digitalyili.com/gateway/api';
-const GATEWAY_DOMAIN = 'a1d5e7a41-wx621112590b635086.sh.wxgateway.com';
-const TENANT_ID = '1718857849685876737';
-
+const GATEWAY_DOMAIN = 'a1d5c552d-wx06af0ef532292cd3.sh.wxgateway.com';
+const MINI_REFERER = `https://servicewechat.com/${APPID}/release/page-frame.html`;
 const MOBILE_UA =
   'Mozilla/5.0 (iPhone; CPU iPhone OS 18_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.58(0x18003a35) NetType/WIFI Language/zh_CN MiniProgramEnv/iOS';
 const DEFAULT_SCENE = '1008';
+const TENANT_ID = '1559474730809618433';
 
 let notifyMsg = '';
-
-function getAppid() {
-  return String(process.env.JINDIAN_APPID || DEFAULT_APPID).trim();
-}
 
 function log(msg) {
   console.log(msg);
@@ -73,7 +65,7 @@ function parseAccounts(raw) {
     .filter((item) => item.wxid);
 }
 
-// ── Token 缓存（jdlck.txt，格式：token#备注，每行一个）──────────────────
+// ── Token 缓存（hlylck.txt，格式：token#备注，每行一个）──────────────────
 
 function readTokenCache() {
   try {
@@ -101,6 +93,7 @@ function writeTokenCache(map) {
   fs.writeFileSync(CACHE_FILE, content, 'utf8');
 }
 
+// 内存中维护一份，整个运行周期共享
 let tokenCache = readTokenCache();
 
 function getCachedToken(remark) {
@@ -116,8 +109,6 @@ function removeCachedToken(remark) {
   delete tokenCache[remark];
   writeTokenCache(tokenCache);
 }
-
-// ── 工具函数 ──────────────────────────────────────────────────────────────
 
 function toQueryString(obj = {}) {
   return Object.entries(obj)
@@ -143,11 +134,10 @@ function createGatewayCallId() {
 }
 
 function getGatewaySimHeaders() {
-  const APPID = getAppid();
-  const routeTag = String(process.env.JINDIAN_ROUTE_TAG || GATEWAY_DOMAIN);
-  const source = String(process.env.JINDIAN_WX_SOURCE || 'wx_client');
+  const routeTag = String(process.env.HLYILI_ROUTE_TAG || GATEWAY_DOMAIN);
+  const source = String(process.env.HLYILI_WX_SOURCE || 'wx_client');
   const callId = createGatewayCallId();
-  const timeoutMs = String(process.env.JINDIAN_TIMEOUT_MS || '15000');
+  const timeoutMs = String(process.env.HLYILI_TIMEOUT_MS || '15000');
 
   return {
     'X-WX-HTTP-MODE': 'REROUTE',
@@ -161,14 +151,13 @@ function getGatewaySimHeaders() {
 }
 
 function buildHeaders(token = '', extra = {}) {
-  const APPID = getAppid();
   return {
     Accept: 'application/json, text/plain, */*',
     'Accept-Encoding': 'gzip, deflate, br',
     'Accept-Language': 'zh-CN,zh;q=0.9',
     'Content-Type': 'application/json',
     Origin: 'https://servicewechat.com',
-    Referer: `https://servicewechat.com/${APPID}/release/page-frame.html`,
+    Referer: MINI_REFERER,
     'User-Agent': MOBILE_UA,
     'access-token': String(token || ''),
     'atv-page': '',
@@ -179,7 +168,7 @@ function buildHeaders(token = '', extra = {}) {
     'tenant-id': TENANT_ID,
     xweb_xhr: '1',
     ...getGatewaySimHeaders(),
-    ...parseJsonEnv('JINDIAN_EXTRA_HEADERS_JSON'),
+    ...parseJsonEnv('HLYILI_EXTRA_HEADERS_JSON'),
     ...extra,
   };
 }
@@ -238,10 +227,7 @@ async function apiRequest(pathname, method = 'GET', token = '', payload = null, 
   return requestJson(url, options);
 }
 
-// ── API ──────────────────────────────────────────────────────────────────
-
 async function getWxCode(wxid) {
-  const APPID = getAppid();
   try {
     return await getSingleCode(APPID, wxid);
   } catch (e) {
@@ -279,13 +265,11 @@ async function getSignConfig(token) {
   return data;
 }
 
-// POST /member/daily/sign
+// POST /member/daily/sign?isUseNewLogic=1  — 源码里 signin() 就是这个接口
 async function dailySign(token) {
-  const { data } = await apiRequest('/member/daily/sign', 'POST', token, {});
+  const { data } = await apiRequest('/member/daily/sign?isUseNewLogic=1', 'POST', token, {});
   return data;
 }
-
-// ── 格式化 ────────────────────────────────────────────────────────────────
 
 function maskMobile(mobile) {
   const text = String(mobile || '');
@@ -310,8 +294,6 @@ function getDailySignRewardText(config) {
     ]),
   };
 }
-
-// ── 任务 ──────────────────────────────────────────────────────────────────
 
 async function runSignTask(token) {
   const beforeStatus = await getSignStatus(token);
@@ -450,7 +432,7 @@ async function runOne(account) {
 
 async function sendNotify(title, content) {
   try {
-    const notify = require('../sendNotify');
+    const notify = require('./sendNotify');
     await notify.sendNotify(title, content);
   } catch (e) {
     log(`⚠️ 通知发送失败: ${e.message}`);
@@ -458,9 +440,9 @@ async function sendNotify(title, content) {
 }
 
 async function main() {
-  const rawAccounts = process.env.WX_ID || process.env.wxjindian || '';
+  const rawAccounts = process.env.WX_ID || process.env.wxhlyili || '';
   if (!rawAccounts.trim()) {
-    throw new Error('未配置账号变量 WX_ID 或 wxjindian');
+    throw new Error('未配置账号变量 WX_ID 或 wxhlyili');
   }
 
   const accounts = parseAccounts(rawAccounts);
@@ -482,7 +464,7 @@ async function main() {
     }
 
     if (i < accounts.length - 1) {
-      const waitSeconds = randomInt(4, 8);
+      const waitSeconds = randomInt(5, 9);
       log(`⏳ ${account.remark} 执行完成，等待 ${waitSeconds} 秒后处理下一个账号`);
       await sleep(waitSeconds * 1000);
     }

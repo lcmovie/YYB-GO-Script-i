@@ -2,7 +2,7 @@ __pycache__/
 *.py[cod]
 wxzftxbbs_account_info.json
 notify.py
-wxapp/**/*cache*.json
-wxapp/**/env_check.json
-wxapp/json/
+**/*cache*.json
+**/env_check.json
+json/
 node_modules/

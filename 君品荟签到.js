@@ -386,7 +386,7 @@ async function SendMsg(message) {
     if (!message || !Notify) return;
     if ($.isNode()) {
         try {
-            const notify = require('../sendNotify');
+            const notify = require('./sendNotify');
             await notify.sendNotify($.name, message);
         } catch {}
     } else {

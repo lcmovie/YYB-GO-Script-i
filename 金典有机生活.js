@@ -1,41 +1,47 @@
-// name:伊家乐享会
-// cron:38 11,16 * * *
+// name:金典
+// cron:30 11,15 * * *
 
 /**
- * 伊家乐享会每日任务
+ * 金典每日签到任务
  * 变量：
  * 1. WX_ID
  *    格式：wxid#备注
- *    多账号用换行或 @ 分隔（兼容旧变量 wxyjlxh）
- *    说明：
- *    - 签到、分享仅依赖 wxid + WECHAT_SERVER
+ *    多账号用换行或 @ 分隔（兼容旧变量 wxjindian）
  * 2. WECHAT_SERVER
  *    协议服务（可选，在 getCode.js 中配置）
+ * 3. JINDIAN_APPID（可选）
+ *    若协议服务需要指定 appid，通过此变量覆盖
  *
  * 逻辑：
- * 1. 微信 code 服务换取 wx.login code
- * 2. code 登录获取 access-token
- * 3. 执行每日签到、每日分享
- * 4. 刷新积分、签到状态并走 sendNotify / 钉钉通知
- *
+ * 1. 读取 jdlck.txt 缓存（格式：token#备注，每行一个）
+ * 2. 按备注匹配账号，用缓存 token 验证，有效则跳过 code 登录
+ * 3. 缓存失效则走 code → 登录 → 更新缓存
+ * 4. 执行每日签到
+ * 5. 刷新积分、签到状态并走 sendNotify 通知
  */
 
+const fs = require('fs');
+const path = require('path');
 const { getSingleCode } = require('./getCode');
 
-const APP_NAME = '伊家乐享会';
-const APPID = 'wxd606233dfaf91cae';
+const APP_NAME = '金典';
+const CACHE_FILE = path.join(__dirname, 'jdlck.txt');
+
+// ⚠️ APPID 需要抓包确认，通过环境变量 JINDIAN_APPID 覆盖
+const DEFAULT_APPID = 'wxf32616183fb4511e';
 const HOST = 'https://msmarket.msx.digitalyili.com/gateway/api';
-const TENANT_ID = '1820778859526668290';
-const GATEWAY_DOMAIN = 'a1d5e5ea9-wx621112590b635086.sh.wxgateway.com';
-const MINI_REFERER = `https://servicewechat.com/${APPID}/122/page-frame.html`;
+const GATEWAY_DOMAIN = 'a1d5e7a41-wx621112590b635086.sh.wxgateway.com';
+const TENANT_ID = '1718857849685876737';
+
 const MOBILE_UA =
   'Mozilla/5.0 (iPhone; CPU iPhone OS 18_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.58(0x18003a35) NetType/WIFI Language/zh_CN MiniProgramEnv/iOS';
 const DEFAULT_SCENE = '1008';
-const DEFAULT_SHARE_TIMES = 25;
-const DEFAULT_SHARE_INTERVAL_MIN_MS = 10_000;
-const DEFAULT_SHARE_INTERVAL_MAX_MS = 20_000;
 
 let notifyMsg = '';
+
+function getAppid() {
+  return String(process.env.JINDIAN_APPID || DEFAULT_APPID).trim();
+}
 
 function log(msg) {
   console.log(msg);
@@ -62,12 +68,56 @@ function parseAccounts(raw) {
       const parts = x.split('#');
       const wxid = (parts[0] || '').trim();
       const remark = (parts[1] || wxid).trim();
-      const encryptedData = parts.length >= 4 ? parts.slice(2, -1).join('#').trim() : '';
-      const iv = parts.length >= 4 ? (parts[parts.length - 1] || '').trim() : '';
-      return { wxid, remark, encryptedData, iv };
+      return { wxid, remark };
     })
     .filter((item) => item.wxid);
 }
+
+// ── Token 缓存（jdlck.txt，格式：token#备注，每行一个）──────────────────
+
+function readTokenCache() {
+  try {
+    const content = fs.readFileSync(CACHE_FILE, 'utf8');
+    const map = {};
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const idx = trimmed.indexOf('#');
+      if (idx < 1) continue;
+      const token = trimmed.slice(0, idx).trim();
+      const remark = trimmed.slice(idx + 1).trim();
+      if (token && remark) map[remark] = token;
+    }
+    return map;
+  } catch {
+    return {};
+  }
+}
+
+function writeTokenCache(map) {
+  const content = Object.entries(map)
+    .map(([remark, token]) => `${token}#${remark}`)
+    .join('\n');
+  fs.writeFileSync(CACHE_FILE, content, 'utf8');
+}
+
+let tokenCache = readTokenCache();
+
+function getCachedToken(remark) {
+  return tokenCache[remark] || null;
+}
+
+function setCachedToken(remark, token) {
+  tokenCache[remark] = token;
+  writeTokenCache(tokenCache);
+}
+
+function removeCachedToken(remark) {
+  delete tokenCache[remark];
+  writeTokenCache(tokenCache);
+}
+
+// ── 工具函数 ──────────────────────────────────────────────────────────────
 
 function toQueryString(obj = {}) {
   return Object.entries(obj)
@@ -88,39 +138,16 @@ function parseJsonEnv(name) {
   }
 }
 
-function getFakeSteps() {
-  const raw = String(process.env.YJLXH_FAKE_STEPS || '').trim();
-  if (!raw) return randomInt(50000, 60000);
-  const value = Number(raw);
-  return Number.isFinite(value) && value > 0 ? Math.floor(value) : randomInt(50000, 60000);
-}
-
-function getShareTimes() {
-  const raw = String(process.env.YJLXH_SHARE_TIMES || '').trim();
-  if (!raw) return DEFAULT_SHARE_TIMES;
-  const value = Number(raw);
-  return Number.isFinite(value) && value > 0 ? Math.floor(value) : DEFAULT_SHARE_TIMES;
-}
-
-function getShareIntervalRange() {
-  const minRaw = String(process.env.YJLXH_SHARE_INTERVAL_MIN_MS || '').trim();
-  const maxRaw = String(process.env.YJLXH_SHARE_INTERVAL_MAX_MS || '').trim();
-  const min = Number(minRaw || DEFAULT_SHARE_INTERVAL_MIN_MS);
-  const max = Number(maxRaw || DEFAULT_SHARE_INTERVAL_MAX_MS);
-  const safeMin = Number.isFinite(min) && min > 0 ? Math.floor(min) : DEFAULT_SHARE_INTERVAL_MIN_MS;
-  const safeMax = Number.isFinite(max) && max > 0 ? Math.floor(max) : DEFAULT_SHARE_INTERVAL_MAX_MS;
-  return safeMin <= safeMax ? { min: safeMin, max: safeMax } : { min: safeMax, max: safeMin };
-}
-
 function createGatewayCallId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function getGatewaySimHeaders() {
-  const routeTag = String(process.env.YJLXH_ROUTE_TAG || GATEWAY_DOMAIN);
-  const source = String(process.env.YJLXH_WX_SOURCE || 'wx_client');
-  const callId = String(process.env.YJLXH_CALL_ID || createGatewayCallId());
-  const timeoutMs = String(process.env.YJLXH_TIMEOUT_MS || '15000');
+  const APPID = getAppid();
+  const routeTag = String(process.env.JINDIAN_ROUTE_TAG || GATEWAY_DOMAIN);
+  const source = String(process.env.JINDIAN_WX_SOURCE || 'wx_client');
+  const callId = createGatewayCallId();
+  const timeoutMs = String(process.env.JINDIAN_TIMEOUT_MS || '15000');
 
   return {
     'X-WX-HTTP-MODE': 'REROUTE',
@@ -134,13 +161,14 @@ function getGatewaySimHeaders() {
 }
 
 function buildHeaders(token = '', extra = {}) {
+  const APPID = getAppid();
   return {
     Accept: 'application/json, text/plain, */*',
     'Accept-Encoding': 'gzip, deflate, br',
     'Accept-Language': 'zh-CN,zh;q=0.9',
     'Content-Type': 'application/json',
     Origin: 'https://servicewechat.com',
-    Referer: MINI_REFERER,
+    Referer: `https://servicewechat.com/${APPID}/release/page-frame.html`,
     'User-Agent': MOBILE_UA,
     'access-token': String(token || ''),
     'atv-page': '',
@@ -151,7 +179,7 @@ function buildHeaders(token = '', extra = {}) {
     'tenant-id': TENANT_ID,
     xweb_xhr: '1',
     ...getGatewaySimHeaders(),
-    ...parseJsonEnv('YJLXH_EXTRA_HEADERS_JSON'),
+    ...parseJsonEnv('JINDIAN_EXTRA_HEADERS_JSON'),
     ...extra,
   };
 }
@@ -162,7 +190,6 @@ async function requestJson(url, options = {}, timeoutMs = 20_000) {
   try {
     const resp = await fetch(url, { ...options, signal: controller.signal });
     const text = await resp.text();
-
     let data;
     try {
       data = JSON.parse(text);
@@ -194,7 +221,7 @@ function extractErrorMsg(data) {
 }
 
 function isAlreadyDoneMessage(message) {
-  return /已签到|已分享|已领取|已完成|今日已|已经|重复/.test(String(message || ''));
+  return /已签到|已领取|已完成|今日已|已经|重复/.test(String(message || ''));
 }
 
 async function apiRequest(pathname, method = 'GET', token = '', payload = null, extraHeaders = {}) {
@@ -211,7 +238,10 @@ async function apiRequest(pathname, method = 'GET', token = '', payload = null, 
   return requestJson(url, options);
 }
 
+// ── API ──────────────────────────────────────────────────────────────────
+
 async function getWxCode(wxid) {
+  const APPID = getAppid();
   try {
     return await getSingleCode(APPID, wxid);
   } catch (e) {
@@ -219,55 +249,43 @@ async function getWxCode(wxid) {
   }
 }
 
+// POST /auth/account/login  { jsCode }
 async function loginByCode(code) {
   const { data } = await apiRequest('/auth/account/login', 'POST', '', { jsCode: code });
   return data;
 }
 
+// GET /auth/account/user/info
 async function getUserInfo(token) {
   const { data } = await apiRequest('/auth/account/user/info', 'GET', token);
   return data;
 }
 
+// GET /member/point
 async function getScore(token) {
   const { data } = await apiRequest('/member/point', 'GET', token);
   return data;
 }
 
-async function getTaskCenter(token) {
-  const { data } = await apiRequest('/member/task/center', 'GET', token);
-  return data;
-}
-
+// GET /member/sign/status
 async function getSignStatus(token) {
   const { data } = await apiRequest('/member/sign/status', 'GET', token);
   return data;
 }
 
+// GET /member/sign/config
 async function getSignConfig(token) {
   const { data } = await apiRequest('/member/sign/config', 'GET', token);
   return data;
 }
 
+// POST /member/daily/sign
 async function dailySign(token) {
   const { data } = await apiRequest('/member/daily/sign', 'POST', token, {});
   return data;
 }
 
-async function dailyShare(token) {
-  const { data } = await apiRequest('/member/share/content/points', 'GET', token);
-  return data;
-}
-
-async function uploadWxRunData(token, encryptedData, iv) {
-  const { data } = await apiRequest('/member/get/wx/steps', 'POST', token, { encryptedData, iv });
-  return data;
-}
-
-async function exchangeSteps(token, steps) {
-  const { data } = await apiRequest(`/member/steps/exchange/${encodeURIComponent(String(steps))}`, 'GET', token);
-  return data;
-}
+// ── 格式化 ────────────────────────────────────────────────────────────────
 
 function maskMobile(mobile) {
   const text = String(mobile || '');
@@ -293,10 +311,7 @@ function getDailySignRewardText(config) {
   };
 }
 
-function getWxRunTask(taskList) {
-  const list = Array.isArray(taskList?.data) ? taskList.data : [];
-  return list.find((item) => Number(item?.taskType) === 14) || null;
-}
+// ── 任务 ──────────────────────────────────────────────────────────────────
 
 async function runSignTask(token) {
   const beforeStatus = await getSignStatus(token);
@@ -353,161 +368,39 @@ async function runSignTask(token) {
   };
 }
 
-async function runSingleShare(token) {
-  const shareResp = await dailyShare(token);
-  if (isSuccess(shareResp)) {
-    const data = shareResp.data;
-    const msg =
-      (data && typeof data === 'object' && (data.message || data.msg || data.tip)) ||
-      (typeof data === 'string' ? data : '');
-    return {
-      status: 'success',
-      message: msg ? `分享成功，${msg}` : '分享成功',
-    };
-  }
-
-  const errorMsg = extractErrorMsg(shareResp);
-  if (isAlreadyDoneMessage(errorMsg)) {
-    return {
-      status: 'already',
-      message: '今日已分享',
-    };
-  }
-  throw new Error(`分享失败: ${errorMsg}`);
-}
-
-async function runShareTask(token) {
-  const shareTimes = getShareTimes();
-  const intervalRange = getShareIntervalRange();
-  let successCount = 0;
-  let alreadyCount = 0;
-
-  for (let i = 1; i <= shareTimes; i += 1) {
-    const result = await runSingleShare(token);
-
-    if (result.status === 'success') {
-      successCount += 1;
-    } else if (result.status === 'already') {
-      alreadyCount += 1;
-    }
-
-    log(`📤 分享 ${i}/${shareTimes}：${result.message}`);
-
-    if (i < shareTimes) {
-      const waitMs = randomInt(intervalRange.min, intervalRange.max);
-      log(`⏱️  等待 ${(waitMs / 1000).toFixed(0)} 秒后继续分享`);
-      await sleep(waitMs);
-    }
-  }
-
-  const parts = [`分享 ${shareTimes} 次`, `成功 ${successCount} 次`];
-  if (alreadyCount > 0) parts.push(`今日已分享 ${alreadyCount} 次`);
-  return parts.join('，');
-}
-
-async function runStepsTask(token, account, wxRunTask) {
-  const fakeSteps = getFakeSteps();
-  if (fakeSteps > 0) {
-    const exchangeResp = await exchangeSteps(token, fakeSteps);
-    if (!isSuccess(exchangeResp)) {
-      const errorMsg = extractErrorMsg(exchangeResp);
-      if (isAlreadyDoneMessage(errorMsg)) {
-        return {
-          message: `伪造步数模式：今日步数已兑换，步数 ${fakeSteps}`,
-          steps: fakeSteps,
-          exchangedPoints: 0,
-          skipped: false,
-        };
-      }
-      throw new Error(`伪造步数兑换失败: ${errorMsg}`);
-    }
-
-    const actualPoints = Number(exchangeResp.data?.stepsExchange?.bonusPoint || 0);
-    return {
-      message: `伪造步数兑换成功，步数 ${fakeSteps}${actualPoints > 0 ? `，+${actualPoints}积分` : ''}`,
-      steps: fakeSteps,
-      exchangedPoints: actualPoints,
-      skipped: false,
-    };
-  }
-
-  if (!account.encryptedData || !account.iv) {
-    return {
-      message: '未提供微信运动 encryptedData/iv，已跳过步数兑换',
-      steps: 0,
-      exchangedPoints: 0,
-      skipped: true,
-    };
-  }
-
-  if (!wxRunTask) {
-    return {
-      message: '任务中心未找到微信步数兑换任务，已跳过',
-      steps: 0,
-      exchangedPoints: 0,
-      skipped: true,
-    };
-  }
-
-  const wxRunResp = await uploadWxRunData(token, account.encryptedData, account.iv);
-  if (!isSuccess(wxRunResp)) {
-    throw new Error(`获取微信步数失败: ${extractErrorMsg(wxRunResp)}`);
-  }
-
-  const steps = Number(wxRunResp.data || 0);
-  if (!steps || steps <= 0) {
-    return {
-      message: '今日微信步数为 0，已跳过兑换',
-      steps,
-      exchangedPoints: 0,
-      skipped: true,
-    };
-  }
-
-  const bonusPerK = Number(wxRunTask?.taskRole?.bonusPoint || 0);
-  const bonusMax = Number(wxRunTask?.taskRole?.bonusPointMax || 0);
-  const estimatedPoints = bonusPerK > 0 ? Math.floor(steps / 1000) * bonusPerK : 0;
-  const expectedPoints = bonusMax > 0 ? Math.min(estimatedPoints, bonusMax) : estimatedPoints;
-
-  const exchangeResp = await exchangeSteps(token, steps);
-  if (!isSuccess(exchangeResp)) {
-    const errorMsg = extractErrorMsg(exchangeResp);
-    if (isAlreadyDoneMessage(errorMsg)) {
-      return {
-        message: `今日步数已兑换，步数 ${steps}`,
-        steps,
-        exchangedPoints: 0,
-        skipped: false,
-      };
-    }
-    throw new Error(`步数兑换失败: ${errorMsg}`);
-  }
-
-  const actualPoints = Number(exchangeResp.data?.stepsExchange?.bonusPoint || expectedPoints || 0);
-  return {
-    message: `步数兑换成功，步数 ${steps}${actualPoints > 0 ? `，+${actualPoints}积分` : ''}`,
-    steps,
-    exchangedPoints: actualPoints,
-    skipped: false,
-  };
-}
-
 async function runOne(account) {
   log(`\n================ ${account.remark} ================`);
-  log(`🧩 ${account.remark} 使用微信 code 服务登录`);
 
-  const code = await getWxCode(account.wxid);
-  const loginResp = await loginByCode(code);
-  if (!isSuccess(loginResp) || !loginResp?.data?.accessToken) {
-    throw new Error(`登录失败: ${extractErrorMsg(loginResp)}`);
+  // 1. 尝试使用缓存 token
+  let token = getCachedToken(account.remark);
+  if (token) {
+    log(`🔑 ${account.remark} 使用缓存 token`);
+    const testResp = await getUserInfo(token);
+    if (!isSuccess(testResp)) {
+      log(`⚠️ ${account.remark} 缓存 token 已失效，重新登录`);
+      removeCachedToken(account.remark);
+      token = null;
+    } else {
+      log(`✅ ${account.remark} 缓存 token 有效`);
+    }
   }
 
-  const token = String(loginResp.data.accessToken);
+  // 2. 缓存无效则走 code 登录
+  if (!token) {
+    log(`🧩 ${account.remark} 使用微信 code 服务登录`);
+    const code = await getWxCode(account.wxid);
+    const loginResp = await loginByCode(code);
+    if (!isSuccess(loginResp) || !loginResp?.data?.accessToken) {
+      throw new Error(`登录失败: ${extractErrorMsg(loginResp)}`);
+    }
+    token = String(loginResp.data.accessToken);
+    setCachedToken(account.remark, token);
+    log(`💾 ${account.remark} token 已缓存`);
+  }
 
-  const [beforeUser, beforeScoreResp, taskCenter] = await Promise.all([
+  const [beforeUser, beforeScoreResp] = await Promise.all([
     getUserInfo(token),
     getScore(token),
-    getTaskCenter(token),
   ]);
 
   if (!isSuccess(beforeUser)) {
@@ -516,19 +409,11 @@ async function runOne(account) {
   if (!isSuccess(beforeScoreResp)) {
     throw new Error(`查询积分失败: ${extractErrorMsg(beforeScoreResp)}`);
   }
-  if (!isSuccess(taskCenter)) {
-    throw new Error(`查询任务中心失败: ${extractErrorMsg(taskCenter)}`);
-  }
 
   const userInfo = beforeUser.data || {};
   const beforeScore = Number(beforeScoreResp.data || 0);
-  const wxRunTask = getWxRunTask(taskCenter);
 
   const signResult = await runSignTask(token);
-  await sleep(randomInt(800, 1500));
-  const shareResult = await runShareTask(token);
-  await sleep(randomInt(800, 1500));
-  const stepsResult = await runStepsTask(token, account, wxRunTask);
 
   const [afterUser, afterScoreResp, afterSignStatus] = await Promise.all([
     getUserInfo(token),
@@ -548,14 +433,13 @@ async function runOne(account) {
 
   const afterInfo = afterUser.data || {};
   const afterScore = Number(afterScoreResp.data || 0);
+
   const line = [
     `【${account.remark}】${afterInfo.nickname || afterInfo.nickName || userInfo.nickname || userInfo.nickName || ''} ${maskMobile(afterInfo.mobile || userInfo.mobile || '')}`.trim(),
     `签到结果：${signResult.message}`,
     `签到状态：${afterSignStatus.data?.signed ? '已签到' : '未签到'}`,
     `签到天数：${Number(afterSignStatus.data?.signedDays || signResult.signedDays || 0)}`,
     `签到奖励：日签${signResult.rewardText.daily}${signResult.rewardText.continuous !== '无' ? `；连签${signResult.rewardText.continuous}` : ''}`,
-    `分享结果：${shareResult}`,
-    `步数结果：${stepsResult.message}`,
     `当前积分：${afterScore}`,
     `积分变化：${beforeScore}->${afterScore}`,
   ].join('\n');
@@ -566,7 +450,7 @@ async function runOne(account) {
 
 async function sendNotify(title, content) {
   try {
-    const notify = require('../sendNotify');
+    const notify = require('./sendNotify');
     await notify.sendNotify(title, content);
   } catch (e) {
     log(`⚠️ 通知发送失败: ${e.message}`);
@@ -574,9 +458,9 @@ async function sendNotify(title, content) {
 }
 
 async function main() {
-  const rawAccounts = process.env.WX_ID || process.env.wxyjlxh || '';
+  const rawAccounts = process.env.WX_ID || process.env.wxjindian || '';
   if (!rawAccounts.trim()) {
-    throw new Error('未配置账号变量 WX_ID 或 wxyjlxh');
+    throw new Error('未配置账号变量 WX_ID 或 wxjindian');
   }
 
   const accounts = parseAccounts(rawAccounts);
@@ -598,7 +482,7 @@ async function main() {
     }
 
     if (i < accounts.length - 1) {
-      const waitSeconds = randomInt(45, 90);
+      const waitSeconds = randomInt(4, 8);
       log(`⏳ ${account.remark} 执行完成，等待 ${waitSeconds} 秒后处理下一个账号`);
       await sleep(waitSeconds * 1000);
     }

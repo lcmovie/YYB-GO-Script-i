@@ -379,7 +379,7 @@ async function runOne(account) {
 
 async function sendNotify(title, content) {
   try {
-    const notify = require('../sendNotify');
+    const notify = require('./sendNotify');
     await notify.sendNotify(title, content);
   } catch (e) {
     log(`⚠️ 通知发送失败: ${e.message}`);

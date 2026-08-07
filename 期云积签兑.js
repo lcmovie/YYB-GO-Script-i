@@ -116,7 +116,7 @@ function nowText() {
 function pushNotify(title, content) {
   if (!CONFIG.notify || !content.trim()) return;
   try {
-    const notify = require('../sendNotify');
+    const notify = require('./sendNotify');
     notify.sendNotify(title, content);
   } catch (e) {
     console.log('通知发送失败:', e.message || e);

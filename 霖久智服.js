@@ -772,8 +772,8 @@ function loadSendNotify() {
   const candidates = [
     './sendNotify',
     './sendNotify.js',
-    '../sendNotify',
-    '../sendNotify.js',
+    './sendNotify',
+    './sendNotify.js',
     '/ql/scripts/sendNotify',
     '/ql/scripts/sendNotify.js',
     '/ql/data/scripts/sendNotify',

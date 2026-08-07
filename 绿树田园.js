@@ -20,7 +20,7 @@
 
 const crypto = require('crypto');
 const axios = require('axios');
-const { sendNotify } = require('../sendNotify');
+const { sendNotify } = require('./sendNotify');
 
 // 统一微信协议（牛子/应用宝双协议，复用仓库 getCode）
 let getSingleCode = null;

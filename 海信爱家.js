@@ -1200,7 +1200,7 @@ async function sendNotifySafe(title, content) {
   try {
     let sender = null;
     try {
-      const mod = require('../sendNotify');
+      const mod = require('./sendNotify');
       sender = mod?.sendNotify || mod;
     } catch (_) {
       // 非青龙环境可能不存在 sendNotify，忽略。
@@ -2639,4 +2639,3 @@ main().catch(async (err) => {
   await sendNotifySafe(`${SCRIPT_NAME} 执行异常`, `时间: ${fmtTime(Date.now())}\n错误: ${err.message || err}`);
   process.exit(1);
 });
-

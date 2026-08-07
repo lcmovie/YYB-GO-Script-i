@@ -186,7 +186,7 @@ async function getValidCred(acc, cache) {
 
 async function sendNotify(title, content) {
   try {
-    const notify = require('../sendNotify');
+    const notify = require('./sendNotify');
     await notify.sendNotify(title, content);
   } catch {
     // ignore
