@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+wxzftxbbs_account_info.json
+notify.py
