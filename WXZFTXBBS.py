@@ -67,8 +67,15 @@ class YYBGoEnhancedAdapter:
             )
             response.raise_for_status()
             body = response.json()
-            code = (((body.get("data") or {}).get("result") or {}).get("code"))
-            if body.get("code") == 0 and code:
+            if response.status_code < 200 or response.status_code >= 300:
+                raise RuntimeError(body.get("error") or body.get("msg") or f"HTTP {response.status_code}")
+            if "code" in body and body.get("code") not in (0, "0", None):
+                raise RuntimeError(body.get("error") or body.get("msg") or "YYB请求失败")
+            result = body.get("result")
+            if result is None:
+                result = (body.get("data") or {}).get("result")
+            code = (result or {}).get("code")
+            if code:
                 self.log(f"[YYB] 账号 {ref} 获取code成功")
                 return code
             self.log(f"[YYB] 获取code失败: {str(body)[:300]}", "error")

@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from getCode import get_single_code
+from getCode import get_single_code, get_single_phone_data
 
 
 # ============ 常量配置 ============
@@ -386,6 +386,9 @@ class NissanSign:
 
     def get_phone_encrypted(self, wxid: str) -> Optional[Dict]:
         """获取微信手机号 encryptedData/iv（与海天同款协议接口）。"""
+        if os.environ.get("YYB_SERVER", "").strip():
+            return get_single_phone_data(WECHAT_MINI_APPID, wxid)
+
         url = self.wechat_server.replace("/get/code", "/get/all/mobile")
         payload = {
             "wxid": wxid,

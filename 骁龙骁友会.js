@@ -15,6 +15,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { getSingleCode } = require('./getCode.js');
+const { sendNotify } = require('./sendNotify.js');
 const http = require("http");
 const https = require("https");
 const { EventEmitter } = require("events");
@@ -765,11 +766,6 @@ async function main() {
     $.log(`未找到变量 ${ckName}`);
     return;
   }
-  if (!WECHAT_SERVER) {
-    $.log("未配置 WECHAT_SERVER");
-    return;
-  }
-
   const accounts = parseAccounts(raw);
   if (!accounts.length) {
     $.log("未解析到有效账号");
@@ -836,7 +832,10 @@ async function main() {
   $.log("全部账号处理完成");
 }
 
-main().catch((e) => {
-  $.log(`脚本异常: ${e.message || e}`);
-  console.error(e?.stack || e);
-});
+main()
+  .then(() => sendNotify($.name, $.logs.join('\n')))
+  .catch(async (e) => {
+    $.log(`脚本异常: ${e.message || e}`);
+    console.error(e?.stack || e);
+    await sendNotify(`${$.name}异常`, $.logs.join('\n'));
+  });

@@ -748,45 +748,14 @@ def get_wx_user_info(wxid: str, log: LogFunc) -> Dict[str, Any]:
     }
 
     if is_yyb:
-        yyb_server = (os.getenv("YYB_SERVER") or os.getenv("YINGYOGBAO_SERVER") or "http://127.0.0.1:8000").rstrip('/')
-        resolved_ref = raw_id
-        try:
-            r = requests.get(f"{yyb_server}/accounts", timeout=15)
-            data = r.json()
-            if data.get("code") == 0 and isinstance(data.get("data"), list):
-                accounts = data["data"]
-                for acc in accounts:
-                    if acc.get("openid") == raw_id:
-                        resolved_ref = str(acc.get("id", "") or raw_id)
-                        break
-                    elif raw_id.isdigit() and str(acc.get("id", "")) == raw_id:
-                        resolved_ref = raw_id
-                        break
-                else:
-                    if len(accounts) == 1:
-                        resolved_ref = str(accounts[0].get("id", "") or raw_id)
-        except Exception as e:
-            log(f"YYB 获取账号列表失败: {e}")
-
-        url = f"{yyb_server}/wxapp/operateWxData"
-        body = {
-            "ref": resolved_ref,
-            "app_id": appid,
-            "payload": payload
-        }
-        resp = requests.post(url, json=body, timeout=15)
-        resp.raise_for_status()
-        res = resp.json()
-        if res.get("code") != 0:
-            raise RuntimeError(f"YYB operateWxData 失败: {res}")
-        inner = res.get("data", {}).get("result", {})
+        inner = getCode.get_single_operate_wx_data(appid, raw_id, payload)
         if not isinstance(inner, dict):
-            inner = res.get("data", {})
+            raise RuntimeError(f"YYB operateWxData 失败: {inner}")
 
         encrypted_data = inner.get("encryptedData")
         iv = inner.get("iv")
         if not encrypted_data or not iv:
-            raise RuntimeError(f"YYB 未返回 encryptedData/iv: {res}")
+            raise RuntimeError(f"YYB 未返回 encryptedData/iv: {inner}")
 
         profile = {}
         b64_str = inner.get("data")

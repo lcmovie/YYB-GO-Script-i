@@ -25,6 +25,7 @@ from datetime import datetime, timedelta
 from urllib.request import urlopen, Request
 from urllib.parse import urlencode
 from urllib.error import URLError, HTTPError
+from notify import send as notify_send
 
 # ========== 配置区 ==========
 from getCode import get_single_code
@@ -560,6 +561,11 @@ def main():
         print(f"{index:<4} {result['remark']:<12} {result['shell_count']:<8} {result['points']:<8}")
 
     print(f"\n🎉 所有账户处理完成!")
+    summary = "\n".join(
+        f"账号{index} {item['remark']}：蛋壳 {item['shell_count']}，积分 {item['points']}"
+        for index, item in enumerate(account_results, 1)
+    )
+    notify_send("美的小天鹅", summary or "任务执行完成")
 
 if __name__ == "__main__":
     main()

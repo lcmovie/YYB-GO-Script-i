@@ -11,6 +11,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { getSingleCode } = require('./getCode.js'); // 共享微信小程序 code 获取模块（自动路由牛子/应用宝，读取 WX_ID）
+const { sendNotify } = require('./sendNotify.js');
 
 const NAME = '广汽丰田新能源-微信协议版';
 const APPID = 'wxd8a42d1c0c59c15d';
@@ -428,4 +429,10 @@ async function main() {
   }
 }
 
-main().catch(e => { console.error(e.message || e); process.exit(1); });
+main()
+  .then(() => sendNotify(NAME, '全部账号任务执行完成'))
+  .catch(async e => {
+    console.error(e.message || e);
+    await sendNotify(`${NAME}异常`, e.stack || e.message || String(e));
+    process.exitCode = 1;
+  });

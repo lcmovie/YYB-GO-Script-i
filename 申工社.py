@@ -9,6 +9,7 @@ from getCode import get_single_code
 import logging
 import random
 from datetime import datetime
+from notify import send as notify_send
 
 logging.basicConfig(
     level=logging.INFO,
@@ -336,8 +337,6 @@ def should_run_today(wxid, remark, cache):
 if __name__ == "__main__":
 
     WX_SERVER = os.environ.get("WECHAT_SERVER", "")
-    if not WX_SERVER:
-        log.warning("未配置 WECHAT_SERVER，请检查环境变量")
 
     # 解析多账号
     wxids_raw = os.environ.get("WX_ID") or os.environ.get("WXIDSGS", "")
@@ -432,3 +431,5 @@ if __name__ == "__main__":
             delay = random.randint(30, 120)
             log.info(f"⏳ 等待 {delay}s 切换下一个账号...")
             time.sleep(delay)
+
+    notify_send("申工社", f"全部账号任务执行完成，共 {len(WXIDS)} 个账号")

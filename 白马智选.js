@@ -28,12 +28,12 @@ function log(str) {
 }
 async function push_notification() {
     let notify;
-    try { notify = require('./notify'); } catch (e) { notify = null; }
+    try { notify = require('./sendNotify'); } catch (e) { notify = null; }
     const title = "白马智选";
     const content = _logMessages.join('\n');
-    if (notify && typeof notify.send === 'function') {
+    if (notify && typeof notify.sendNotify === 'function') {
         try {
-            await notify.send(title, content);
+            await notify.sendNotify(title, content);
             log('✅ 通知发送成功');
         } catch (e) {
             log('⚠️ 通知发送失败: ' + e.message);
@@ -181,11 +181,6 @@ async function main() {
 
     if (!WXID_RAW) {
         log('❌ 未找到 ' + ckName + ' 环境变量');
-        await push_notification();
-        return;
-    }
-    if (!WECHAT_SERVER) {
-        log('❌ 未找到 WECHAT_SERVER 环境变量');
         await push_notification();
         return;
     }

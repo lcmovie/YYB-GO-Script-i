@@ -164,6 +164,18 @@ gmssl
 brotli
 ```
 
+## 消息通知
+
+仓库内置 `sendNotify.js` 和 `notify.py` 统一通知兼容层，支持 YYB-Go-Enhanced 账号任务注入的以下环境变量：
+
+| 渠道 | 环境变量 |
+| --- | --- |
+| Server酱 | `PUSH_KEY` |
+| PushPlus | `PUSH_PLUS_TOKEN`，可选群组 `PUSH_PLUS_USER` |
+| 企业微信机器人 | `QYWX_KEY` |
+
+未配置通知变量时，通知内容只输出到青龙任务日志，不影响脚本执行。
+
 ## 适配方式
 
 - `getCode.py` 和 `getCode.js` 是统一兼容层。

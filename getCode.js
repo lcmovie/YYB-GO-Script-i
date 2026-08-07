@@ -46,10 +46,14 @@ async function post(identifier, appId, route, payload) {
     headers: { 'Content-Type': 'application/json' },
   });
   const data = response.data || {};
-  if (response.status !== 200 || Number(data.code) !== 0) {
-    throw new Error(data.msg || `YYB请求失败（HTTP ${response.status}）`);
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(data.error || data.msg || `YYB请求失败（HTTP ${response.status}）`);
   }
-  const result = data.data && data.data.result;
+  if (Object.prototype.hasOwnProperty.call(data, 'code') && ![0, '0', null, undefined].includes(data.code)) {
+    throw new Error(data.error || data.msg || 'YYB请求失败');
+  }
+  // 当前 YYB-Go-Enhanced 直接返回 {openid, result}，同时兼容旧包装。
+  const result = data.result || (data.data && data.data.result);
   if (!result || typeof result !== 'object') throw new Error('YYB响应缺少data.result');
   return result;
 }
@@ -101,11 +105,22 @@ async function getSinglePhoneNumber(appId, identifier) {
   }
 }
 
+async function getSinglePhoneData(appId, identifier) {
+  try {
+    return await post(identifier, appId, '/wxapp/getPhoneNumber');
+  } catch (error) {
+    console.log(`[getCode] 获取手机号授权数据失败：${error.message}`);
+    return null;
+  }
+}
+
 async function getSingleOperateWxData(appId, identifier, payload) {
   try {
-    if (payload) return await post(identifier, appId, '/wxapp/operateWxData', payload);
-    const code = await getSingleCode(appId, identifier);
-    return code ? { code, encryptedData: null, iv: null } : null;
+    if (payload !== undefined && payload !== null) {
+      return await post(identifier, appId, '/wxapp/operateWxData', payload);
+    }
+    // 旧脚本无 payload 调用的真实意图是取得手机号授权数据。
+    return await post(identifier, appId, '/wxapp/getPhoneNumber');
   } catch (error) {
     console.log(`[getCode] 获取operateWxData失败：${error.message}`);
     return null;
@@ -117,7 +132,7 @@ module.exports = {
   WeChatCodeGetter,
   getSingleCode,
   getSinglePhoneNumber,
+  getSinglePhoneData,
   getSinglePhoneEncrypted: getSinglePhoneNumber,
   getSingleOperateWxData,
 };
-
