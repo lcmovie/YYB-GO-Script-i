@@ -611,6 +611,17 @@ class XiaodangjiaWxidSign:
             return None
 
     def get_mobile_info(self, wxid: str, code: str) -> Optional[Dict]:
+        if os.environ.get("YYB_SERVER", "").strip():
+            result = getCode.get_single_phone_data(self.wechat_mini_appid, wxid)
+            if not result:
+                return None
+            result.setdefault("code", code)
+            wx_phone = result.get("wx_phone")
+            if isinstance(wx_phone, dict):
+                wx_phone.setdefault("code", code)
+                return result
+            return {"wx_phone": result, "code": result.get("code") or code}
+
         url = f"{self.wechat_server}/api/v1/wx/app/get/all/mobile"
         payload = {
             "wxid": wxid,

@@ -1,7 +1,6 @@
 __pycache__/
 *.py[cod]
 wxzftxbbs_account_info.json
-notify.py
 **/*cache*.json
 **/env_check.json
 json/

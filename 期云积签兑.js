@@ -609,9 +609,6 @@ async function main() {
   if (CONFIG.dryRun) console.log('当前为 dry-run：不会提交签到或领奖接口');
   const accounts = parseAccounts();
   if (accounts.length === 0) throw new Error('未找到环境变量 WX_ID 或 qyqd');
-  if (accounts.some((account) => account.mode === 'wxid') && !CONFIG.wechatServer) {
-    throw new Error('wxid 自动登录需要配置 WECHAT_SERVER');
-  }
 
   for (let i = 0; i < accounts.length; i++) {
     try {

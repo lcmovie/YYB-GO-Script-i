@@ -34,7 +34,7 @@ const ACCOUNT_CACHE_FILE = pathMod.join(CACHE_DIR, 'hsjj_accounts.json');
 
 // ==================== 通知模块 ====================
 let notify;
-try { notify = require('./notify'); } catch (e) { notify = null; }
+try { notify = require('./sendNotify'); } catch (e) { notify = null; }
 
 // 消息收集
 let _logMessages = [];
@@ -45,9 +45,9 @@ function log(str) {
 async function push_notification() {
     const title = "红色火箭（华泰基金）";
     const content = _logMessages.join('\n');
-    if (notify && typeof notify.send === 'function') {
+    if (notify && typeof notify.sendNotify === 'function') {
         try {
-            await notify.send(title, content);
+            await notify.sendNotify(title, content);
             log('✅ 通知发送成功');
         } catch (e) {
             log('⚠️ 通知发送失败: ' + e.message);

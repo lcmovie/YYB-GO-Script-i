@@ -20,6 +20,7 @@
 'use strict';
 
 const { getSingleCode } = require('./getCode');
+const { sendNotify } = require('./sendNotify');
 const crypto = require('crypto');
 const vm = require('vm');
 
@@ -807,4 +808,5 @@ async function runOne(line, idx) {
   hr('═');
   console.log('🎉 全部账号处理完成');
   hr('═');
+  await sendNotify('创维小程序', `全部账号任务执行完成，共 ${accounts.length} 个账号`);
 })();

@@ -36,6 +36,7 @@
 'use strict';
 
 const { getSingleCode } = require('./getCode');
+const { sendNotify } = require('./sendNotify');
 
 const ENV_NAME = 'wwnhd';
 
@@ -737,7 +738,7 @@ async function runOne(line, idx) {
   const needConsumerToken = ENABLE_TASKS || ENABLE_SIGNIN || ENABLE_SHARE;
 
   // 自动识别 wxid 模式（兼容非 wxid_ 开头）
-  const hasWechatServer = !!String(process.env.WECHAT_SERVER || '').trim();
+  const hasWechatServer = !!String(process.env.WECHAT_SERVER || process.env.YYB_SERVER || '').trim();
   const explicitWx = head.startsWith('wxid_') || head.startsWith('wx:');
   const useWxMode = explicitWx || (hasWechatServer && isLikelyWxIdentifier(head) && !looksLikeToken(head));
 
@@ -850,7 +851,9 @@ async function runOne(line, idx) {
         console.log(`账号${i + 1}失败: ${e.message || e}`);
       }
     }
+    await sendNotify('问问农', `全部账号任务执行完成，共 ${accounts.length} 个账号`);
   } catch (e) {
     console.log('脚本异常:', e.message || e);
+    await sendNotify('问问农异常', e.stack || e.message || String(e));
   }
 })();

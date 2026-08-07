@@ -199,11 +199,15 @@ class WxAdapter:
     
     def __init__(self, server_url=None):
         self.server_url = (server_url or DEFAULT_WECHAT_SERVER).rstrip("/")
-        self.yyb_server = (
+        yyb_entry = (
             os.environ.get("YYB_SERVER") or
             os.environ.get("YINGYOGBAO_SERVER") or
             ""
-        ).rstrip("/")
+        ).splitlines()[0].strip()
+        yyb_url = yyb_entry.rsplit("@", 1)[0] if "@" in yyb_entry else yyb_entry
+        if yyb_url and not yyb_url.startswith(("http://", "https://")):
+            yyb_url = "http://" + yyb_url
+        self.yyb_server = yyb_url.rstrip("/")
         self.base = self.server_url + "/api/v1/wx/"
         self.session = requests.Session()
         self.session.headers["Content-Type"] = "application/json"
@@ -245,7 +249,12 @@ class WxAdapter:
         resp = self.session.get(f"{self.yyb_server}/accounts", timeout=15)
         resp.raise_for_status()
         body = resp.json()
-        accounts = body.get("data", []) if isinstance(body, dict) else []
+        if isinstance(body, list):
+            accounts = body
+        elif isinstance(body, dict):
+            accounts = body.get("data", [])
+        else:
+            accounts = []
         return accounts if isinstance(accounts, list) else []
 
     def _yyb_resolve_ref(self, wxid):
@@ -284,13 +293,15 @@ class WxAdapter:
             raise RuntimeError("账号 login_buffer 已过期，需要重新扫码登录")
         resp.raise_for_status()
         result = resp.json()
-        if not isinstance(result, dict) or result.get("code", -1) != 0:
-            msg = result.get("msg", resp.text[:120]) if isinstance(result, dict) else resp.text[:120]
+        if not isinstance(result, dict):
+            raise RuntimeError(f"YYB响应异常: {resp.text[:120]}")
+        if "code" in result and result.get("code") not in (0, "0", None):
+            msg = result.get("error") or result.get("msg", resp.text[:120])
             raise RuntimeError(msg)
-        data = result.get("data", {})
-        if not isinstance(data, dict):
-            raise RuntimeError(f"YYB响应data异常: {str(data)[:120]}")
-        inner = data.get("result", data)
+        inner = result.get("result")
+        if inner is None:
+            data = result.get("data", {})
+            inner = data.get("result", data) if isinstance(data, dict) else data
         if not isinstance(inner, dict):
             raise RuntimeError(f"YYB响应result异常: {str(inner)[:120]}")
         return inner

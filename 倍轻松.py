@@ -4,7 +4,7 @@
 #需要配置WECHAT_SERVER、WX_ID，用于获取wx.login code
 #账号变量名:BREO
 #new Env("BREO")
-#cron 2 11,14 * * *
+# cron: 2 11,14 * * *
 import requests
 import json
 import os
@@ -12,6 +12,7 @@ import sys
 import time
 import random
 from pathlib import Path
+from notify import send as notify_send
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -405,3 +406,4 @@ if __name__ == "__main__":
             print(f"-------------- 账号 {i} 结束 --------------")
 
         print("\n=============== 所有任务执行完毕 ===============")
+        notify_send("倍轻松", f"全部账号任务执行完成，共 {len(accounts)} 个账号")

@@ -28,7 +28,7 @@ import random
 import hashlib
 import datetime
 import requests
-from getCode import get_single_code
+from getCode import get_single_code, get_single_phone_number
 from typing import Optional, Dict, Any, List, Tuple
 
 # 通知模块
@@ -235,6 +235,9 @@ def get_wx_phone_code(wxid: str) -> Optional[str]:
     从中转服务获取手机号授权 code（二号协议）
     接口: POST {WECHAT_SERVER}/api/v1/wx/app/get/all/mobile
     """
+    if os.environ.get("YYB_SERVER", "").strip():
+        return get_single_phone_number(WX_APP_ID, wxid)
+
     raw_server = os.environ.get(ENV_WECHAT_SERVER, "").strip()
     if not raw_server:
         return None

@@ -27,6 +27,7 @@ const https = require('https');
 const zlib = require('zlib');
 const { URL } = require('url');
 const { getSingleCode } = require('./getCode.js'); // 共享微信小程序 code 获取模块（自动路由牛子/应用宝，读取 WX_ID）
+const { sendNotify } = require('./sendNotify.js');
 
 const APP_NAME = '美孚臻享俱乐部';
 const WX_APPID = 'wx46f9572cac706c22';
@@ -71,20 +72,20 @@ const COMMON_HEADERS = {
   Referer: `https://servicewechat.com/${WX_APPID}/120/page-frame.html`,
 };
 
-main().catch((error) => {
-  console.log(`[异常] ${error && error.stack ? error.stack : error}`);
-  process.exitCode = 1;
-});
+main()
+  .then(() => sendNotify(APP_NAME, '全部账号任务执行完成'))
+  .catch(async (error) => {
+    const message = error && error.stack ? error.stack : String(error);
+    console.log(`[异常] ${message}`);
+    await sendNotify(`${APP_NAME}异常`, message);
+    process.exitCode = 1;
+  });
 
 async function main() {
   const wxAccounts = parseWxAccounts(CONFIG.wxAccountsRaw);
   const tokenAccounts = parseTokenAccounts(CONFIG.tokenRaw);
 
   if (wxAccounts.length) {
-    if (!CONFIG.wechatServer) {
-      throw new Error('缺少 WECHAT_SERVER，请填写微信协议服务地址');
-    }
-
     console.log(`[开始] ${APP_NAME} 微信协议版，共 ${wxAccounts.length} 个账号`);
     const cache = loadCache();
 

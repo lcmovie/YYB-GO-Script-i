@@ -63,9 +63,16 @@ def _post(identifier: str, app_id: str, route: str, payload: dict[str, Any] | No
         data = response.json()
     except ValueError as exc:
         raise RuntimeError(f"YYB响应不是JSON（HTTP {response.status_code}）") from exc
-    if response.status_code != 200 or data.get("code") != 0:
-        raise RuntimeError(data.get("msg") or f"YYB请求失败（HTTP {response.status_code}）")
-    result = ((data.get("data") or {}).get("result") or {})
+    if response.status_code < 200 or response.status_code >= 300:
+        raise RuntimeError(data.get("error") or data.get("msg") or f"YYB请求失败（HTTP {response.status_code}）")
+    # YYB-Go-Enhanced 当前直接返回 {openid, result}；同时兼容旧版
+    # {code: 0, data: {result}} 包装，便于平滑升级。
+    if "code" in data and data.get("code") not in (0, "0", None):
+        raise RuntimeError(data.get("error") or data.get("msg") or "YYB请求失败")
+    result = data.get("result")
+    if result is None:
+        result = (data.get("data") or {}).get("result")
+    result = result or {}
     if not isinstance(result, dict):
         raise RuntimeError(f"YYB响应result格式错误：{str(result)[:120]}")
     return result
@@ -91,17 +98,26 @@ def get_single_phone_number(app_id: str, identifier: str) -> str | None:
         return None
 
 
+def get_single_phone_data(app_id: str, identifier: str) -> dict[str, Any] | None:
+    """返回 YYB-Go-Enhanced 提供的真实手机号授权结果。"""
+    try:
+        return _post(identifier, app_id, "/wxapp/getPhoneNumber")
+    except Exception as exc:
+        print(f"[getCode] 获取手机号授权数据失败：{exc}")
+        return None
+
+
 def get_single_operate_wx_data(
     app_id: str,
     identifier: str,
     payload: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     try:
-        if payload:
+        if payload is not None:
             return _post(identifier, app_id, "/wxapp/operateWxData", payload)
-        code = get_single_code(app_id, identifier)
-        return {"code": code, "encryptedData": None, "iv": None} if code else None
+        # 旧脚本把无 payload 的 operateWxData 用作手机号授权数据获取；必须
+        # 返回服务端真实的 code/encryptedData/iv，不能用普通 wx.login code 伪造。
+        return _post(identifier, app_id, "/wxapp/getPhoneNumber")
     except Exception as exc:
         print(f"[getCode] 获取operateWxData失败：{exc}")
         return None
-

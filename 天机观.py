@@ -25,6 +25,7 @@ import time
 import random
 import requests
 import getCode  # 共享的微信小程序 code 获取模块（自动路由 牛子/应用宝，读取 WX_ID 过滤）
+from notify import send as notify_send
 
 # 屏蔽 SSL 告警
 import warnings
@@ -285,11 +286,13 @@ def main():
     # 优先 wechatLoader 自动模式
     if run_by_wechat_loader():
         Log.ok("wechatLoader 自动模式执行完成")
+        notify_send("天机观", "YYB_SERVER 多账号任务执行完成")
         return
 
     # 兼容旧 token 直登模式
     if run_by_token_only():
         Log.ok("TIANJITOKEN 模式执行完成")
+        notify_send("天机观", "TIANJITOKEN 任务执行完成")
         return
 
     Log.err("未检测到可用环境变量。请设置 WX_ID，或设置 TIANJITOKEN")
