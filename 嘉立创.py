@@ -115,11 +115,31 @@ def get_wx_code(account_id):
         raise RuntimeError(f"获取code失败: {e}")
 
 
+def _extract_login_auth(resp):
+    """兼容从响应头或 JSON 响应体读取登录凭据。"""
+    token = resp.headers.get("X-Jlc-Accesstoken") or resp.headers.get("x-jlc-accesstoken")
+    secret = resp.headers.get("secretkey") or resp.headers.get("Secretkey") or DEFAULT_SECRET_KEY
+    try:
+        payload = resp.json()
+    except (ValueError, TypeError):
+        payload = {}
+
+    candidates = [payload]
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+        candidates.insert(0, payload["data"])
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        token = token or item.get("accessToken") or item.get("token") or item.get("access_token")
+        secret = item.get("secretkey") or item.get("secretKey") or secret
+
+    if token and str(token).upper() != "NONE":
+        return str(token), str(secret)
+    return None, None
+
+
 def login_with_code(account_id):
-    """使用 code 直接登录获取 token（参考 BREO.py 的简洁模式）"""
-    code = get_wx_code(account_id)
-    
-    # 方案1：尝试直接用 code 登录 m.jlc.com
+    """使用一次性 code 登录；按小程序常见请求格式依次兼容。"""
     url = BASE_URL + "/api/login/login-by-code"
     headers = {
         "accept": "application/json, text/plain, */*",
@@ -133,29 +153,37 @@ def login_with_code(account_id):
         "xweb_xhr": "1",
         "user-agent": DEFAULT_UA,
     }
-    files = {"code": (None, code)}
-    
-    try:
-        resp = session.post(url, files=files, headers=headers, timeout=30)
-        token = resp.headers.get("X-Jlc-Accesstoken") or resp.headers.get("x-jlc-accesstoken")
-        if token and token.upper() != "NONE":
-            return {
-                "token": token,
-                "secret": DEFAULT_SECRET_KEY,
-                "updatedAt": int(time.time()),
-            }
-    except Exception as e:
-        print(f"[{account_id}] login-by-code 请求异常: {e}")
-    
-    # 方案2：如果方案1失败，打印响应信息帮助调试
-    try:
-        body = resp.text[:300] if 'resp' in locals() else "N/A"
-        status = resp.status_code if 'resp' in locals() else "N/A"
-        print(f"[{account_id}] login-by-code 失败: status={status}, body={body}")
-    except Exception:
-        pass
-    
-    raise RuntimeError(f"code登录失败，请检查响应")
+
+    # wx.request 默认发送 JSON。旧脚本使用 multipart，服务端升级后可能不再兼容；
+    # 每次重试必须重新获取 code，因为 wx.login code 只能使用一次。
+    attempts = (
+        ("JSON", lambda code: {"json": {"code": code}}),
+        ("表单", lambda code: {"data": {"code": code}}),
+        ("multipart", lambda code: {"files": {"code": (None, code)}}),
+    )
+    errors = []
+    for mode, build_request in attempts:
+        try:
+            code = get_wx_code(account_id)
+            resp = session.post(url, headers=headers, timeout=30, **build_request(code))
+            token, secret = _extract_login_auth(resp)
+            if token:
+                print(f"[{account_id}] login-by-code 登录成功（{mode}）")
+                return {
+                    "token": token,
+                    "secret": secret,
+                    "updatedAt": int(time.time()),
+                }
+            body = resp.text.replace("\r", " ").replace("\n", " ")[:300]
+            detail = f"{mode}: status={resp.status_code}, body={body}"
+            errors.append(detail)
+            print(f"[{account_id}] login-by-code 未通过（{detail}）")
+        except Exception as e:
+            detail = f"{mode}: 请求异常={e}"
+            errors.append(detail)
+            print(f"[{account_id}] login-by-code {detail}")
+
+    raise RuntimeError("code登录失败；" + "；".join(errors))
 
 
 def get_cached_token(account_id):
