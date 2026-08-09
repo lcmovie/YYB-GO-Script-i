@@ -6,8 +6,9 @@
 """
 JLC 小程序签到脚本（青龙面板版 / 多账号 / 推送 / 查询豆豆总数）
 【环境变量】
-- WX_ID / JLC:  账号配置，格式：wxid#备注，多账号用换行或 & 分隔
-- WECHAT_SERVER: 微信协议服务地址，默认：http://192.168.31.196:8787
+- YYB_SERVER: YYB-Go-Enhanced 账号配置，格式：server:port@ref，多账号换行
+- JLC: 可选，仅运行指定 ref，格式：ref#备注，多账号用换行或 & 分隔
+- JLC_AUTH: 可选手动凭据，格式：token#secret，多账号用换行或 & 分隔
 【依赖】
 - requests
 【第七天逻辑说明】
@@ -45,8 +46,7 @@ SCRIPT_NAME = "JLC 嘉立创签到"
 # ===================== 手动调试开关 =====================
 DEBUG = False
 DEBUG_ENV = {
-    "JLC": "wxid_xxxxxxxx#测试号",
-    "WECHAT_SERVER": "http://192.168.31.196:8787",
+    "JLC": "account-ref#测试号",
 }
 if DEBUG:
     for _k, _v in DEBUG_ENV.items():
@@ -55,19 +55,18 @@ if DEBUG:
 # =======================================================
 
 BASE_URL = "https://m.jlc.com"
+CAS_BASE_URL = "https://passport.jlc.com"
+CAS_APP_ID = os.getenv("JLC_CAS_APP_ID", "JLC_MOBILE_APP").strip()
 PLATFORM_TYPE = os.getenv("JLC_PLATFORM_TYPE", "MP-WEIXIN").strip()
 SOURCE = os.getenv("JLC_SOURCE", "2").strip()
-
-# 微信协议服务地址
-DEFAULT_WECHAT_SERVER = "http://192.168.31.196:8787"
-WECHAT_SERVER = os.getenv("WECHAT_SERVER", DEFAULT_WECHAT_SERVER).strip().rstrip("/")
-WX_AUTH = os.getenv("WX_ID", "")
 
 # 嘉立创小程序 appid
 JLC_MINI_APPID = os.getenv("JLC_MINI_APPID", "wx6c7b851c877dba42").strip()
 # 旧版固定 key 仅用于兼容已有缓存；当前 key 必须从官方更新接口动态获取。
 LEGACY_SECRET_KEY = "34343232636134362d646135612d346335662d386464382d356237633937623132413437"
 SECRET_UPDATE_URL = BASE_URL + "/api/integrated/secret/update"
+CAS_CHECK_APPLET_LOGIN_URL = CAS_BASE_URL + "/api/cas/sso/login/check-applet-login"
+CAS_APPLET_LOGIN_URL = CAS_BASE_URL + "/api/cas/sso/login/applet-silent-login"
 SECRET_EXPIRED_CODES = {29001, 29003}
 
 # Token 缓存路径
@@ -151,7 +150,7 @@ def refresh_secret_key(token="NONE", previous_key=""):
         "X-JLC-ClientType": "MP-WEIXIN",
         "X-JLC-MP-AppId": JLC_MINI_APPID,
         "X-JLC-MP-Env": os.getenv("JLC_MP_ENV", "release"),
-        "X-JLC-MP-Version": os.getenv("JLC_MP_VERSION", "1.113.0"),
+        "X-JLC-MP-Version": os.getenv("JLC_MP_VERSION", "1.117.4"),
         "origin": BASE_URL,
         "referer": BASE_URL + "/",
         "user-agent": DEFAULT_UA,
@@ -169,28 +168,91 @@ def refresh_secret_key(token="NONE", previous_key=""):
     return _CURRENT_SECRET_KEY
 
 
+def _extract_cas_auth_code(payload):
+    """从 CAS 响应中递归提取真正供 login-by-code 使用的 AC- 授权码。"""
+    if isinstance(payload, str):
+        return payload if payload.startswith("AC-") else None
+    if isinstance(payload, dict):
+        for value in payload.values():
+            code = _extract_cas_auth_code(value)
+            if code:
+                return code
+    if isinstance(payload, list):
+        for value in payload:
+            code = _extract_cas_auth_code(value)
+            if code:
+                return code
+    return None
+
+
+def get_cas_auth_code(account_id):
+    """按嘉立创小程序 154 的官方链路把 wx.login code 换成 CAS AC- code。"""
+    wx_code = get_wx_code(account_id)
+    if not wx_code:
+        raise RuntimeError("YYB未返回有效微信code")
+
+    headers = {
+        "accept": "application/json, text/plain, */*",
+        "accept-encoding": "gzip, deflate",
+        "content-type": "application/json",
+        "referer": f"https://servicewechat.com/{JLC_MINI_APPID}/154/page-frame.html",
+        "user-agent": DEFAULT_UA,
+    }
+    cas_session = requests.Session()
+    check_resp = cas_session.post(
+        CAS_CHECK_APPLET_LOGIN_URL,
+        json={"appId": CAS_APP_ID, "appletAuthCode": wx_code},
+        headers=headers,
+        timeout=30,
+    )
+    check_resp.raise_for_status()
+    check_data = check_resp.json()
+    check_info = check_data.get("data") or {}
+    applet_login_token = check_info.get("token") if isinstance(check_info, dict) else None
+    if check_data.get("code") != 200 or not applet_login_token:
+        message = check_data.get("message") or check_data.get("msg") or check_data
+        raise RuntimeError(f"CAS检查小程序登录失败: {str(message)[:200]}")
+    if check_info.get("isLoginBind") is False or check_info.get("bind") is False:
+        raise RuntimeError("嘉立创账号尚未绑定当前微信，请先在官方小程序完成绑定")
+
+    login_headers = dict(headers)
+    login_headers["referer"] = f"{CAS_BASE_URL}/m/login/mp-login?appId={CAS_APP_ID}"
+    login_resp = cas_session.post(
+        CAS_APPLET_LOGIN_URL,
+        json={"token": applet_login_token, "appId": CAS_APP_ID},
+        headers=login_headers,
+        timeout=30,
+    )
+    login_resp.raise_for_status()
+    login_data = login_resp.json()
+    cas_code = _extract_cas_auth_code(login_data)
+    if login_data.get("code") != 200 or not cas_code:
+        message = login_data.get("message") or login_data.get("msg") or login_data
+        raise RuntimeError(f"CAS小程序静默登录失败: {str(message)[:200]}")
+    print(f"[{account_id}] CAS授权码获取成功")
+    return cas_code
+
+
 def login_with_code(account_id):
-    """使用微信一次性 code 登录，并在密钥过期时自动更新后重试。"""
+    """使用 CAS AC- code 登录，并在密钥过期时自动更新后重试。"""
     url = BASE_URL + "/api/login/login-by-code"
     secret = refresh_secret_key()
     errors = []
     for attempt in range(2):
         headers = {
             "accept": "application/json, text/plain, */*",
-            "referer": f"https://servicewechat.com/{JLC_MINI_APPID}/141/page-frame.html",
+            "referer": f"https://servicewechat.com/{JLC_MINI_APPID}/154/page-frame.html",
             "X-JLC-AccessToken": "NONE",
             "X-JLC-ClientType": "MP-WEIXIN",
             "X-JLC-MP-AppId": JLC_MINI_APPID,
             "X-JLC-MP-Env": os.getenv("JLC_MP_ENV", "release"),
-            "X-JLC-MP-Version": os.getenv("JLC_MP_VERSION", "1.113.0"),
+            "X-JLC-MP-Version": os.getenv("JLC_MP_VERSION", "1.117.4"),
             "secretkey": secret,
             "xweb_xhr": "1",
             "user-agent": DEFAULT_UA,
         }
         try:
-            code = get_wx_code(account_id)
-            if not code:
-                raise RuntimeError("YYB未返回有效code")
+            code = get_cas_auth_code(account_id)
             resp = session.post(url, files={"code": (None, code)}, headers=headers, timeout=30)
             token, response_secret = _extract_login_auth(resp, secret)
             if token:
@@ -209,7 +271,7 @@ def login_with_code(account_id):
                 response_code = None
             if attempt == 0 and (response_code in SECRET_EXPIRED_CODES or resp.status_code == 460):
                 secret = refresh_secret_key(previous_key=secret)
-                print(f"[{account_id}] 登录未通过，已刷新secretkey并使用新code重试")
+                print(f"[{account_id}] 登录未通过，已刷新secretkey并使用新CAS授权码重试")
                 continue
             print(f"[{account_id}] login-by-code 未通过（{detail}）")
             break
@@ -219,7 +281,7 @@ def login_with_code(account_id):
             print(f"[{account_id}] login-by-code {detail}")
             break
 
-    raise RuntimeError("code登录失败；" + "；".join(errors))
+    raise RuntimeError("CAS登录失败；" + "；".join(errors))
 
 
 def get_cached_token(account_id):
@@ -312,27 +374,7 @@ def parse_accounts() -> List[Dict[str, str]]:
     remarks = _split_accounts(remarks_raw)
     accounts: List[Dict[str, str]] = []
 
-    # 1) wxid 自动登录模式（推荐）
-    wxid_raw = os.getenv("WX_ID") or os.getenv("JLC", "")
-    if wxid_raw:
-        items = _split_accounts(wxid_raw)
-        for idx, item in enumerate(items):
-            if "#" in item:
-                wxid, remark = item.split("#", 1)
-                wxid, remark = wxid.strip(), remark.strip()
-            else:
-                wxid, remark = item.strip(), ""
-            if not wxid:
-                continue
-            accounts.append({
-                "mode": "wxid",
-                "wxid": wxid,
-                "remark": remark or (remarks[idx] if idx < len(remarks) else f"账号{idx+1}"),
-            })
-        if accounts:
-            return accounts
-
-    # 兼容旧的 JLC_AUTH 模式
+    # 1) 显式 token 模式优先。否则 getCode 导出的 WX_ID 会使 JLC_AUTH 永远失效。
     auth_raw = _env("JLC_AUTH")
     if auth_raw:
         items = _split_accounts(auth_raw)
@@ -351,6 +393,26 @@ def parse_accounts() -> List[Dict[str, str]]:
                 "remark": remarks[idx] if idx < len(remarks) else f"账号{idx+1}",
             })
         return accounts
+
+    # 2) wxid 自动登录模式（推荐）；JLC 可覆盖全局 YYB 账号列表。
+    wxid_raw = os.getenv("JLC") or os.getenv("WX_ID", "")
+    if wxid_raw:
+        items = _split_accounts(wxid_raw)
+        for idx, item in enumerate(items):
+            if "#" in item:
+                wxid, remark = item.split("#", 1)
+                wxid, remark = wxid.strip(), remark.strip()
+            else:
+                wxid, remark = item.strip(), ""
+            if not wxid:
+                continue
+            accounts.append({
+                "mode": "wxid",
+                "wxid": wxid,
+                "remark": remark or (remarks[idx] if idx < len(remarks) else f"账号{idx+1}"),
+            })
+        if accounts:
+            return accounts
 
     raise RuntimeError("缺少环境变量：请设置 WX_ID 或 JLC（推荐）或 JLC_AUTH。")
 
