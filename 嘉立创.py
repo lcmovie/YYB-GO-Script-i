@@ -106,15 +106,76 @@ def mask_token(token):
 
 
 # ===================== 登录相关 =====================
-import getCode
+def _yyb_entries() -> List[Tuple[str, str]]:
+    """解析 YYB_SERVER，每行格式为 server:port@ref。"""
+    entries: List[Tuple[str, str]] = []
+    for line in os.getenv("YYB_SERVER", "").splitlines():
+        value = line.strip()
+        if not value or "@" not in value:
+            continue
+        server, ref = value.rsplit("@", 1)
+        server, ref = server.strip().rstrip("/"), ref.strip()
+        if not server or not ref:
+            continue
+        if not server.startswith(("http://", "https://")):
+            server = "http://" + server
+        entries.append((server, ref))
+    return entries
+
+
+def _install_yyb_account_view() -> None:
+    """未显式配置 JLC/WX_ID 时，让原账号循环读取 YYB_SERVER 中的 ref。"""
+    if os.getenv("JLC") or os.getenv("WX_ID"):
+        return
+    refs = [ref for _, ref in _yyb_entries()]
+    if refs:
+        os.environ["WX_ID"] = "\n".join(refs)
+
+
+def _select_yyb_account(identifier: str) -> Tuple[str, str]:
+    entries = _yyb_entries()
+    if not entries:
+        raise RuntimeError("未配置 YYB_SERVER，格式：地址@账号ref，多账号换行")
+    raw = str(identifier or "").split("#", 1)[0].strip()
+    for server, ref in entries:
+        if raw in (ref, f"{server}@{ref}"):
+            return server, ref
+    if len(entries) == 1:
+        return entries[0]
+    raise RuntimeError(f"YYB_SERVER 中找不到账号ref：{raw}")
 
 
 def get_wx_code(account_id):
-    """通过微信协议服务获取小程序 code"""
+    """直接调用 YYB-Go-Enhanced 获取嘉立创小程序 wx.login code。"""
     try:
-        return getCode.get_single_code(JLC_MINI_APPID, account_id)
-    except Exception as e:
-        raise RuntimeError(f"获取code失败: {e}")
+        server, ref = _select_yyb_account(account_id)
+        yyb_session = requests.Session()
+        yyb_session.trust_env = False
+        response = yyb_session.post(
+            f"{server}/wxapp/getCode",
+            json={"ref": ref, "app_id": JLC_MINI_APPID},
+            timeout=30,
+        )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RuntimeError(f"YYB响应不是JSON（HTTP {response.status_code}）") from exc
+        if not response.ok:
+            raise RuntimeError(data.get("error") or data.get("msg") or f"YYB请求失败（HTTP {response.status_code}）")
+        if "code" in data and data.get("code") not in (0, "0", None):
+            raise RuntimeError(data.get("error") or data.get("msg") or "YYB请求失败")
+        result = data.get("result")
+        if result is None:
+            result = (data.get("data") or {}).get("result")
+        if not isinstance(result, dict) or not result.get("code"):
+            raise RuntimeError("YYB未返回有效微信code")
+        return str(result["code"])
+    except Exception as exc:
+        print(f"[YYB] 获取code失败：{exc}")
+        return None
+
+
+_install_yyb_account_view()
 
 
 def _extract_login_auth(resp, fallback_secret):
