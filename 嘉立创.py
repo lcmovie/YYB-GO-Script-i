@@ -65,8 +65,10 @@ WX_AUTH = os.getenv("WX_ID", "")
 
 # 嘉立创小程序 appid
 JLC_MINI_APPID = os.getenv("JLC_MINI_APPID", "wx6c7b851c877dba42").strip()
-# secretkey 固定值
-DEFAULT_SECRET_KEY = "34343232636134362d646135612d346335662d386464382d356237633937623132413437"
+# 旧版固定 key 仅用于兼容已有缓存；当前 key 必须从官方更新接口动态获取。
+LEGACY_SECRET_KEY = "34343232636134362d646135612d346335662d386464382d356237633937623132413437"
+SECRET_UPDATE_URL = BASE_URL + "/api/integrated/secret/update"
+SECRET_EXPIRED_CODES = {29001, 29003}
 
 # Token 缓存路径
 TOKEN_CACHE_PATH = Path(__file__).with_name("JLC_token_cache.json")
@@ -79,6 +81,7 @@ DEFAULT_UA = (
 )
 
 session = requests.Session()
+_CURRENT_SECRET_KEY = ""
 
 
 def read_token_cache():
@@ -115,10 +118,10 @@ def get_wx_code(account_id):
         raise RuntimeError(f"获取code失败: {e}")
 
 
-def _extract_login_auth(resp):
+def _extract_login_auth(resp, fallback_secret):
     """兼容从响应头或 JSON 响应体读取登录凭据。"""
     token = resp.headers.get("X-Jlc-Accesstoken") or resp.headers.get("x-jlc-accesstoken")
-    secret = resp.headers.get("secretkey") or resp.headers.get("Secretkey") or DEFAULT_SECRET_KEY
+    secret = resp.headers.get("secretkey") or resp.headers.get("Secretkey") or fallback_secret
     try:
         payload = resp.json()
     except (ValueError, TypeError):
@@ -138,50 +141,83 @@ def _extract_login_auth(resp):
     return None, None
 
 
-def login_with_code(account_id):
-    """使用一次性 code 登录；按小程序常见请求格式依次兼容。"""
-    url = BASE_URL + "/api/login/login-by-code"
+def refresh_secret_key(token="NONE", previous_key=""):
+    """从嘉立创官方接口获取当前 keyId，不输出密钥内容。"""
+    global _CURRENT_SECRET_KEY
     headers = {
         "accept": "application/json, text/plain, */*",
-        "referer": f"https://servicewechat.com/{JLC_MINI_APPID}/141/page-frame.html",
-        "X-JLC-AccessToken": "NONE",
+        "content-type": "application/json;charset=UTF-8",
+        "X-JLC-AccessToken": token or "NONE",
         "X-JLC-ClientType": "MP-WEIXIN",
         "X-JLC-MP-AppId": JLC_MINI_APPID,
         "X-JLC-MP-Env": os.getenv("JLC_MP_ENV", "release"),
         "X-JLC-MP-Version": os.getenv("JLC_MP_VERSION", "1.113.0"),
-        "secretkey": DEFAULT_SECRET_KEY,
-        "xweb_xhr": "1",
+        "origin": BASE_URL,
+        "referer": BASE_URL + "/",
         "user-agent": DEFAULT_UA,
     }
+    payload = {"keyId": previous_key} if previous_key else {}
+    resp = session.post(SECRET_UPDATE_URL, json=payload, headers=headers, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    key_info = data.get("data") or {}
+    key_id = key_info.get("keyId") if isinstance(key_info, dict) else None
+    if data.get("code") != 200 or not key_id:
+        raise RuntimeError(f"更新secretkey失败: {str(data.get('message') or data)[:200]}")
+    _CURRENT_SECRET_KEY = str(key_id)
+    print("[JLC] secretkey 已动态更新")
+    return _CURRENT_SECRET_KEY
 
-    # wx.request 默认发送 JSON。旧脚本使用 multipart，服务端升级后可能不再兼容；
-    # 每次重试必须重新获取 code，因为 wx.login code 只能使用一次。
-    attempts = (
-        ("JSON", lambda code: {"json": {"code": code}}),
-        ("表单", lambda code: {"data": {"code": code}}),
-        ("multipart", lambda code: {"files": {"code": (None, code)}}),
-    )
+
+def login_with_code(account_id):
+    """使用微信一次性 code 登录，并在密钥过期时自动更新后重试。"""
+    url = BASE_URL + "/api/login/login-by-code"
+    secret = refresh_secret_key()
     errors = []
-    for mode, build_request in attempts:
+    for attempt in range(2):
+        headers = {
+            "accept": "application/json, text/plain, */*",
+            "referer": f"https://servicewechat.com/{JLC_MINI_APPID}/141/page-frame.html",
+            "X-JLC-AccessToken": "NONE",
+            "X-JLC-ClientType": "MP-WEIXIN",
+            "X-JLC-MP-AppId": JLC_MINI_APPID,
+            "X-JLC-MP-Env": os.getenv("JLC_MP_ENV", "release"),
+            "X-JLC-MP-Version": os.getenv("JLC_MP_VERSION", "1.113.0"),
+            "secretkey": secret,
+            "xweb_xhr": "1",
+            "user-agent": DEFAULT_UA,
+        }
         try:
             code = get_wx_code(account_id)
-            resp = session.post(url, headers=headers, timeout=30, **build_request(code))
-            token, secret = _extract_login_auth(resp)
+            if not code:
+                raise RuntimeError("YYB未返回有效code")
+            resp = session.post(url, files={"code": (None, code)}, headers=headers, timeout=30)
+            token, response_secret = _extract_login_auth(resp, secret)
             if token:
-                print(f"[{account_id}] login-by-code 登录成功（{mode}）")
+                print(f"[{account_id}] login-by-code 登录成功")
                 return {
                     "token": token,
-                    "secret": secret,
+                    "secret": response_secret,
                     "updatedAt": int(time.time()),
                 }
             body = resp.text.replace("\r", " ").replace("\n", " ")[:300]
-            detail = f"{mode}: status={resp.status_code}, body={body}"
+            detail = f"第{attempt + 1}次: status={resp.status_code}, body={body}"
             errors.append(detail)
+            try:
+                response_code = resp.json().get("code")
+            except (ValueError, AttributeError):
+                response_code = None
+            if attempt == 0 and (response_code in SECRET_EXPIRED_CODES or resp.status_code == 460):
+                secret = refresh_secret_key(previous_key=secret)
+                print(f"[{account_id}] 登录未通过，已刷新secretkey并使用新code重试")
+                continue
             print(f"[{account_id}] login-by-code 未通过（{detail}）")
+            break
         except Exception as e:
-            detail = f"{mode}: 请求异常={e}"
+            detail = f"第{attempt + 1}次: 请求异常={e}"
             errors.append(detail)
             print(f"[{account_id}] login-by-code {detail}")
+            break
 
     raise RuntimeError("code登录失败；" + "；".join(errors))
 
@@ -203,18 +239,24 @@ def remove_cached_token(account_id):
         write_token_cache(cache)
 
 
-def validate_token(token):
+def validate_token(token, secret):
     """验证 token 是否有效"""
     try:
         url = BASE_URL + "/api/activity/sign/getCurrentUserSignInConfig"
-        headers = {
-            "x-jlc-accesstoken": token,
-            "secretkey": DEFAULT_SECRET_KEY,
-            "user-agent": DEFAULT_UA,
-        }
-        resp = session.get(url, params={"platformType": PLATFORM_TYPE}, headers=headers, timeout=15)
-        if resp.status_code == 200:
+        current_secret = _CURRENT_SECRET_KEY or secret or LEGACY_SECRET_KEY
+        for attempt in range(2):
+            headers = {
+                "x-jlc-accesstoken": token,
+                "secretkey": current_secret,
+                "user-agent": DEFAULT_UA,
+            }
+            resp = session.get(url, params={"platformType": PLATFORM_TYPE}, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                return False
             data = resp.json()
+            if attempt == 0 and data.get("code") in SECRET_EXPIRED_CODES:
+                current_secret = refresh_secret_key(token=token, previous_key=current_secret)
+                continue
             return data.get("success") is True
         return False
     except Exception:
@@ -226,15 +268,16 @@ def get_token_for_account(account_id, remark):
     cached = get_cached_token(account_id)
     if cached and cached.get("token"):
         print(f"[{remark}] 使用缓存token: {mask_token(cached['token'])}")
-        if validate_token(cached["token"]):
-            return cached["token"], cached.get("secret", DEFAULT_SECRET_KEY)
+        cached_secret = cached.get("secret", LEGACY_SECRET_KEY)
+        if validate_token(cached["token"], cached_secret):
+            return cached["token"], _CURRENT_SECRET_KEY or cached_secret
         print(f"[{remark}] 缓存token失效，重新登录")
         remove_cached_token(account_id)
 
     auth_info = login_with_code(account_id)
     save_cached_token(account_id, auth_info)
     print(f"[{remark}] 登录成功")
-    return auth_info["token"], auth_info.get("secret", DEFAULT_SECRET_KEY)
+    return auth_info["token"], auth_info.get("secret", _CURRENT_SECRET_KEY or LEGACY_SECRET_KEY)
 
 
 # ===================== 工具函数 =====================
@@ -317,7 +360,7 @@ def build_headers(token: str, secret: str) -> Dict[str, str]:
         "accept": "application/json, text/plain, */*",
         "content-type": "application/json;charset=UTF-8",
         "x-jlc-accesstoken": token,
-        "secretkey": secret,
+        "secretkey": _CURRENT_SECRET_KEY or secret,
         "origin": BASE_URL,
         "referer": BASE_URL + "/",
         "user-agent": DEFAULT_UA,
@@ -328,13 +371,19 @@ def build_headers(token: str, secret: str) -> Dict[str, str]:
 def api_get(session: requests.Session, path: str, params: Optional[Dict[str, Any]] = None, 
             token: str = "", secret: str = "") -> Dict[str, Any]:
     url = BASE_URL + path
-    headers = build_headers(token, secret) if token else {}
-    r = session.get(url, params=params, headers=headers, timeout=20)
-    r.raise_for_status()
-    try:
-        return r.json()
-    except Exception:
-        raise RuntimeError(f"接口返回非 JSON：{url}\n{r.text[:300]}")
+    for attempt in range(2):
+        headers = build_headers(token, secret) if token else {}
+        r = session.get(url, params=params, headers=headers, timeout=20)
+        r.raise_for_status()
+        try:
+            data = r.json()
+        except Exception:
+            raise RuntimeError(f"接口返回非 JSON：{url}\n{r.text[:300]}")
+        if attempt == 0 and data.get("code") in SECRET_EXPIRED_CODES:
+            refresh_secret_key(token=token, previous_key=headers.get("secretkey", ""))
+            continue
+        return data
+    return data
 
 
 def get_sign_status(s, token, secret) -> Dict[str, Any]:
