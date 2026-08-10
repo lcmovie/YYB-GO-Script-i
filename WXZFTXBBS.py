@@ -440,5 +440,5 @@ class AutoTask:
                 notify.send(title, content)
 
 if __name__ == "__main__":
-    auto_task = AutoTask("code版_微信支付提现笔笔省")
+    auto_task = AutoTask("微信支付提现笔笔省")
     auto_task.run()
