@@ -2,20 +2,15 @@
 君品荟签到
 
 变量：
-  WECHAT_SERVER  微信协议服务地址，默认 http://192.168.6.222:8011
-  WX_ID         微信账号，多账号支持换行、& 分隔，必须配置
+  YYB_SERVER    YYB-Go-Enhanced 地址@账号标识，多账号一行一个，必须配置
+                示例：yyb-go:8000@openid
   cron: 57 10,13 * * *
-WX_ID 格式：
-  支持直接填 wxid_xxx (牛子)
-  支持直接填 openid (应用宝)
-  脚本会自动使用 getCode.js 进行路由获取
 
 可选：
   JPH_NOTIFY     通知开关，默认 1；填 0 关闭 sendNotify
 */
 const $ = new Env('君品荟签到');
 const axios = require('axios');
-const { getSingleCode } = require('./getCode.js');
 
 const { setGlobalDispatcher, Agent } = require('undici');
 setGlobalDispatcher(new Agent({
@@ -33,7 +28,8 @@ const Notify = !['0', 'false', 'off', 'no'].includes(String(($.isNode() ? proces
 const debug = 0; //0为关闭调试，1为打开调试,默认为0
 const WX_APPID = "wx8d41cdc44c8aeaab";
 const OCR_SERVER = (($.isNode() ? process.env.OCR_SERVER : $.getdata("OCR_SERVER")) || "http://ocr.fj.us.ci").replace(/\/$/, "");
-let xjhd = ($.isNode() ? process.env.WX_ID : $.getdata("WX_ID")) || ""
+const YYB_SERVER = ($.isNode() ? process.env.YYB_SERVER : $.getdata("YYB_SERVER")) || "";
+let xjhd = '';
 let xjhdArr = [];
 let data = '';
 let msg = '';
@@ -44,6 +40,18 @@ let pointValue = '';
 let wx_unionid = '';
 let wx_applet_openid = '';
 let user_phone = '';
+
+function parseYybGoEntry(rawValue) {
+    const value = String(rawValue || '').trim();
+    const atIndex = value.lastIndexOf('@');
+    if (atIndex <= 0 || atIndex === value.length - 1) {
+        return { server: '', ref: '' };
+    }
+    let server = value.slice(0, atIndex).trim().replace(/\/+$/, '');
+    const ref = value.slice(atIndex + 1).trim();
+    if (server && !/^https?:\/\//i.test(server)) server = `http://${server}`;
+    return server && ref ? { server, ref } : { server: '', ref: '' };
+}
 
 !(async () => {
     if (typeof $request !== "undefined") {
@@ -67,9 +75,21 @@ let user_phone = '';
             let num = index + 1
             addNotifyStr(`\n==== 开始【第 ${num} 个账号】====\n`, true)
             xjhd = xjhdArr[index];
+            xj_code = '';
+            xj_token = '';
+            xj_cookie = '';
+            wx_unionid = '';
+            wx_applet_openid = '';
+            user_phone = '';
 
-            await get_code(xjhd);
-            await wxMiniSilentLogin(xj_code);
+            if (!(await get_code(xjhd))) {
+                addNotifyStr(`❌ 第 ${num} 个账号获取微信 code 失败，跳过`, true);
+                continue;
+            }
+            if (!(await wxMiniSilentLogin(xj_code))) {
+                addNotifyStr(`❌ 第 ${num} 个账号业务登录失败，跳过`, true);
+                continue;
+            }
             await get_setcookie(xj_token);
 
             // 滑块验证
@@ -137,17 +157,33 @@ let user_phone = '';
 // 获取code
 async function get_code(hd) {
     xj_code = '';
-    const account = String(hd || '').trim().split('#')[0].trim();
+    const { server, ref } = parseYybGoEntry(hd);
+    if (!server || !ref) {
+        log(`❌ YYB_SERVER 格式错误，应为 地址@账号标识`);
+        return false;
+    }
     try {
-        xj_code = await getSingleCode(WX_APPID, account);
+        const response = await axios.post(`${server}/wxapp/getCode`, {
+            ref,
+            app_id: WX_APPID
+        }, {
+            timeout: 20000,
+            proxy: false,
+            validateStatus: () => true
+        });
+        const result = response.data;
+        xj_code = result && result.data && result.data.result && result.data.result.code;
         if (xj_code) {
-            log(`✅ 获取code成功: ${account}`);
+            log(`✅ YYB-Go-Enhanced 获取 code 成功`);
+            return true;
         } else {
-            log(`❌ 获取code异常: 未拿到有效code`);
+            const detail = JSON.stringify(result || {}).slice(0, 300);
+            log(`❌ YYB-Go-Enhanced 获取 code 失败（HTTP ${response.status}）：${detail}`);
         }
     } catch (err) {
-        console.error(`❌ 获取code请求失败: ${err.message || err}`);
+        log(`❌ YYB-Go-Enhanced 请求异常：${err.message || err}`);
     }
+    return false;
 }
 
 // 静默登录
@@ -166,20 +202,28 @@ async function wxMiniSilentLogin(codestr) {
         axios.request(options).then(res => {
             try {
                 const data = res.data;
-                xj_token = data.data.token;
-                wx_unionid = data.data.unionId || '';
-                wx_applet_openid = data.data.openId || '';
-                user_phone = data.data.phone || '';
+                const loginData = data && data.data;
+                if (!loginData || !loginData.token) {
+                    const code = data && (data.code ?? data.status);
+                    const reason = data && (data.message || data.msg || data.error || data.success);
+                    log(`❌ 业务登录失败：code=${code ?? 'unknown'} message=${String(reason ?? '未返回 token').slice(0, 160)}`);
+                    return resolve(false);
+                }
+                xj_token = loginData.token;
+                wx_unionid = loginData.unionId || '';
+                wx_applet_openid = loginData.openId || '';
+                user_phone = loginData.phone || '';
                 let hidePhone = user_phone.replace(/(\d{3})\d{4}(\d{4})/, '$1****$2');
                 //log(`✅ 用户手机号获取成功:  ${hidePhone}`);
                 addNotifyStr(`✅ 用户手机号获取成功:  ${hidePhone}`);
+                resolve(true);
             } catch (e) {
-                log(`❌ 登录解析异常`)
+                log(`❌ 登录解析异常：${e.message || e}`)
+                resolve(false);
             }
-            resolve();
         }).catch(err => {
-            log(`❌ 登录请求失败`)
-            resolve();
+            log(`❌ 登录请求失败：${err.message || err}`)
+            resolve(false);
         })
     })
 }
@@ -370,8 +414,20 @@ function $await(ms) {
 
 // 环境处理
 async function Envs() {
-    if (!xjhd) { log(`未填写变量 WX_ID`); return false }
-    xjhdArr = xjhd.split(/[\n&@]/).filter(i => i);
+    if (!YYB_SERVER.trim()) {
+        log(`未填写变量 YYB_SERVER，格式：地址@账号标识，多账号一行一个`);
+        return false;
+    }
+    xjhdArr = YYB_SERVER.split(/\r?\n/).map(i => i.trim()).filter(i => {
+        if (!i) return false;
+        const parsed = parseYybGoEntry(i);
+        if (!parsed.server || !parsed.ref) log(`跳过无效 YYB_SERVER 配置：${i}`);
+        return parsed.server && parsed.ref;
+    });
+    if (!xjhdArr.length) {
+        log(`YYB_SERVER 中没有有效账号`);
+        return false;
+    }
     return true;
 }
 
