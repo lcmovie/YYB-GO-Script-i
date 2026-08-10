@@ -1,7 +1,7 @@
 """
 作者: 临渊
 日期: 2025/8/21
-name: code版_微信支付提现笔笔省
+name: 微信支付提现笔笔省
 入口: 微信小程序 (https://a.c1ns.cn/X3ucP)
 功能: 领券、查询
 变量: YYB_SERVER (YYB-Go-Enhanced地址@账号ref，多个账号换行分割)
