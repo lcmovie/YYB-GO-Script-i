@@ -10,16 +10,13 @@
 环境变量配置说明：
 ========================================
 必填：
-  WX_ID           微信账号，多账号换行分隔
-                  格式：wxid/openid#备注（备注可选）
-                  示例：
-                    wxid_abc123#李四
-                    owNAX6v0xxx#张三
-                    wxid_xyz456
-  WECHAT_SERVER   微信协议服务地址（getCode统一接口）
-                  默认：http://127.0.0.1:8011
+  YYB_SERVER      YYB-Go-Enhanced 地址@账号ref，多账号一行一个
 
 选填：
+  WX_ID/WXIDXJ    只运行指定账号，格式：ref#备注，多账号换行或 & 分隔
+                  未配置时自动读取 YYB_SERVER 中的全部账号ref
+  WECHAT_SERVER   旧微信协议服务回退地址
+                  默认：http://127.0.0.1:8011
   OCR_SERVER      滑块验证码识别服务地址（ddddocr）
                   默认：http://localhost:7777
                   不设则遇到滑块验证时报错
@@ -217,9 +214,22 @@ class WxAdapter:
         if _HAS_GETCODE:
             try:
                 code = get_single_code(appid, wxid)
-                return {"success": True, "code": code}
+                if code:
+                    return {"success": True, "code": code}
             except Exception as e:
                 log.warning(f"getCode获取失败，尝试牛子API: {e}")
+
+        # 单文件运行时可能无法导入同目录 getCode.py，直接使用
+        # YYB_SERVER 中与当前 ref 对应的服务获取 wx.login code。
+        if self._can_use_yyb(wxid):
+            try:
+                result = self._yyb_call("getCode", wxid, appid)
+                code = result.get("code")
+                if code:
+                    return {"success": True, "code": code}
+                return {"success": False, "error": "YYB未返回有效code"}
+            except Exception as e:
+                log.warning(f"YYB直连获取code失败，尝试牛子API: {e}")
         
         # 回退到牛子 API
         try:
@@ -234,11 +244,36 @@ class WxAdapter:
     def _raw_id(self, wxid):
         return str(wxid).split("#")[0].strip()
 
+    def _configured_yyb_entries(self):
+        entries = []
+        for line in (os.environ.get("YYB_SERVER") or "").splitlines():
+            value = line.strip()
+            if not value or "@" not in value:
+                continue
+            server, ref = value.rsplit("@", 1)
+            server, ref = server.strip().rstrip("/"), ref.strip()
+            if not server or not ref:
+                continue
+            if not server.startswith(("http://", "https://")):
+                server = "http://" + server
+            entries.append({"server": server, "ref": ref})
+        return entries
+
+    def _yyb_entry_for(self, wxid):
+        entries = self._configured_yyb_entries()
+        raw_id = self._raw_id(wxid)
+        for entry in entries:
+            if raw_id in (entry["ref"], f'{entry["server"]}@{entry["ref"]}'):
+                return entry
+        if len(entries) == 1:
+            return entries[0]
+        return None
+
     def _is_wxid_style(self, wxid):
         return self._raw_id(wxid).lower().startswith("wxid_")
 
     def _can_use_yyb(self, wxid):
-        return bool(self.yyb_server) and not self._is_wxid_style(wxid)
+        return bool(self._yyb_entry_for(wxid) or self.yyb_server) and not self._is_wxid_style(wxid)
 
     def _can_use_unified_wxapp(self, wxid):
         return not self._is_wxid_style(wxid) and (bool(get_single_operate_wx_data) or bool(self.yyb_server))
@@ -280,15 +315,17 @@ class WxAdapter:
         return raw_id
 
     def _yyb_call(self, endpoint, wxid, appid, payload=None):
-        if not self.yyb_server:
+        entry = self._yyb_entry_for(wxid)
+        yyb_server = entry["server"] if entry else self.yyb_server
+        if not yyb_server:
             raise RuntimeError("未配置 YYB_SERVER")
         body = {
-            "ref": self._yyb_resolve_ref(wxid),
+            "ref": entry["ref"] if entry else self._yyb_resolve_ref(wxid),
             "app_id": appid,
         }
         if payload is not None:
             body["payload"] = payload
-        resp = self.session.post(f"{self.yyb_server}/wxapp/{endpoint}", json=body, timeout=30)
+        resp = self.session.post(f"{yyb_server}/wxapp/{endpoint}", json=body, timeout=30)
         if resp.status_code == 409:
             raise RuntimeError("账号 login_buffer 已过期，需要重新扫码登录")
         resp.raise_for_status()
@@ -850,6 +887,22 @@ def parse_accounts(raw):
             accounts.append({"id": item, "note": ""})
     return accounts
 
+def parse_yyb_server_accounts(raw):
+    """从多行 YYB_SERVER（地址@ref）提取账号，保持原有顺序并去重。"""
+    accounts = []
+    seen = set()
+    for line in (raw or "").splitlines():
+        value = line.strip()
+        if not value or "@" not in value:
+            continue
+        _, ref = value.rsplit("@", 1)
+        ref = ref.strip()
+        if not ref or ref in seen:
+            continue
+        seen.add(ref)
+        accounts.append({"id": ref, "note": ""})
+    return accounts
+
 # ============================================================
 #  主业务逻辑 run()
 # ============================================================
@@ -1393,7 +1446,11 @@ if __name__ == "__main__":
 
     accounts = parse_accounts(WX_ID_RAW)
     if not accounts:
-        print("❌ 未找到环境变量 WX_ID 或 WXIDXJ，请设置账号")
+        accounts = parse_yyb_server_accounts(os.getenv("YYB_SERVER", ""))
+        if accounts:
+            print("ℹ️ 未配置 WX_ID/WXIDXJ，已从 YYB_SERVER 读取 %d 个账号" % len(accounts))
+    if not accounts:
+        print("❌ 未找到账号，请设置 WX_ID、WXIDXJ 或 YYB_SERVER")
         sys.exit(1)
 
     CACHE_FILE = Path(__file__).parent / "xijiutoken.json"
