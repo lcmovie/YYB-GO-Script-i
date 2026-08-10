@@ -3,18 +3,91 @@
 //  红色火箭（华泰基金指慧家）
  
 //  环境变量：
-//    WX_ID              必填，格式：wxid#备注，多账号换行或 & 分隔
-//   WECHAT_SERVER      微信协议服务地址
+//    YYB_SERVER         必填，格式：地址@账号ref，多账号换行
+//    WX_ID              可选，仅运行指定ref，格式：ref#备注，多账号换行或 & 分隔
+//    WECHAT_SERVER      可选，旧微信协议服务回退地址
 //    HSJJ_AUTO_CLAIM_H5 设为 '0' 或 'false' 关闭自动提现（默认开启）
  
 
 'use strict';
 
-const { getSingleCode } = require('./getCode.js');
-const getWxCode = (wxid, appid) => getSingleCode(appid, String(wxid).split('#')[0].trim());
 const axios = require('axios');
 const fs = require('fs');
 const pathMod = require('path');
+
+// ==================== 内置 YYB-Go-Enhanced 适配 ====================
+function getYybEntries() {
+    return String(process.env.YYB_SERVER || '')
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(Boolean)
+        .map(line => {
+            const at = line.lastIndexOf('@');
+            if (at < 1) return null;
+            let server = line.slice(0, at).trim().replace(/\/+$/, '');
+            const ref = line.slice(at + 1).trim();
+            if (!server || !ref) return null;
+            if (!/^https?:\/\//i.test(server)) server = `http://${server}`;
+            return { server, ref };
+        })
+        .filter(Boolean);
+}
+
+const YYB_ENTRIES = getYybEntries();
+if (!process.env.WX_ID && YYB_ENTRIES.length) {
+    process.env.WX_ID = YYB_ENTRIES.map(item => item.ref).join('\n');
+}
+
+function findYybEntry(identifier) {
+    const raw = String(identifier || '').split('#')[0].trim();
+    return YYB_ENTRIES.find(item => item.ref === raw || `${item.server}@${item.ref}` === raw) || null;
+}
+
+function selectYybEntry(identifier) {
+    if (!YYB_ENTRIES.length) {
+        throw new Error('未配置 YYB_SERVER，格式：地址@账号ref，多账号换行');
+    }
+    const raw = String(identifier || '').split('#')[0].trim();
+    const found = findYybEntry(raw);
+    if (found) return found;
+    if (YYB_ENTRIES.length === 1) return YYB_ENTRIES[0];
+    throw new Error(`YYB_SERVER 中找不到账号ref：${raw}`);
+}
+
+async function yybPost(identifier, appId, route, payload) {
+    const item = selectYybEntry(identifier);
+    const body = { ref: item.ref, app_id: appId };
+    if (payload !== undefined) body.payload = payload;
+    const response = await axios.post(`${item.server}${route}`, body, {
+        timeout: 30000,
+        proxy: false,
+        validateStatus: () => true,
+        headers: { 'Content-Type': 'application/json' },
+    });
+    const data = response.data || {};
+    if (response.status < 200 || response.status >= 300) {
+        throw new Error(data.error || data.msg || `YYB请求失败（HTTP ${response.status}）`);
+    }
+    if (Object.prototype.hasOwnProperty.call(data, 'code') && ![0, '0', null, undefined].includes(data.code)) {
+        throw new Error(data.error || data.msg || 'YYB请求失败');
+    }
+    const result = data.result || (data.data && data.data.result);
+    if (!result || typeof result !== 'object') throw new Error('YYB响应缺少result');
+    return result;
+}
+
+async function getSingleCode(appId, identifier) {
+    try {
+        const result = await yybPost(identifier, appId, '/wxapp/getCode');
+        if (!result.code) throw new Error('YYB未返回有效code');
+        return result.code;
+    } catch (error) {
+        console.log(`[YYB] 获取code失败：${error.message}`);
+        return null;
+    }
+}
+
+const getWxCode = (wxid, appid) => getSingleCode(appid, String(wxid).split('#')[0].trim());
 
 const BASE_URL = 'https://index.amcfortune.com';
 
@@ -322,25 +395,21 @@ async function apiRequest(method, url, data, token, encryptVer, openId, userId, 
 }
 
 // ==================== 微信登录 ====================
-// 使用 getCode.js 统一接口
+// 使用脚本内置 YYB-Go-Enhanced 接口
 
 // ==================== 业务逻辑 ====================
 
 // 获取手机号授权code
 async function getPhoneCodeInfo(wxid) {
     const cleanWxid = String(wxid).split('#')[0].trim();
-    const isYyb = /^\d+$/.test(cleanWxid) || /^o[a-zA-Z0-9_-]{20,}$/.test(cleanWxid);
+    const isYyb = Boolean(findYybEntry(cleanWxid)) || /^\d+$/.test(cleanWxid) || /^o[a-zA-Z0-9_-]{20,}$/.test(cleanWxid);
     
     let respData;
     if (isYyb) {
         // 使用 YYB 协议获取手机号 code
-        const { WeChatCodeGetter, YYBAdapter } = require('./getCode.js');
-        const getter = new WeChatCodeGetter();
-        await getter.init();
-        
-        const yybAdapter = new YYBAdapter(getter.yybServer);
-        const resolvedRef = await yybAdapter._resolveRef(cleanWxid);
-        const url = getter.yybServer.replace(/\/+$/, '') + '/wxapp/getPhoneNumber';
+        const entry = selectYybEntry(cleanWxid);
+        const resolvedRef = entry.ref;
+        const url = entry.server + '/wxapp/getPhoneNumber';
         
         if (debug) log(`[YYB] 请求手机号code: ref=${resolvedRef}, app_id=${APPID}`);
         const resp = await axios.post(url, { ref: resolvedRef, app_id: APPID }, {
@@ -589,16 +658,12 @@ async function getEncryptKey(wxid) {
     // 2) 兜底走小程序协议接口
     let respData;
     const cleanWxid = String(wxid).split('#')[0].trim();
-    const isYyb = /^\d+$/.test(cleanWxid) || /^o[a-zA-Z0-9_-]{20,}$/.test(cleanWxid);
+    const isYyb = Boolean(findYybEntry(cleanWxid)) || /^\d+$/.test(cleanWxid) || /^o[a-zA-Z0-9_-]{20,}$/.test(cleanWxid);
 
     if (isYyb) {
-        const { WeChatCodeGetter, YYBAdapter } = require('./getCode.js');
-        const getter = new WeChatCodeGetter();
-        await getter.init();
-        
-        const yybAdapter = new YYBAdapter(getter.yybServer);
-        const resolvedRef = await yybAdapter._resolveRef(cleanWxid);
-        const url = getter.yybServer.replace(/\/+$/, '') + '/wxapp/operateWxData';
+        const entry = selectYybEntry(cleanWxid);
+        const resolvedRef = entry.ref;
+        const url = entry.server + '/wxapp/operateWxData';
         
         if (debug) log(`[YYB] 请求EncryptKey: ref=${resolvedRef}, app_id=${APPID}`);
         const resp = await axios.post(url, {
@@ -1002,7 +1067,7 @@ async function resolveH5Openid(wxid, ticketCode, cache, cacheKey) {
     if (!wxid || !WECHAT_SERVER || !ticketCode) return '';
 
     try {
-        // 1. 通过 getCode.js 统一接口获取 H5 公众号 code
+        // 1. 通过内置 YYB-Go-Enhanced 接口获取 H5 公众号 code
         const code = await getSingleCode(H5_OAUTH_APPID, String(wxid).split('#')[0].trim());
         if (!code) {
             if (debug) log('  ⚠️ 桥接服务未返回H5 code');
