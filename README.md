@@ -6,7 +6,10 @@
 - 感谢 [SuperNaiBA/YYB-GO-Script](https://github.com/SuperNaiBA/YYB-GO-Script) 作者提供 YYB Go 青龙适配脚本及仓库订阅范例。
 - 感谢 [ZHwin/kuakuaql-docs](https://github.com/ZHwin/kuakuaql-docs) 及压缩包内各脚本原作者提供脚本资料；原作者信息尽量保留在各文件头部。
 
-本项目是 **YYB-GO-Script 项目的脚本补充**，统一使用 `YYB_SERVER` 配置和 YYB-Go-Enhanced 的 `/wxapp/*` 接口，为青龙面板补充更多微信小程序脚本。
+本项目是 **YYB-GO-Script 项目的脚本补充**，统一使用 `YYB_SERVER` 配置和 YYB-Go-Enhanced 的 `/wxapp/*` 接口，为青龙面板补充更多微信小程序脚本，后续我将陆续把调整好的脚本贡献到[SuperNaiBA/YYB-GO-Script](https://github.com/SuperNaiBA/YYB-GO-Script)中，建议优先使用该订阅。
+
+## 脚本需求
+如有新脚本需求，可在lssues中提出，有能力下会做！
 
 ## 环境变量
 
