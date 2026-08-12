@@ -1,4 +1,4 @@
-# YB-GO-Script-i
+# YYB-GO-Script-i
 
 首先感谢以下项目的作者：
 
@@ -26,7 +26,7 @@
 ## 青龙订阅
 
 ```bash
-ql repo https://github.com/lcmovie/YB-GO-Script-i.git "" "" "main" ""
+ql repo https://github.com/lcmovie/YYB-GO-Script-i.git "" "" "main" ""
 ```
 
 ## 脚本
@@ -117,8 +117,8 @@ ql repo https://github.com/lcmovie/YB-GO-Script-i.git "" "" "main" ""
 任务命令示例：
 
 ```bash
-task lcmovie_YB-GO-Script-i/全棉时代.js
-task lcmovie_YB-GO-Script-i/东风日产.py
+task lcmovie_YYB-GO-Script-i/全棉时代.js
+task lcmovie_YYB-GO-Script-i/东风日产.py
 ```
 
 各脚本的 cron 建议和额外可选配置请查看对应文件头部。
