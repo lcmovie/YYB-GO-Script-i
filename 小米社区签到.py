@@ -18,7 +18,7 @@ import json
 import uuid
 import re
 import base64
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlsplit
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -196,20 +196,53 @@ def login_and_sign(code, wx_user_info):
     )
     token_login.raise_for_status()
     if token_login.is_redirect:
-        raise RuntimeError(f"小米会话接口发生重定向（HTTP {token_login.status_code}）")
-    try:
-        token_text = token_login.text.removeprefix("&&&START&&&")
-        token_body = requests.models.complexjson.loads(token_text)
-    except ValueError as exc:
-        title_match = re.search(r"<title[^>]*>(.*?)</title>", token_login.text, re.I | re.S)
-        html_title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else "无标题"
-        raise RuntimeError(
-            f"小米会话接口返回非 JSON（HTTP {token_login.status_code}，"
-            f"类型 {token_login.headers.get('Content-Type', '未知')}，长度 {len(token_login.content)}，"
-            f"页面 {html_title[:40]}）"
-        ) from exc
+        location = token_login.headers.get("Location", "")
+        parsed_location = urlsplit(location)
+        query_names = ",".join(sorted({key for key, _ in parse_qsl(parsed_location.query)})) or "无"
+        if os.getenv("MI_COMMUNITY_DEBUG") == "1":
+            print(
+                "调试：tokenLogin 重定向目标="
+                f"{parsed_location.netloc}{parsed_location.path}，查询字段={query_names}"
+            )
+        # 小米账号服务可能把 tokenLogin 成功结果放入重定向 URL。
+        # 只解析字段，不输出 Location，避免日志泄露账号票据。
+        redirected = dict(parse_qsl(parsed_location.query, keep_blank_values=True))
+        if redirected.get("passToken"):
+            token_body = redirected
+        else:
+            raise RuntimeError(
+                f"小米会话接口发生重定向（HTTP {token_login.status_code}，"
+                f"目标 {parsed_location.netloc or '相对地址'}{parsed_location.path or '/'}，"
+                f"查询字段：{query_names}）"
+            )
+    else:
+        try:
+            token_text = token_login.text.removeprefix("&&&START&&&")
+            token_body = requests.models.complexjson.loads(token_text)
+        except ValueError as exc:
+            title_match = re.search(r"<title[^>]*>(.*?)</title>", token_login.text, re.I | re.S)
+            html_title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else "无标题"
+            raise RuntimeError(
+                f"小米会话接口返回非 JSON（HTTP {token_login.status_code}，"
+                f"类型 {token_login.headers.get('Content-Type', '未知')}，长度 {len(token_login.content)}，"
+                f"页面 {html_title[:40]}）"
+            ) from exc
     if not isinstance(token_body, dict) or not token_body.get("passToken"):
-        raise RuntimeError("小米会话建立失败")
+        if isinstance(token_body, dict):
+            if token_body.get("code") == 20003 or token_body.get("description") == "用户不存在":
+                raise RuntimeError(
+                    "该微信账号尚未创建或绑定小米账号（错误码 20003）；"
+                    "请先用此微信进入小米社区小程序完成登录/注册"
+                )
+            safe_fields = []
+            for key in ("code", "status", "result", "description", "desc", "message", "reason"):
+                value = token_body.get(key)
+                if isinstance(value, (str, int, float, bool)) and value != "":
+                    safe_fields.append(f"{key}={str(value)[:80]}")
+            field_names = ",".join(sorted(token_body.keys()))
+            detail = "；".join(safe_fields) or "未返回错误说明"
+            raise RuntimeError(f"小米会话建立失败（字段：{field_names}；{detail}）")
+        raise RuntimeError("小米会话建立失败（响应不是对象）")
     flow_ok("小米账号会话建立成功")
 
     # tokenLogin 只在 JSON 中返回账号票据，小程序会手动写入 Cookie 后再取 STS。
