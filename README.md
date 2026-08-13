@@ -34,7 +34,7 @@ ql repo https://github.com/lcmovie/YYB-GO-Script-i.git "" "" "main" ""
 
 ## 脚本
 
-仓库根目录现已恢复原有脚本，并保留新增的小米社区签到脚本。参照 kuakuaql-docs 的日常使用类目整理如下：
+仓库根目录包含已恢复的原有脚本。参照 kuakuaql-docs 的日常使用类目整理如下：
 
 ### 🍔 餐饮 / 食品 / 酒水
 
@@ -114,9 +114,8 @@ ql repo https://github.com/lcmovie/YYB-GO-Script-i.git "" "" "main" ""
 | 13 | 汤星球 | `汤星球.py` | PY |
 | 14 | 快集合 | `快集合.py` | PY |
 | 15 | 老板服务微商城 | `老板服务微商城.py` | PY |
-| 16 | 小米社区签到 | `小米社区签到.py` | PY |
 
-以上业务分类共收录 45 个脚本。
+以上业务分类共收录 44 个脚本。
 
 任务命令示例：
 
