@@ -3,7 +3,7 @@
 青龙脚本订阅仓库，脚本按运行方式分为两类：
 
 - `wx-script/`：对接 [YYB-Go-Enhanced](https://github.com/525815266/YYB-Go-Enhanced) 的微信小程序脚本。
-- `idp-script/`：不需要对接 YYB-Go-Enhanced 的独立脚本。
+- `idp-script/`：独立脚本。
 
 ## 青龙拉库命令
 
@@ -56,6 +56,7 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 
 | 脚本 | 文件名 |
 |---|---|
+| 福利吧签到 | `fulibasign.js` |
 | 联通 | `lt.py` |
 | 网易云音乐签到脚本 | `netease_full.js` |
 | 微软积分 | `Microsoft Rewards.js` |
