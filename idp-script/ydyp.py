@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# name: 移动云盘
+# cron: 0 0 8,16,20 * * *
 """
 移动云盘自动签到 v5.0.6
 

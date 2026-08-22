@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# name: 联通
+# cron: 0 7,20 * * *
 """
 中国联通 Python 版 v1.1.1
 
