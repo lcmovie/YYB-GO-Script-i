@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+// name: 微软积分
+// cron: 0 8,20 * * *
+
 /**
  * Microsoft Rewards Standalone Script
  *
