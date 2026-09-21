@@ -41,6 +41,7 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 |---|---|
 | 飞猪签到 | `fzqd.py` |
 | 红色火箭 | `hshj.js` |
+| 哈啰出行签到 | `hl.py` |
 | 华润通签到 | `hrt.py` |
 | 嘉立创签到 | `jlc.py` |
 | 君品荟签到 | `jph.js` |
