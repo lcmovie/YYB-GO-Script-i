@@ -1,5 +1,5 @@
-﻿// name:红色火箭
-// cron: 26 10,13 * * *
+// name:红色火箭
+// cron: 1 9,13 * * *
 //  红色火箭（华泰基金指慧家）
 
 //  环境变量：
@@ -7,10 +7,9 @@
 //    YYB_API_KEY / YYB_PROTOCOL_TOKEN  可选，启用协议鉴权时配置
 //    WX_ID              可选，仅运行指定ref，格式：ref#备注，多账号换行或 & 分隔
 //    WECHAT_SERVER      可选，旧微信协议服务回退地址
-//
-//  说明：2026-10-28 起已移除依赖微信 H5 网页授权的红包自动领取/提现链路
-//  （mktzb baseWxAuth 授权、getCodeBaseInfo、checkCodeBatchRepeat），
-//  仅保留签到、口令兑换、积分与红包记录查询（均为小程序侧接口）。
+//    HSJJ_NOTIFY        可选，0关闭通知；默认调用青龙sendNotify，仅推送账号汇总
+//    2026-10-30 手动领取版：签到、口令兑换、积分与红包记录查询。
+//    获得现金红包后请到小程序手动领取；不包含自动提现、领取或H5授权代码。
 
 
 'use strict';
@@ -93,8 +92,7 @@ async function getSingleCode(appId, identifier) {
         if (!result.code) throw new Error('YYB未返回有效code');
         return result.code;
     } catch (error) {
-        console.log(`[YYB] 获取code失败：${error.message}`);
-        return null;
+        throw new Error('小程序取码失败：' + error.message);
     }
 }
 
@@ -109,31 +107,54 @@ const WECHAT_SERVER = (process.env.WECHAT_SERVER || '').replace(/\/$/, '');
 const debug = process.env.debug || 0;
 const APPID = 'wx1b44c3ad181bde16';
 const ACTIVITY_PAGE_ID = process.env.HSJJ_ACTIVITY_PAGE_ID || '7541';
-const CACHE_DIR = pathMod.join(process.cwd(), '.cache');
+
+const CACHE_DIR = pathMod.join(__dirname, '.cache');
 const ACCOUNT_CACHE_FILE = pathMod.join(CACHE_DIR, 'hsjj_accounts.json');
 
-// ==================== 通知模块 ====================
-let notify;
-try { notify = require('./sendNotify'); } catch (e) { notify = null; }
+// ==================== 青龙通知：正文仅包含账号汇总 ====================
+function log(str) { console.log(str); }
 
-// 消息收集
-let _logMessages = [];
-function log(str) {
-    console.log(str);
-    _logMessages.push(str);
-}
-async function push_notification() {
-    const title = "红色火箭（华泰基金）";
-    const content = _logMessages.join('\n');
-    if (notify && typeof notify.sendNotify === 'function') {
+function loadQinglongNotifier() {
+    // 仅影响本脚本进程，避免青龙通知模块追加随机句子。
+    process.env.HITOKOTO = 'false';
+    const candidates = [
+        '/ql/data/scripts/sendNotify.js', '/ql/data/deps/sendNotify.js', '/ql/scripts/sendNotify.js',
+        pathMod.join(__dirname, 'sendNotify.js'), pathMod.join(__dirname, '..', 'sendNotify.js'),
+        pathMod.join(__dirname, '..', '..', 'sendNotify.js'), 'sendNotify',
+    ];
+    for (const filename of candidates) {
         try {
-            await notify.sendNotify(title, content);
-            log('✅ 通知发送成功');
-        } catch (e) {
-            log('⚠️ 通知发送失败: ' + e.message);
-        }
-    } else {
-        log("--- 通知 ---\n" + title + "\n" + content + "\n-------------");
+            const notifier = require(filename);
+            if (typeof notifier?.sendNotify === 'function') return notifier;
+        } catch {}
+    }
+    return null;
+}
+
+function formatAccountSummary(account) {
+    const display = account.note || account.wxid;
+    if (!account.completed) return '当前账号: ' + display + ' 执行失败，余额未验证（不记为0）';
+    const currentPoint = account.currentPoint ?? '查询失败';
+    const historyAmount = Math.max(account.historyRedPacketAmount || 0, account.redPacketAmount || 0);
+    const pendingAmount = account.pendingRedPacketAmount || 0;
+    return '当前账号: ' + display + ' 当前积分: ' + currentPoint
+        + ' 后端红包记录累计:' + formatMoney(historyAmount) + '元'
+        + ' 需手动领取红包: ' + formatMoney(pendingAmount) + '元'
+        + (account.ok === false ? '（部分任务未完成）' : '');
+}
+
+async function push_notification(summaryLines = []) {
+    if (process.env.HSJJ_NOTIFY === '0') return;
+    if (!summaryLines.length) { log('ℹ️ 没有账号汇总，跳过通知'); return; }
+    const notifier = loadQinglongNotifier();
+    if (!notifier) { log('⚠️ 未找到可用的青龙sendNotify模块，账号汇总保留在运行日志'); return; }
+    const title = '红色火箭（华泰基金）';
+    const content = ['📋 账号汇总:', ...summaryLines].join('\n');
+    try {
+        await notifier.sendNotify(title, content);
+        log('✅ 账号汇总已提交青龙通知模块');
+    } catch (error) {
+        log('⚠️ 青龙通知调用失败: ' + (error.code || '通知模块异常'));
     }
 }
 
@@ -248,8 +269,7 @@ function buildSignature(params) {
 }
 
 function todayMMdd() {
-    const d = new Date();
-    return String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
+    return new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit' }).format(new Date()).split('/').reverse().join('');
 }
 
 function buildDailyRegisterChannel() {
@@ -321,8 +341,8 @@ function loadCache() {
     catch { return {}; }
 }
 function saveCache(data) {
-    try { ensureCacheDir(); fs.writeFileSync(ACCOUNT_CACHE_FILE, JSON.stringify(data, null, 2), 'utf8'); }
-    catch (e) { log('保存缓存失败: ' + e.message); }
+    try { ensureCacheDir(); const temp = ACCOUNT_CACHE_FILE + '.tmp'; fs.writeFileSync(temp, JSON.stringify(data, null, 2), { encoding: 'utf8', mode: 0o600 }); fs.renameSync(temp, ACCOUNT_CACHE_FILE); fs.chmodSync(ACCOUNT_CACHE_FILE, 0o600); return true; }
+    catch (e) { log('保存缓存失败: ' + (e.code || '文件写入失败')); return false; }
 }
 
 function getCache(cache, key) {
@@ -340,6 +360,7 @@ function putCache(cache, key, value) {
 function getEncryptKeyCache(cache, key) {
     const cached = getCache(cache, key);
     if (!cached) return { encryptKey: '', version: '' };
+    if (cached.encryptExpireTime && Number(cached.encryptExpireTime) <= Date.now()) return { encryptKey: '', version: '' };
     if (cached.encryptKey && cached.encryptVer) {
         return { encryptKey: cached.encryptKey, version: String(cached.encryptVer), expireTime: cached.encryptExpireTime || '' };
     }
@@ -376,11 +397,11 @@ function createAxios(token) {
 async function apiRequest(method, url, data, token, encryptVer, openId, userId, appSecret, retries = 1, options = {}) {
     try {
         const headers = buildHeaders(data || {}, token, encryptVer, openId, userId, appSecret, options);
-        const config = { method, url: BASE_URL + url, headers };
+        const config = { method, url: BASE_URL + url, headers, timeout: 30000, proxy: false };
         if (method === 'POST') config.data = data;
         else config.params = { ...data, key: Date.now() };
         const resp = await axios(config);
-        if (debug) log('[API] ' + url + ' => ' + JSON.stringify(resp.data).substring(0, 200));
+        if (debug) log('[API] ' + url + ' code=' + resp.data?.code);
         return resp.data;
     } catch (e) {
         const status = e?.response?.status || 0;
@@ -394,11 +415,12 @@ async function apiRequest(method, url, data, token, encryptVer, openId, userId, 
                 return await apiRequest(method, url, data, token, encryptVer, openId, userId, appSecret, retries - 1, options);
             }
         }
-        if (retries > 0) {
-            log('  请求失败，重试... ' + e.message);
+        if (retries > 0 && method === 'GET') {
+            await sleep(1500);
+            log('  请求失败，重试... ' + (e.code || '网络错误'));
             return await apiRequest(method, url, data, token, encryptVer, openId, userId, appSecret, retries - 1, options);
         }
-        log('  请求失败: ' + url + ' - ' + e.message);
+        log('  请求失败: ' + url + ' - ' + (e.code || ('HTTP ' + status)));
         return null;
     }
 }
@@ -466,7 +488,7 @@ async function getPhoneCodeInfo(wxid) {
         const phoneCode = walk(respData);
         if (phoneCode) return { phoneCode, mobile };
     }
-    log('  ⚠️ 获取手机号code失败: ' + (respData ? JSON.stringify(respData).substring(0, 300) : 'null'));
+    log('  ⚠️ 获取手机号code失败，code=' + (respData?.code ?? respData?.Code ?? '无响应'));
     return { phoneCode: '', mobile: '' };
 }
 
@@ -499,6 +521,7 @@ async function refreshProtocolSession(wxid, cache, cacheKey, reason = '') {
     const ids = await getOpenIdAndUnionId(code);
     const phoneInfo = await getPhoneCodeInfo(wxid);
     const phoneCode = phoneInfo.phoneCode;
+    if (!phoneCode) throw new Error('手机号授权code获取失败，保留原登录缓存');
     const loginData = await login(phoneCode, ids.openId, ids.unionId);
     if (!loginData) return null;
     putCache(cache, cacheKey, {
@@ -545,30 +568,35 @@ async function login(phoneCode, openId, unionId) {
 }
 
 async function getOpenIdAndUnionId(code) {
+    if (!code) throw new Error('小程序取码为空，保留原缓存并停止该账号');
     const headers = buildHeaders({ code }, '', '');
     const resp = await axios.post(BASE_URL + '/fundex-uc/uc/v1/getWxOpenIdAndUnionId', { code }, { headers });
     if (resp.data?.code === '200' && resp.data?.data?.openId) {
         return { openId: resp.data.data.openId, unionId: resp.data.data.unionId };
     }
-    throw new Error('获取openId失败: ' + JSON.stringify(resp.data));
+    throw new Error('获取小程序身份失败，code=' + resp.data?.code);
 }
 
 // 校验缓存登录态：能正常访问轻量接口就认为 token/openId/userId 可用。
 async function checkCachedLogin(cached) {
     if (!cached?.token || !cached?.openId || !cached?.userId) return false;
     const resp = await apiRequest('GET', '/fundex-activity/point/sign/getRecordList', {}, cached.token, '', cached.openId, cached.userId, '', 0);
-    return resp?.code === '200';
+    if (!resp) return null;
+    if (String(resp.code) === '200') return true;
+    if (/^(401|403|407)$/.test(String(resp.code))) return false;
+    return null;
 }
 
 // 动态获取页面活动 ID 和渠道参数，失败才兜底使用默认页面 ID/当天渠道。
 async function discoverActivityEntry(token, openId, userId) {
-    const resp = await apiRequest('GET', '/fundex-activity/opportunity/v3/findPageContent', {
+    const resp = await apiRequest('GET', '/fundex-index/opportunity/v3/findPageContent', {
         orderBy: 'changePercent',
         classA: '02',
         order: 'desc',
         platform: '',
         openId,
     }, token, '', openId, userId, '', 1);
+    if (!resp || String(resp.code) !== '200') throw new Error('首页活动查询失败，停止兑换，避免使用过期活动');
     const found = extractFanActivityFromHome(resp?.data || {});
     if (found.pageId) {
         log(`  🧭 动态活动入口: pageId=${found.pageId} channel=${found.registerChannel}`);
@@ -583,13 +611,14 @@ async function discoverActivityEntry(token, openId, userId) {
         log(`  🧭 动态活动入口(宽松匹配): pageId=${pageId} channel=${channel}`);
         return { pageId, registerChannel: channel, skipAddr: '' };
     }
-    log(`  ⚠️ 未从首页发现活动入口，兜底 pageId=${ACTIVITY_PAGE_ID}`);
-    return { pageId: ACTIVITY_PAGE_ID, registerChannel: buildDailyRegisterChannel(), skipAddr: '' };
+    if (process.env.HSJJ_ACTIVITY_PAGE_ID) return { pageId: ACTIVITY_PAGE_ID, registerChannel: buildDailyRegisterChannel(), skipAddr: '' };
+    log('  ℹ️ 首页暂无口令活动入口');
+    return { pageId: '', unavailable: true };
 }
 
 // 获取加密密钥配置
 async function getEncryptConfig(token, openId) {
-    const resp = await apiRequest('GET', '/fundex-activity/knowledgeBase/findKnowledgeInfoListByKeyList', { knowledgeKeyList: 'secure_path' }, token, '', openId);
+    const resp = await apiRequest('GET', '/fundex-material/knowledgeBase/findKnowledgeInfoListByKeyList', { knowledgeKeyList: 'secure_path' }, token, '', openId);
     if (resp?.code === '200' && Array.isArray(resp?.data)) {
         const content = resp.data[0]?.knowledgeContent || '';
         return content.split(',').filter(Boolean);
@@ -599,150 +628,36 @@ async function getEncryptConfig(token, openId) {
 
 // 获取加密密钥：先尝试养鸡场“最新用户key”接口，失败再兜底调用小程序的 getUserCryptoManager。
 async function getEncryptKey(wxid) {
-    const tryParseEncryptKey = (obj) => {
-        try {
-            if (!obj) return null;
-            const walk = (node, depth = 0) => {
-                if (depth > 8 || node == null) return null;
-                if (typeof node === 'string') {
-                    // 1) base64（24+ 可见字符）解码后可能是嵌套 JSON
-                    if (/^[A-Za-z0-9+/=]{24,}$/i.test(node)) {
-                        try {
-                            const decoded = Buffer.from(node, 'base64').toString('utf8');
-                            if (decoded) return walk(JSON.parse(decoded), depth + 1);
-                        } catch {}
-                    }
-                    // 2) 直接是 JSON 字符串（YYB: {"encrypt_key":"...","version":...,"iv":...}）
-                    if (node.trim().startsWith('{')) {
-                        try {
-                            return walk(JSON.parse(node), depth + 1);
-                        } catch {}
-                    }
-                    return null;
-                }
-                if (Array.isArray(node)) {
-                    for (const item of node) {
-                        const found = walk(item, depth + 1);
-                        if (found) return found;
-                    }
-                    return null;
-                }
-                if (typeof node === 'object') {
-                    const key = node.encryptKey || node.encrypt_key || node.key || node.EncryptKey;
-                    if (key) {
-                        return {
-                            encryptKey: String(key),
-                            version: String(node.version || node.Version || node.encryptVer || '1'),
-                            iv: node.iv || '',
-                        };
-                    }
-                    for (const v of Object.values(node)) {
-                        const found = walk(v, depth + 1);
-                        if (found) return found;
-                    }
-                }
-                return null;
-            };
-            return walk(obj);
-        } catch {
-            return null;
-        }
-    };
-
-    // 1) 优先尝试养鸡场最新key接口
-    try {
-        const latestResp = await axios.post(WECHAT_SERVER + '/wechat/api/getLatestUserKey', {
-            wxid,
-            appid: APPID
-        });
-        const latestKey = tryParseEncryptKey(latestResp.data || latestResp);
-        if (latestKey?.encryptKey) {
-            if (debug) log('  getLatestUserKey: ' + JSON.stringify(latestResp.data).substring(0, 500));
-            return latestKey;
-        }
-    } catch (e) {
-        if (debug) log('  getLatestUserKey失败: ' + e.message);
-    }
-
-    // 2) 兜底走小程序协议接口
-    let respData;
-    const cleanWxid = String(wxid).split('#')[0].trim();
-    const isYyb = Boolean(findYybEntry(cleanWxid)) || /^\d+$/.test(cleanWxid) || /^o[a-zA-Z0-9_-]{20,}$/.test(cleanWxid);
-
-    if (isYyb) {
-        const entry = selectYybEntry(cleanWxid);
-        const resolvedRef = entry.ref;
-        const url = entry.server + '/wxapp/operateWxData';
-
-        if (debug) log(`[YYB] 请求EncryptKey: ref=${resolvedRef}, app_id=${APPID}`);
-        const resp = await axios.post(url, {
-            ref: resolvedRef,
-            app_id: APPID,
-            payload: { api_name: 'webapi_getuserencryptkey' }
-        }, {
-            headers: _yybAuthHeaders(),
-            timeout: 30000,
-            validateStatus: () => true
-        });
-        respData = resp.data;
-        if (debug) log('  [YYB][debug] getuserencryptkey 原始响应: ' + JSON.stringify(respData).substring(0, 1200));
+    const cleanRef = String(wxid).split('#')[0].trim();
+    let result;
+    if (findYybEntry(cleanRef)) {
+        result = await yybPost(cleanRef, APPID, '/wxapp/operateWxData', { api_name: 'webapi_getuserencryptkey' });
     } else {
+        if (!WECHAT_SERVER) throw new Error('找不到该账号的小程序协议配置');
         const resp = await axios.post(WECHAT_SERVER + '/api/v1/wx/app/call/function', {
-            wxid: cleanWxid,
-            appid: APPID,
-            data: JSON.stringify({ api_name: 'webapi_getuserencryptkey', with_credentials: true }),
-            opt: 1
-        });
-        respData = resp.data;
+            wxid: cleanRef, appid: APPID,
+            data: JSON.stringify({ api_name: 'webapi_getuserencryptkey', with_credentials: true }), opt: 1,
+        }, { timeout: 30000, proxy: false });
+        result = resp.data;
     }
-
-    // 原始响应始终打印（便于排查 YYB/牛子 不同返回格式），不再依赖 debug 开关
-    log('  [encryptKey][raw] ' + JSON.stringify(respData).substring(0, 1500));
-
-    if (respData && (respData.Code === 0 || respData.code === 0 || respData.Success === true || respData.Data || respData.data || respData.result || respData.openid)) {
-        try {
-            // 兼容多种结构:
-            //   牛子/养鸡场: Data.Data / Data.data（base64）
-            //   应用宝 YYB:  data.result / data.data（base64 或 JSON 字符串）
-            let outer = respData.Data?.Data || respData.Data?.data ||
-                        respData.data?.result || respData.data?.data || respData.data?.Data ||
-                        respData.result?.data || respData.result?.Data || respData.result || '';
-            let decoded = '';
-            if (outer) {
-                try {
-                    decoded = Buffer.from(outer, 'base64').toString('utf8');
-                } catch {
-                    decoded = '';
-                }
-                // base64 解码失败/为空时，尝试直接把 outer 当 JSON 字符串
-                if (!decoded) decoded = (typeof outer === 'string') ? outer : '';
+    const walk = (node, depth = 0) => {
+        if (depth > 8 || node == null) return null;
+        if (typeof node === 'string') {
+            try { return walk(JSON.parse(node), depth + 1); } catch {}
+            try { return walk(JSON.parse(Buffer.from(node, 'base64').toString('utf8')), depth + 1); } catch {}
+        } else if (typeof node === 'object') {
+            const key = node.encrypt_key || node.encryptKey;
+            if (key && node.version != null && Buffer.from(key, 'base64').length === 16) {
+                return { encryptKey: key, version: String(node.version),
+                    expireTime: Date.now() + Math.max(0, Number(node.expire_in || 0)) * 1000 };
             }
-            let inner;
-            try {
-                inner = decoded ? JSON.parse(decoded) : {};
-            } catch {
-                inner = (typeof decoded === 'object') ? decoded : {};
-            }
-            if (inner && (inner.encrypt_key !== undefined || inner.encryptKey !== undefined || inner.version !== undefined)) {
-                return {
-                    encryptKey: inner.encrypt_key || inner.encryptKey || '',
-                    version: String(inner.version || ''),
-                    iv: inner.iv || '',
-                };
-            }
-        } catch (e) {
-            log('  [encryptKey] 解析异常: ' + e.message);
+            for (const value of Object.values(node)) { const found = walk(value, depth + 1); if (found) return found; }
         }
-    }
-    // 兜底：用通用递归提取器在 YYB/牛子 多样结构中找 encryptKey（处理 base64 / 嵌套 JSON / 直出字段）
-    try {
-        const fb = tryParseEncryptKey(respData);
-        if (fb?.encryptKey) {
-            if (debug) log('  [encryptKey] 兜底递归提取成功');
-            return fb;
-        }
-    } catch {}
-    throw new Error('获取加密密钥失败, 响应预览: ' + JSON.stringify(respData).substring(0, 600));
+        return null;
+    };
+    const key = walk(result);
+    if (!key) throw new Error('小程序协议未返回有效的16字节加密密钥');
+    return key;
 }
 
 // 签到
@@ -752,16 +667,10 @@ async function doSign(session, wxid, cache, cacheKey) {
     const userId = session.userId;
     log('  📝 执行签到...');
     const record = await apiRequest('GET', '/fundex-activity/point/sign/getRecordList', {}, token, '', openId, userId);
-    if (record?.code === '7005' && !session._signReloginDone) {
-        const fresh = await refreshProtocolSession(wxid, cache, cacheKey, '签到记录返回7005');
-        if (fresh) {
-            session.token = fresh.token;
-            session.openId = fresh.openId;
-            session.userId = fresh.userId;
-            session.loginData = fresh.loginData;
-            session._signReloginDone = true;
-            return await doSign(session, wxid, cache, cacheKey);
-        }
+    if (record?.code === '7005' && !session._signCryptoRetry) {
+        session._signCryptoRetry = true;
+        log('  🔄 小程序返回7005，重新获取加密参数后重试一次');
+        return await doSign(session, wxid, cache, cacheKey);
     }
     if (record?.code === '200') {
         const today = record.data?.today;
@@ -794,9 +703,10 @@ async function doSign(session, wxid, cache, cacheKey) {
                 log('  ⚠️ 签到 encryptKey 长度异常(' + kb.length + ')，明文提交');
             }
         } catch (e) {
-            log('  ⚠️ 签到参数加密失败: ' + e.message + '，明文提交');
+            log('  ⚠️ 签到参数加密失败: ' + e.message + '，停止提交');
         }
     }
+    if (!signPayload.msg) { log('  ⚠️ 无有效小程序密钥，停止签到写入'); return false; }
     const resp = await apiRequest('POST', '/fundex-activity/point/sign/userSignIn', signPayload,
         token, encryptKeyData.version || '', openId, userId, encryptKeyData.encryptKey || '');
     if ((resp?.code === '429' || /访问过于频繁|请稍后再试/.test(resp?.msg || resp?.message || '')) && (session._sign429RetryCount || 0) < 3) {
@@ -806,16 +716,17 @@ async function doSign(session, wxid, cache, cacheKey) {
         await sleep(waitMs);
         return await doSign(session, wxid, cache, cacheKey);
     }
-    if (resp?.code === '7005' && !session._signReloginDone) {
-        const fresh = await refreshProtocolSession(wxid, cache, cacheKey, '签到提交返回7005');
-        if (fresh) {
-            session.token = fresh.token;
-            session.openId = fresh.openId;
-            session.userId = fresh.userId;
-            session.loginData = fresh.loginData;
-            session._signReloginDone = true;
-            return await doSign(session, wxid, cache, cacheKey);
-        }
+    if (resp?.code === '7005' && !session._signCryptoRetry) {
+        session._signCryptoRetry = true;
+        log('  🔄 小程序返回7005，重新获取加密参数后重试一次');
+        return await doSign(session, wxid, cache, cacheKey);
+    }
+    if (String(resp?.code) === '7005' && !session._signSessionRefresh) {
+        session._signSessionRefresh = true;
+        try {
+            const fresh = await refreshProtocolSession(wxid, cache, cacheKey, '新密钥仍被拒绝，同步小程序业务会话（限一次）');
+            if (fresh) { Object.assign(session, fresh); return await doSign(session, wxid, cache, cacheKey); }
+        } catch (e) { log('  ⚠️ 小程序会话同步失败：' + e.message); }
     }
     if (resp?.code === '200') {
         const point = resp?.data?.point || 0;
@@ -834,7 +745,7 @@ async function getTotalPoint(token, openId, userId) {
         return Number(resp.data.totalPoint || 0);
     }
     log('  ⚠️ 查询当前积分失败: ' + (resp?.message || resp?.msg || JSON.stringify(resp)));
-    return 0;
+    return null;
 }
 
 // 查询ROE并提交口令
@@ -842,8 +753,30 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
     const token = session.token;
     const openId = session.openId;
     const loginData = session.loginData;
+    if (activityEntry?.unavailable) return { success: true, skipped: true };
     log('  🔍 查询ROE...');
 
+    const pageActivityId = activityEntry?.pageId || ACTIVITY_PAGE_ID;
+    const actResp = await apiRequest('GET', '/fundex-activity/financial/getActivityInfoV2', { id: pageActivityId }, token, '', openId, loginData.userId);
+    if (actResp?.code === '7005' && !session._roeCryptoRetry) {
+        session._roeCryptoRetry = true;
+        log('  🔄 小程序返回7005，重新获取加密参数后重试一次');
+        return await doRoeReward(session, wxid, cache, cacheKey, activityEntry);
+    }
+    // 说明：
+    // - 这个接口在 HAR 里虽然 success=false，但只要 data 存在就是活动有效。
+    // - 真正要看的是 activitystatusResponseVo.status，HAR 中为 "1" 才表示活动可用。
+    const activity = actResp?.data || null;
+    const activityStatus = String(activity?.activitystatusResponseVo?.status ?? activity?.status ?? '');
+    if (actResp?.code !== '200' || !activity) {
+        log(`  ⚠️ 活动接口无数据（code=${actResp?.code || '-'}）`);
+        return { success: false };
+    }
+    if (activityStatus && activityStatus !== '1') {
+        log(activityStatus === '2' ? '  ⏰ 活动尚未开始：' + (activity.activityTime || '') : `  ℹ️ 活动不可参与（status=${activityStatus}）：` + (activity.activityTime || ''));
+        return { success: true, skipped: true, status: activityStatus };
+    }
+    log('  📋 活动: ' + activity.title + ` | status=${activityStatus || '-'}`);
     // 提交加密接口前必须尽量使用最新 encryptKey/version。
     // 0624 抓包中手动提交为 key_version=9，而旧缓存 version=7 会触发 7005。
     // 因此这里先刷新，刷新失败才兜底使用缓存。
@@ -859,33 +792,8 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
         if (encryptKeyData.encryptKey) log('  🔑 使用缓存encryptKey, version=' + encryptKeyData.version);
     }
 
-    const pageActivityId = activityEntry?.pageId || ACTIVITY_PAGE_ID;
-    const actResp = await apiRequest('GET', '/fundex-activity/financial/getActivityInfoV2', { id: pageActivityId }, token, '', openId, loginData.userId);
-    if (actResp?.code === '7005' && !session._roeReloginDone) {
-        const fresh = await refreshProtocolSession(wxid, cache, cacheKey, '兑换活动信息返回7005');
-        if (fresh) {
-            session.token = fresh.token;
-            session.openId = fresh.openId;
-            session.userId = fresh.userId;
-            session.loginData = fresh.loginData;
-            session._roeReloginDone = true;
-            return await doRoeReward(session, wxid, cache, cacheKey, activityEntry);
-        }
-    }
-    // 说明：
-    // - 这个接口在 HAR 里虽然 success=false，但只要 data 存在就是活动有效。
-    // - 真正要看的是 activitystatusResponseVo.status，HAR 中为 "1" 才表示活动可用。
-    const activity = actResp?.data || null;
-    const activityStatus = String(activity?.activitystatusResponseVo?.status ?? activity?.status ?? '');
-    if (actResp?.code !== '200' || !activity) {
-        log(`  ⚠️ 活动接口无数据（code=${actResp?.code || '-'}）`);
-        return false;
-    }
-    if (activityStatus && activityStatus !== '1') {
-        log(`  ⚠️ 活动已结束（status=${activityStatus}）`);
-        return false;
-    }
-    log('  📋 活动: ' + activity.title + ` | status=${activityStatus || '-'}`);
+
+
 
     // 从活动内容中提取指数代码
     const skipLink = activity.skipLink || '';
@@ -899,7 +807,8 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
         log('  ⚠️ 查询ROE失败');
         return { success: false };
     }
-    const roeValue = roeResp.data.roe.value;
+    const roeValue = Number(roeResp.data.roe.value);
+    if (!Number.isFinite(roeValue)) return { success: false };
     const roeAnswer = roeValue.toFixed(2) + '%';
     log('  📈 ROE: ' + roeValue + ' -> 口令: ' + roeAnswer);
 
@@ -931,12 +840,13 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
                 log('  ⚠️ encryptKey长度异常(' + keyBytes.length + 'bytes)，明文提交');
             }
         } catch (e) {
-            log('  ⚠️ SM4加密失败: ' + e.message + '，明文提交');
+            log('  ⚠️ SM4加密失败: ' + e.message + '，停止提交');
         }
     } else {
         log('  ⚠️ 无encryptKey，明文提交');
     }
 
+    if (!payload.msg) { log('  ⚠️ 无有效小程序密钥，停止口令提交'); return { success: false }; }
     // 提交口令
     // 0624 抓包里 doExchange 的 register_channel 为空；
     // 渠道只用于发现页面入口，不强行带到兑换提交，避免 7005。
@@ -960,16 +870,17 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
         await sleep(waitMs);
         return await doRoeReward(session, wxid, cache, cacheKey, activityEntry);
     }
-    if (resp?.code === '7005' && !session._roeReloginDone) {
-        const fresh = await refreshProtocolSession(wxid, cache, cacheKey, '兑换提交返回7005');
-        if (fresh) {
-            session.token = fresh.token;
-            session.openId = fresh.openId;
-            session.userId = fresh.userId;
-            session.loginData = fresh.loginData;
-            session._roeReloginDone = true;
-            return await doRoeReward(session, wxid, cache, cacheKey, activityEntry);
-        }
+    if (resp?.code === '7005' && !session._roeCryptoRetry) {
+        session._roeCryptoRetry = true;
+        log('  🔄 小程序返回7005，重新获取加密参数后重试一次');
+        return await doRoeReward(session, wxid, cache, cacheKey, activityEntry);
+    }
+    if (String(resp?.code) === '7005' && !session._roeSessionRefresh) {
+        session._roeSessionRefresh = true;
+        try {
+            const fresh = await refreshProtocolSession(wxid, cache, cacheKey, '新密钥仍被拒绝，同步小程序业务会话（限一次）');
+            if (fresh) { Object.assign(session, fresh); return await doRoeReward(session, wxid, cache, cacheKey, activityEntry); }
+        } catch (e) { log('  ⚠️ 小程序会话同步失败：' + e.message); }
     }
     if (resp?.code === '200') {
         const data = resp.data;
@@ -977,7 +888,8 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
             // rewardType=2 对应微信红包，rewardAmount 是元；不是积分。
             const isRedPacket = String(data.rewardType || '') === '2' || data.link || data.tickCode;
             if (isRedPacket) {
-                log('  🎉 兑换成功! 标题: ' + (data.title || roeAnswer) + ' 红包: ' + data.rewardAmount + '元');
+                log('  🎉 兑换成功! 标题: ' + (data.title || roeAnswer) + ' 红包: ' + data.rewardAmount + '元，请到小程序手动领取');
+
 
                 return {
                     success: true, type: 'redPacket', amount: Number(data.rewardAmount) || 0, data,
@@ -990,7 +902,10 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
         log('  ⚠️ ' + (data?.content || JSON.stringify(data)));
         return { success: false };
     }
-    log('  ⚠️ 提交失败: ' + (resp?.message || JSON.stringify(resp)));
+    if (String(resp?.code) === '9001' && /超过单人限兑|已参与|已兑换/.test(resp?.msg || resp?.message || '')) {
+        log('  ✅ 今日口令已兑换'); return { success: true, alreadyDone: true };
+    }
+    log('  ⚠️ 提交失败: ' + (resp?.message || resp?.msg || ('code=' + resp?.code)));
     return { success: false };
 }
 
@@ -1000,7 +915,7 @@ async function getActivityList(token, openId, userId) {
     if (resp?.code === '200' && resp?.data) {
         return resp.data;
     }
-    return [];
+    throw new Error('红包活动列表查询失败');
 }
 
 // 查询未领取红包列表
@@ -1014,7 +929,7 @@ async function getUnclaimedList(token, openId, userId) {
     if (resp?.code === '200' && resp?.data?.dataList) {
         return resp.data.dataList;
     }
-    return [];
+    throw new Error('未领红包查询失败');
 }
 
 // 查询红包领取历史
@@ -1027,7 +942,32 @@ async function getRequestPage(token, openId, userId) {
     if (resp?.code === '200' && resp?.data?.dataList) {
         return resp.data.dataList;
     }
-    return [];
+    throw new Error('红包历史查询失败');
+}
+
+// 只汇总本次现金奖励与后台待领记录，不读取自动领取缓存，也不发起领取请求。
+function summarizeManualRedPackets(roeResult, unclaimedList, requestPage) {
+    const pending = [];
+    const ids = new Set(), tickets = new Set();
+    const add = packet => {
+        const id = String(packet.requestId || packet.redPacketRequestId || '');
+        const ticket = String(packet.ticketCode || packet.tickCode || '');
+        if ((id && ids.has(id)) || (ticket && tickets.has(ticket))) return;
+        if (id) ids.add(id);
+        if (ticket) tickets.add(ticket);
+        const amount = Number(packet.amount ?? packet.rewardAmount ?? 0);
+        pending.push({ amount: Number.isFinite(amount) ? amount : 0 });
+    };
+    for (const packet of unclaimedList) add(packet);
+    if (roeResult?.success && roeResult.type === 'redPacket') {
+        add({ ...roeResult.data, amount: roeResult.amount });
+    }
+    return {
+        pendingRedPacketCount: pending.length,
+        pendingRedPacketAmount: Math.round(pending.reduce((sum, item) => sum + item.amount, 0) * 100) / 100,
+        historyRedPacketAmount: Math.round(requestPage.reduce((sum, item) => sum + (Number(item.amount) || 0), 0) * 100) / 100,
+        historyCount: requestPage.length,
+    };
 }
 
 // ==================== 单账号执行 ====================
@@ -1051,7 +991,9 @@ async function runTask(accountInfo) {
         let loginData = null;
 
         // 1. 先读缓存，缓存有效就不再调用 wx.login / 手机号授权 / 登录接口。
-        if (cached && await checkCachedLogin(cached)) {
+        const cachedStatus = cached ? await checkCachedLogin(cached) : false;
+        if (cached && cachedStatus === null) throw new Error('缓存验证未完成（网络或服务异常），保留CK，稍后重试');
+        if (cached && cachedStatus) {
             token = cached.token;
             openId = cached.openId;
             unionId = cached.unionId || '';
@@ -1061,8 +1003,8 @@ async function runTask(accountInfo) {
                 encryptUserId: cached.encryptUserId || '',
                 isRegister: cached.isRegister || '0',
             };
-            const mobile = await fillCachedMobileIfMissing(wxid, cache, cacheKey);
-            log('  ✅ 使用缓存CK成功, userId: ' + loginData.userId + (mobile ? ' 手机号：' + mobile : ''));
+            // 有效缓存无需再次获取手机号授权。
+            log('  ✅ 使用缓存CK成功');
         } else {
             if (cached) log('  ⚠️ 缓存CK失效，重新协议登录');
 
@@ -1074,12 +1016,13 @@ async function runTask(accountInfo) {
             const ids = await getOpenIdAndUnionId(code);
             openId = ids.openId;
             unionId = ids.unionId;
-            log('  ✅ openId: ' + openId.substring(0, 10) + '...');
+            log('  ✅ 小程序身份获取成功');
 
             // 4. 获取手机号授权code
             const phoneInfo = await getPhoneCodeInfo(wxid);
             const phoneCode = phoneInfo.phoneCode;
-            log('  ✅ 手机号授权code获取成功' + (phoneInfo.mobile ? '，手机号：' + phoneInfo.mobile : ''));
+            if (!phoneCode) throw new Error('手机号授权code获取失败，保留原登录缓存');
+            log('  ✅ 手机号授权code获取成功');
 
             // 5. 登录
             loginData = await login(phoneCode, openId, unionId);
@@ -1088,7 +1031,7 @@ async function runTask(accountInfo) {
                 return false;
             }
             token = loginData.token;
-            log('  ✅ 登录成功, userId: ' + loginData.userId);
+            log('  ✅ 小程序登录成功');
 
             // 登录成功后写缓存，下次优先复用。
             putCache(cache, cacheKey, {
@@ -1115,56 +1058,31 @@ async function runTask(accountInfo) {
         await sleep(randomInt(1000, 2000));
 
         // 6. 签到
-        await doSign(session, wxid, cache, cacheKey);
+        const signOk = await doSign(session, wxid, cache, cacheKey);
         await sleep(randomInt(1000, 2000));
 
         // 7. 动态发现页面活动 ID，然后执行 ROE 口令红包。
         const activityEntry = await discoverActivityEntry(session.token, session.openId, session.userId);
         const roeResult = await doRoeReward(session, wxid, cache, cacheKey, activityEntry);
 
-        // 8. 查询红包列表与记录（只读，不再自动领取）
+        // 8. 红包只查询和提示手动领取，所有账号采用相同逻辑。
         await sleep(randomInt(1000, 2000));
-        let redPacketAmount = 0;
-        let pendingRedPacketAmount = 0;
-        let roeReward = 0;
-        // 获取红包活动列表
+        let redPacketAmount = 0, roeReward = 0;
         const activities = await getActivityList(session.token, session.openId, session.userId);
-        if (activities && activities.length > 0) {
-            log('  📋 红包活动列表: ' + activities.length + '个');
-            for (const activity of activities) {
-                if (activity.id && activity.title) {
-                    log('  📌 ' + activity.title + ' (ID: ' + activity.id + ')');
-                }
-            }
-        }
-
-        // 获取未领取红包列表（通过 getRequestPage receiveStatus=0）
+        log('  📋 红包活动列表: ' + activities.length + '个');
         const unclaimedList = await getUnclaimedList(session.token, session.openId, session.userId);
-        if (unclaimedList && unclaimedList.length > 0) {
-            log('  🎁 未领取红包: ' + unclaimedList.length + '个');
-            for (const packet of unclaimedList) {
-                if (packet.ticketCode || packet.requestId) {
-                    const amount = Number(packet.amount || 0);
-                    pendingRedPacketAmount += amount;
-                    log('  🎯 未领红包: ' + (packet.describe || '') + ' 金额: ' + amount + '元 (ticketCode: ' + (packet.ticketCode || packet.requestId) + ')');
-                }
-            }
-        } else {
-            log('  ℹ️ 没有未领取的红包');
-        }
-
-        // 获取红包领取历史：这里是账号累计已领取红包，用于最终汇总的"当前总获得红包"。
-        let historyRedPacketAmount = 0;
         const requestPage = await getRequestPage(session.token, session.openId, session.userId);
-        if (requestPage && requestPage.length > 0) {
-            log('  📊 历史已领取红包: ' + requestPage.length + '条（非本次收益）');
-            for (const item of requestPage) {
-                if (item.amount) {
-                    historyRedPacketAmount += Number(item.amount) || 0;
-                }
-            }
-            log('  💰 历史已领取红包累计: ' + formatMoney(historyRedPacketAmount) + '元（非本次收益）');
+        const manual = summarizeManualRedPackets(roeResult, unclaimedList, requestPage);
+        const pendingRedPacketAmount = manual.pendingRedPacketAmount;
+        const historyRedPacketAmount = manual.historyRedPacketAmount;
+        log('  📊 历史已标记领取记录: ' + manual.historyCount + '笔，累计' + formatMoney(historyRedPacketAmount) + '元（非本次收益）');
+        if (manual.pendingRedPacketCount > 0) {
+            log('  🎁 需手动领取红包: ' + manual.pendingRedPacketCount + '笔，合计' + formatMoney(pendingRedPacketAmount) + '元');
+        } else {
+            log('  ℹ️ 后台未返回新的待领红包');
         }
+        log('  📲 红包请打开红色火箭小程序，在活动中心/红包记录中手动领取。');
+
 
         // 汇总里展示账号当前积分余额，避免把"本次积分奖励"误当成总积分。
         const currentPoint = await getTotalPoint(session.token, session.openId, session.userId);
@@ -1178,7 +1096,9 @@ async function runTask(accountInfo) {
                 roeReward += roeResult.amount || 0;
             }
         }
-        return { success: true, currentPoint, roeReward, redPacketAmount, historyRedPacketAmount, pendingRedPacketAmount };
+
+
+        return { success: Boolean(signOk && roeResult?.success && currentPoint !== null), currentPoint, roeReward, redPacketAmount, historyRedPacketAmount, pendingRedPacketAmount };
 
     } catch (e) {
         log('❌ 异常: ' + e.message);
@@ -1190,6 +1110,7 @@ async function runTask(accountInfo) {
 // ==================== 主逻辑 ====================
 async function main() {
     log('🚀 红色火箭脚本启动');
+    log('📲 手动领取版：现金红包需在小程序中自行领取');
 
     if (!taskVar.trim()) {
         log('环境变量未设置: ' + ckName);
@@ -1215,9 +1136,11 @@ async function main() {
     for (let i = 0; i < accounts.length; i++) {
         try {
             const result = await runTask(accounts[i]);
-            if (result && result.success) {
-                successCount++;
-                accounts[i].currentPoint = result.currentPoint || 0;
+            if (result) {
+                if (result.success) successCount++;
+                accounts[i].completed = true;
+                accounts[i].ok = result.success;
+                accounts[i].currentPoint = result.currentPoint;
                 accounts[i].roeReward = result.roeReward || 0;
                 accounts[i].redPacketAmount = result.redPacketAmount || 0;
                 accounts[i].historyRedPacketAmount = result.historyRedPacketAmount || 0;
@@ -1234,19 +1157,16 @@ async function main() {
 
     // 汇总输出
     log('\n' + '='.repeat(50));
-    log('📊 执行完毕, 成功 ' + successCount + '/' + accounts.length);
+    log('📊 基础任务执行完毕, 成功 ' + successCount + '/' + accounts.length + '（红包需手动领取）');
 
-    // 输出每个账号的汇总信息
+    // 详细执行日志只输出到控制台；通知单独使用下列汇总。
     log('\n📋 账号汇总:');
-    for (const account of accounts) {
-        const display = account.note || account.wxid;
-        const currentPoint = account.currentPoint || 0;
-        const redPacketAmount = Math.max(account.historyRedPacketAmount || 0, account.redPacketAmount || 0);
-        const pendingRedPacketAmount = account.pendingRedPacketAmount || 0;
-        log('当前账号: ' + display + ' 当前积分: ' + currentPoint + ' 当前总获得红包:' + formatMoney(redPacketAmount) + '元 当前未领红包: ' + formatMoney(pendingRedPacketAmount) + '元');
-    }
-    // 推送通知
-    await push_notification();
+    const summaryLines = accounts.map(formatAccountSummary);
+    for (const line of summaryLines) log(line);
+    await push_notification(summaryLines);
 }
 
-main().catch(e => { log('❌ 脚本异常: ' + e.message); log(e.stack); });
+if (require.main === module) main().catch(e => { log('❌ 脚本异常: ' + e.message); process.exitCode = 1; });
+module.exports = { main, apiRequest, checkCachedLogin, getWxCode, getOpenIdAndUnionId, getEncryptKey,
+    loadCache, discoverActivityEntry, doRoeReward, extractFanActivityFromHome, todayMMdd, runTask,
+    sm4Encrypt, buildHeaders, summarizeManualRedPackets, formatAccountSummary, push_notification };
