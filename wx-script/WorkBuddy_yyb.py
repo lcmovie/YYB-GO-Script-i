@@ -4,14 +4,14 @@
 # cron: 31 7,12,23 * * *
 """
 name: WorkBuddy 签到
-cron: 31 7,12 * * *
+cron: 31 7,12,23 * * *
 
 ════════════════════════════════════════════════════════════════
 该脚本引用自原作者：https://github.com/L0NE-6/WorkBuddy-Daily
 修改作者：lcmovie https://github.com/lcmovie/YYB-GO-Script-i
 修改后主要适配：https://github.com/525815266/YYB-Go-Enhanced，实现无感取码，自动打卡 + 全部成长任务！
 ════════════════════════════════════════════════════════════════
-🌱 WorkBuddy Daily - 全能签到脚本 v3.26（YYB 无感取码版）
+🌱 WorkBuddy Daily - 全能签到脚本 v3.33（YYB 无感取码版）
 ════════════════════════════════════════════════════════════════
 
 📌 这是什么
@@ -19,17 +19,18 @@ cron: 31 7,12 * * *
    积分/用量查询、18 项成长任务、8 项互动玩法、小程序成长任务、
    自动领奖，全部无人值守。
 
+
 ✨ 特性
    🔐 无感取码       只配一个 YYB_SERVER 变量，脚本自动 wx.login 取码登录 + 自动续期
-   ✅ 成长任务       17 项云端任务全覆盖（含轻量云专家；小程序链式见下一行）
-   📱 小程序任务     Tasks_1~7 链式任务（每日零点解锁一环，日志给出解锁日期）
+   ✅ 成长任务       已适配的云端及动态专家任务（执行前确认来源、登记和状态）
+   📱 小程序任务     Tasks_1~6 小程序链式任务；第 7 环为 PC 灵感任务
    🎮 8 项互动玩法   抽奖、盲盒、Buddy、派猫猫旅行、连签兑换、补签卡、礼包补偿、徽章
    💰 三类查询       积分剩余合计+明细、用量统计、成长数据（等级/两种连签/能量）
    🎁 自动领奖       按进度扫描全部已达标任务；桌面/小程序分别补领
    📢 青龙通知       优先 notify.py，回落到 PushPlus / Server酱 / 企业微信 / Bark
    🧩 幂等安全       重复运行只补缺口，不会重复领取或重复操作
    🔄 API 重试       网络/5xx 自动指数退避重试，写动作间隔可调（--gap）
-   🔗 稳定指纹       每账号 md5 派生固定 machineId，桌面/web/小程序三域对齐官方埋点
+   🔗 稳定指纹       按账号派生稳定 machineId，桌面/web/小程序三域对齐官方埋点
    🐧 青龙友好       非 Windows 走指纹上报，纯 API 直接跑
    📦 已归档         开学季等已结束/已下架的限时任务代码已移除（上游移入 archive/）
    🔥 每日活跃       签到后补发一条 chat_request_send 点亮成长中心热力墙（活跃连登，幂等）
@@ -37,8 +38,7 @@ cron: 31 7,12 * * *
 🚀 使用方法（YYB 版）
    1. 设置变量     YYB_SERVER = 每行一个 "YYB地址@微信账号标识"（多账号换行分隔）
                    例：yyb-go:8000@1
-   2. 定时任务     31 7,12 * * *     日常全流程
-                   31 23 * * *      夜猫子活动窗口（23:00-08:00，必须单独排程）
+   2. 定时任务     31 7,12,23 * * *  沿用现有定时，23 点覆盖夜间任务窗口
 
 ⌨️ 命令行参数
    --only 3          只跑第 3 个账号（可用逗号 3,4,5）
@@ -76,12 +76,13 @@ cron: 31 7,12 * * *
    PUSH_PLUS_TOKEN / PLUSPLUS_TOKEN / PUSH_KEY / QYWX_KEY / BARK_PUSH
                         【可选】脚本自带通知通道（青龙 notify.py 未配置时回落）
 
-📦 任务清单（对齐上游 v3.7）
-   ☁️ 成长中心任务（17 项）：每日签到 · 设计创意模式 · 探索优秀灵感 · 桌面端对话 ·
+📦 任务清单（参考上游 v3.33，以下任务以实际下发为准）
+   ☁️ 已适配成长任务：每日签到 · 设计创意模式 · 探索优秀灵感 · 桌面端对话 ·
       尝鲜热门技能 · 体验资料库 · 腾讯轻量云专家 · 和平精英主题 · 发现应用 ·
       企鹅教师助手 · GLM-5.2模型对话 · 和AI聊天5次 · 夜猫子活动 · 召唤3次专家团 ·
       召唤5次专家 · 使用5个模板 · 设置自动化任务 · 领取Buddy
-   📱 小程序成长任务（7 项，Sequential_Tasks_1~7）
+   📱 链式任务：Sequential_Tasks_1~6 为小程序，第 7 环为 PC 灵感
+   🧑‍💼 专家任务：轻量云、无畏契约及动态 expert_use_*（桌面/小程序双来源）
    🎮 互动玩法（8 项）：抽奖 · 盲盒 · Buddy信息 · 派猫猫旅行 · 连签兑换 · 补签卡 ·
       礼包补偿 · 徽章
    📦 已归档（活动结束 / 服务端已下架，代码已移除，对齐上游 archive/）
@@ -102,7 +103,7 @@ cron: 31 7,12 * * *
    · mp 真人节奏：Sequential 对话判据逐条 45s±10s 上报（上游有反作弊：连发会先计数、
      后被整体回滚，claim 报 400）；--mp-gap / WORKBUDDY_MP_GAP 可调
    · accept 后回读：mp 任务接受后重读真实 target，避免"少报→误判达标→claim 400"
-   · mp 指纹：按官方源码口径（ideVersion/extVersion=2.2.8、android 14/arm64、source=mini_program）
+   · mp 元数据：公共 base 为 2.4.0，部分专家/灵感事件保留 2.2.8；android 14/arm64
    · locked 任务：任务行 locked=true（未到上线时间）直接跳过并给出解锁日，不空跑不误判
    · mp 对话 id：conversationId / requestId / traceId 同值传递（源码同值）
    · 瞬时错误重试：签到/余额/用量对网络与 5xx 做 2s/4s 有界重试，业务错误不重试
@@ -110,14 +111,16 @@ cron: 31 7,12 * * *
    · 旅行领奖：claim 携带服务端 record_id，只有回执含 reward_credit 才确认到账
    · 补签日历：按服务端 today/launch_date/当月边界选断点，排除 makeup_dates，默认只补最近一张
    · 礼包补偿：先查 active/claimed/credit_num，再按回执 credit 判定本次到账；本地按活动期防重
-   · 桌面指纹：WorkBuddy 5.8.3 / CLI 2.161.0（ideVersion、commit、releaseDate、osVersion 同步官方）
+   · 桌面元数据：WorkBuddy 5.9.3 / CLI 2.165.0，构建字段沿用上次已适配值
    · 每日活跃：合成事件后回读热力图分数确认；未计分自动用真实对话兜底，仍未计分不写本地标记
-   · 网页会话：撞 10105 名额上限时回收同前缀最旧会话；每轮对话结束必 stop/delete
-   · 专家任务：expert_use_* 族动态发现（jump_url 深链优先、专家市场按 ID 精确落位）
+   · 网页会话：撞 10105 时仅收尾归属记录中的脚本旧会话；排除用户会话及本轮在用会话
+   · 专家任务：桌面/小程序双来源发现；先登记后对话，来源确认后领奖；保留 ID 校验
    · PC 灵感：Sequential_Tasks_7 走桌面 playbook 事件链（对话链 + cta_click + prompt_send）
    · 任务发现：桌面 /v2 + 小程序 /v2 + 等级族 /activity 三源合并去重
    · 未下发任务：accept_status 为 None（已下线/未开放）直接跳过，不发对话不白扣积分
    · mp 延迟 target：accept 后 target 未下发时有界回读（30×2.5s），仍空则留待下一轮不冒领
+   · 任务查询：统一间隔与 429 有界等待；查询失败不冒充任务未下发
+   · 会话归属：workbuddy_conversation_state.json 独立保存脚本创建的真实会话 ID
    · 推送策略：WORKBUDDY_NOTIFY=always（默认）/ fail（仅异常）/ 0（关闭）
 
 📄 依赖：requests（pip3 install requests）
@@ -157,7 +160,9 @@ try:
 except Exception:
     pass
 
-VERSION = "1.8.1"
+VERSION = "1.9.1"
+UPSTREAM_VERSION = "3.33"
+UPSTREAM_COMMIT = "d1ae050ee5338457a6adaf7fce895c24b623dc19"
 APP_ID = "wx907c65e5e107ddcf"                     # WorkBuddy 小程序 AppID
 LOGIN_URL = "https://www.codebuddy.cn/v2/plugin/login/token"
 PROFILE_URL = "https://www.codebuddy.cn/v2/as/wechatmp/user/profile"
@@ -166,7 +171,7 @@ STATUS_URL = "https://www.workbuddy.cn/v2/billing/meter/checkin-activity-status"
 CHECKIN_URL = "https://www.workbuddy.cn/v2/billing/meter/daily-checkin"
 
 BASE = "https://www.workbuddy.cn"
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) WorkBuddy/5.5.4 Chrome/138.0.7204.251 Electron/37.10.3 Safari/537.36"
+UA = "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"
 
 HEADERS = {
     "Content-Type": "application/json",
@@ -269,7 +274,7 @@ EXPERT_TASK_SPECS = {
     },
 }
 DESKTOP_ONLY_TASK_CODES = frozenset(EXPERT_TASK_SPECS) | {
-    "Expert_lighthouse", "WorkBuddy_Valorant",
+    "Expert_lighthouse", "WorkBuddy_Valorant", "Sequential_Tasks_7",
 }
 LEVEL_TASK_CODES = {
     "first_chat", "skill_installed", "wechat_linked",
@@ -367,7 +372,7 @@ MP_EXPERT_FALLBACK = {"WorkspaceBuilder": {"id": "WorkspaceBuilder", "name": "�
 MP_TASK_CODES = {
     "Sequential_Tasks_1", "Sequential_Tasks_2", "Sequential_Tasks_3",
     "Sequential_Tasks_4", "Sequential_Tasks_5", "Sequential_Tasks_6",
-    "Sequential_Tasks_7", "school_season",
+    "school_season",
 }
 
 MP_HEADER = {"X-Client-Platform": "miniprogram",
@@ -377,11 +382,11 @@ MP_REPORT_HEADERS = {
     "X-Client-Product": "workbuddy-mp", "X-Client-Version": "2.4.0",
     "X-Client-Platform": "mp-weixin", "X-Platform": "wechatmp",
 }
-DESKTOP_UA = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"
+DESKTOP_UA = UA
 WORKBUDDY_UA_CN = DESKTOP_UA
-DESKTOP_VERSION_CN = "5.8.3"
-DESKTOP_COMMIT_CN = "db0e9b51b7fa0b383f41f5b0b83dd442c8557918"
-DESKTOP_RELEASE_CN = 1792029498676
+DESKTOP_VERSION_CN = "5.9.3"
+DESKTOP_COMMIT_CN = "d46924219e79332f49c37ccebf27292f87001b19"
+DESKTOP_RELEASE_CN = 1793093056315
 WEB_CONVERSATIONS_PATH = "/console/webchat/conversations"
 WEB_CONVERSATION_ACTIVE_STATUSES = ("working", "creating", "pending")
 WEB_CONVERSATION_PRUNE_KEEP = 8
@@ -817,24 +822,20 @@ def _json_or_empty(r):
 
 def prog(s, code):
     try:
-        r = s.get(BASE + "/v2/activity/growth/tasks", timeout=25, verify=False).json()
-        for t in r.get("data", {}).get("tasks", []):
-            if t.get("task_code") == code:
-                pr = t.get("progress") or {}
-                return t.get("accept_status", ""), pr.get("current"), pr.get("target")
-    except Exception:
+        for task in growth_task_rows(s):
+            if task.get("task_code") == code:
+                progress = task.get("progress") or {}
+                return task.get("accept_status", ""), progress.get("current"), progress.get("target")
+    except (SafeError, requests.RequestException):
         pass
     return None, None, None
 
 
 def _growth_task_rows(s, headers=None, path="/v2/activity/growth/tasks"):
-    """读取一份成长任务原始行；单源失败返回空列表。"""
+    """任务发现复用统一的只读限速和有界重试，单源失败不阻断其他来源。"""
     try:
-        payload = s.get(BASE + path, timeout=25,
-                        verify=False, headers=headers).json() or {}
-        rows = (payload.get("data") or {}).get("tasks", [])
-        return [task for task in rows if isinstance(task, dict)]
-    except Exception:
+        return growth_task_rows(s, headers=headers, path=path)
+    except (SafeError, requests.RequestException):
         return []
 
 
@@ -927,12 +928,148 @@ def _market_expert_by_id(s, keyword, expected_id):
     return None
 
 
+def _expert_sources(s):
+    sources = {}
+    for name, headers in (("desktop", None), ("mp", MP_HEADER)):
+        try:
+            sources[name] = {"ok": True, "rows": growth_task_rows(s, headers=headers)}
+        except (SafeError, requests.RequestException):
+            sources[name] = {"ok": False, "rows": []}
+    return sources
+
+def _expert_context(s, code):
+    sources = _expert_sources(s)
+    for name in sources:
+        sources[name]["row"] = next((row for row in sources[name]["rows"]
+            if (row.get("task_code") or row.get("code")) == code), None)
+    if not sources["desktop"]["ok"]:
+        raise SafeError("专家任务来源未确认（桌面任务列表读取失败）")
+    if sources["desktop"]["row"] is not None:
+        return "desktop", sources["desktop"]["row"], sources
+    if not sources["mp"]["ok"]:
+        raise SafeError("专家任务来源未确认（小程序任务列表读取失败）")
+    return "mp", sources["mp"]["row"], sources
+
+def _expert_task_row(s, code):
+    # 只读发现允许保留另一侧提供的信息；写动作另用 _expert_context 确认来源。
+    sources = _expert_sources(s)
+    for name in ("desktop", "mp"):
+        for row in sources[name]["rows"]:
+            if (row.get("task_code") or row.get("code")) == code:
+                return row
+    return None
+
+def _expert_prog(s, code):
+    _source, row, _sources = _expert_context(s, code)
+    if row is None:
+        return None, None, None
+    progress = row.get("progress") or {}
+    return row.get("accept_status", ""), progress.get("current"), progress.get("target")
+
+def _expert_unavailable(row):
+    if row.get("locked"):
+        return "任务未解锁"
+    today = beijing_today().isoformat()
+    for field, future in (("valid_start", True), ("valid_end", False)):
+        value = str(row.get(field) or "")[:10]
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            if (future and value > today) or (not future and value < today):
+                return "任务未到开放日期" if future else "任务已到期"
+    return ""
+
+def _accept_expert_task(s, code, log):
+    source, row, _sources = _expert_context(s, code)
+    if row is None or _expert_unavailable(row):
+        return False
+    if row.get("accept_status") in ("accepted", "completed", "claimed"):
+        return True
+    headers = MP_HEADER if source == "mp" else None
+    # 只向已确认来源提交一次。响应丢失时先回读，不切换来源或重放写入。
+    try:
+        s.post(BASE + "/v2/activity/growth/tasks/accept", json={"task_codes": [code]},
+               timeout=20, verify=False, headers=headers)
+    except requests.RequestException:
+        pass
+    for attempt in range(2):
+        if attempt:
+            time.sleep(WRITE_GAP)
+        try:
+            rows = growth_task_rows(s, headers=headers)
+        except (SafeError, requests.RequestException):
+            continue
+        current = next((r for r in rows if (r.get("task_code") or r.get("code")) == code), None)
+        if current and current.get("accept_status") in ("accepted", "completed", "claimed"):
+            return True
+    log("   专家任务接受结果未确认，停止本任务")
+    return False
+
+def _task_claimable(task):
+    if not task or task.get("locked"):
+        return False
+    if task.get("accept_status") == "claimed" or str(task.get("claimed")).lower() == "true":
+        return False
+    progress = task.get("progress") or {}
+    current, target = _as_int(progress.get("current")), _as_int(progress.get("target"))
+    return current >= target if target > 0 else task.get("accept_status") == "completed"
+
+def _conversation_owner_key(s):
+    uid = s.headers.get("X-User-Id", "")
+    return hashlib.sha256(uid.encode()).hexdigest() if isinstance(uid, str) and uid else ""
+
+def _conversation_owned(s):
+    key = _conversation_owner_key(s)
+    if not key:
+        return {}
+    path = Path(STATE_DIR) / "workbuddy_conversation_state.json"
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("version") != 1 or not isinstance(data.get("accounts"), dict):
+        raise SafeError("会话归属记录格式异常")
+    rows = data["accounts"].get(key, {})
+    if not isinstance(rows, dict):
+        raise SafeError("会话归属记录格式异常")
+    return rows
+
+def _conversation_record(s, conversation_id, add=False):
+    """只记录实际创建返回的 ID；独立状态文件不涉及 YYB 或邀请缓存。"""
+    key = _conversation_owner_key(s)
+    if not key or not conversation_id:
+        return
+    try:
+        path = Path(STATE_DIR) / "workbuddy_conversation_state.json"
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"version": 1, "accounts": {}}
+        if data.get("version") != 1 or not isinstance(data.get("accounts"), dict):
+            raise ValueError()
+        owned = data["accounts"].setdefault(key, {})
+        if add:
+            owned[conversation_id] = {"created": time.time()}
+        else:
+            if conversation_id not in owned:
+                return
+            owned.pop(conversation_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".wb-conversations-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=True, separators=(",", ":"))
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    except (OSError, ValueError, AttributeError, TypeError):
+        print("⚠️ 会话归属记录读写失败，历史会话不自动清理", flush=True)
+
+
 def _expert_spec_for_task(s, code):
     """返回内置专家定义；合法任务 jump_url 中的新 ID 优先于静态兜底。"""
     stored = EXPERT_TASK_SPECS.get(code)
     if not stored and not str(code).startswith("expert_use_"):
         return {}
-    row = _growth_task_row(s, code) or {}
+    row = _expert_task_row(s, code) or {}
     title = str(
         row.get("title") or row.get("task_title") or row.get("task_name")
         or TASK_NAME_CN.get(code) or code)
@@ -950,12 +1087,10 @@ def _expert_spec_for_task(s, code):
 
 
 def _dynamic_expert_task_codes(s):
-    """发现桌面任务列表里的 expert_use_* 族任务，静态四条只是已审核兜底。"""
-    return sorted({
-        str(task.get("task_code") or task.get("code") or "").strip()
-        for task in _growth_task_rows(s)
-        if str(task.get("task_code") or task.get("code") or "").startswith("expert_use_")
-    })
+    sources = _expert_sources(s)
+    return sorted({str(row.get("task_code") or row.get("code") or "").strip()
+        for source in sources.values() for row in source["rows"]
+        if str(row.get("task_code") or row.get("code") or "").startswith("expert_use_")})
 
 
 def _parse_expert_deeplink(value):
@@ -1157,45 +1292,46 @@ def _web_conversation_action(s, conversation_id, action):
 
 
 def _web_conversation_prune(s, prefix, keep=WEB_CONVERSATION_PRUNE_KEEP):
-    """撞到 10105 时，停掉同前缀的最旧活跃会话，最多保留 keep 条。"""
+    """账号级计数，跨任务只收尾有精确归属记录且本轮未在用的会话。"""
     try:
-        response = s.get(
-            BASE + WEB_CONVERSATIONS_PATH,
-            params={"page": 1, "pageSize": 50},
-            timeout=20, verify=False)
-        payload = response.json() or {}
-        data = payload.get("data") if isinstance(payload, dict) else {}
-        rows = data.get("conversations") if isinstance(data, dict) else []
-    except Exception:
+        response = s.get(BASE + WEB_CONVERSATIONS_PATH, params={"page": 1, "pageSize": 50},
+                         timeout=20, verify=False)
+        payload = _json_or_empty(response)
+        if not 200 <= response.status_code < 300 or payload.get("code") not in (0, None):
+            return 0
+        rows = (payload.get("data") or {}).get("conversations") or []
+        owned = _conversation_owned(s)
+    except (requests.RequestException, SafeError, OSError, ValueError, AttributeError):
         return 0
-    active = []
-    for row in rows if isinstance(rows, list) else []:
-        if not isinstance(row, dict):
-            continue
-        status = str(row.get("status") or "").lower()
-        name = str(row.get("name") or "")
-        if status not in WEB_CONVERSATION_ACTIVE_STATUSES:
-            continue
-        if prefix and not name.startswith(prefix + "-"):
-            continue
-        active.append(row)
+    active = [row for row in rows if isinstance(row, dict) and
+              str(row.get("status") or "").lower() in WEB_CONVERSATION_ACTIVE_STATUSES]
     if len(active) < 10:
         return 0
-    active.sort(key=lambda row: str(row.get("createdAt") or ""))
+    in_use = getattr(s, "_workbuddy_in_use_conversations", set())
+    if not isinstance(in_use, set):
+        in_use = set()
+    eligible = [row for row in active if row.get("id") in owned and row.get("id") not in in_use]
+    eligible.sort(key=lambda row: str(row.get("createdAt") or ""))
     stopped = 0
-    for row in active:
+    for row in eligible:
         if len(active) - stopped <= keep:
             break
-        if _web_conversation_action(s, row.get("id"), "stop"):
+        cid = row["id"]
+        if _web_conversation_action(s, cid, "stop"):
+            _conversation_record(s, cid)
             stopped += 1
     return stopped
 
 
 def _web_conversation_release(s, conversation_id, delete=False):
     stopped = _web_conversation_action(s, conversation_id, "stop")
-    if delete:
-        return _web_conversation_action(s, conversation_id, "delete") or stopped
-    return stopped
+    deleted = _web_conversation_action(s, conversation_id, "delete") if delete else False
+    in_use = getattr(s, "_workbuddy_in_use_conversations", set())
+    if isinstance(in_use, set):
+        in_use.discard(conversation_id)
+    if stopped or deleted:
+        _conversation_record(s, conversation_id)
+    return stopped or deleted
 
 
 def _web_conversation_create(s, conv_name):
@@ -1210,6 +1346,8 @@ def _web_conversation_create(s, conv_name):
     conversation_id = str(data.get("conversationId") or "") if isinstance(data, dict) else ""
     if _web_conversation_limit_hit(response.status_code, payload):
         freed = _web_conversation_prune(s, conv_name)
+        if not freed:
+            print("⚠️ 网页会话名额不足，未找到可安全收尾的脚本会话，请在客户端处理", flush=True)
         if freed:
             try:
                 response = s.post(BASE + WEB_CONVERSATIONS_PATH, json=body,
@@ -1223,6 +1361,13 @@ def _web_conversation_create(s, conv_name):
     code = payload.get("code") if isinstance(payload, dict) else None
     if not (200 <= response.status_code < 300) or code not in (0, None):
         return ""
+    if conversation_id:
+        _conversation_record(s, conversation_id, add=True)
+        in_use = getattr(s, "_workbuddy_in_use_conversations", None)
+        if not isinstance(in_use, set):
+            in_use = set()
+            s._workbuddy_in_use_conversations = in_use
+        in_use.add(conversation_id)
     return conversation_id
 
 
@@ -1498,9 +1643,13 @@ def t_daily_activity(s, uid, nick, log):
 # 各任务配方（全部经过原版实测，移植保持原样）
 # ============================================================================ #
 def t_accept_all(s, uid, nick, log):
-    r = s.get(BASE + "/v2/activity/growth/tasks", timeout=25, verify=False).json()
-    todo = [t.get("task_code") for t in r.get("data", {}).get("tasks", [])
-            if isinstance(t, dict) and t.get("accept_status") == "not_accepted"]
+    try:
+        rows = growth_task_rows(s)
+    except (SafeError, requests.RequestException):
+        log("   📋批量接受读取任务失败，本轮跳过登记")
+        return
+    todo = [t.get("task_code") for t in rows
+            if t.get("task_code") and t.get("accept_status") == "not_accepted"]
     if not todo:
         return
     resp = {}
@@ -1616,7 +1765,7 @@ def t_buddy_apps(s, uid, nick, log):
 def _fetch_hp_theme(s):
     try:
         d = s.post(BASE + "/v2/operation-platform/appearance/resources",
-                   json={"platform": "client", "kind": "theme", "version": "5.5.6", "lang": "zh-CN"},
+                   json={"platform": "client", "kind": "theme", "version": DESKTOP_VERSION_CN, "lang": "zh-CN"},
                    timeout=20, verify=False).json()
         for x in ((d.get("data") or {}).get("resources") or []):
             nm = x.get("name") or ""
@@ -1665,13 +1814,19 @@ def t_library(s, uid, nick, log):
 
 
 def t_chat_n(s, uid, nick, log, code, n, prompts):
-    st0, _c, _t = prog(s, code)
-    if st0 is None:
-        # 任务未下发（已下线/未开放）：继续发真实对话只会白扣积分
-        log("   %s: 当前任务列表未下发（可能已下线），跳过" % code)
-        return
     for i in range(n):
-        st, cur, tgt = prog(s, code)
+        try:
+            rows = growth_task_rows(s)
+        except (SafeError, requests.RequestException) as exc:
+            reason = str(exc) if isinstance(exc, SafeError) else type(exc).__name__
+            log("   %s: %s，停止追加对话" % (code, reason))
+            return
+        row = next((t for t in rows if t.get("task_code") == code), None)
+        if row is None:
+            log("   %s: 当前任务未下发，停止追加对话" % code)
+            return
+        progress = row.get("progress") or {}
+        st, cur, tgt = row.get("accept_status"), progress.get("current"), progress.get("target")
         if st in ("completed", "claimed") or (cur or 0) >= (tgt or n):
             break
         conv_id, txt = webchat(s, code, prompts[i % len(prompts)])
@@ -2482,13 +2637,30 @@ VALORANT_EXPERT = {"id": "ex_xQHHD1u5Jkua", "name": "无畏契约拼豆专家", 
 def _run_local_expert_task(s, uid, nick, log, task_code, expert, conv_name="expert"):
     """LOCAL 专家任务共用链：真实对话 + 召唤 + actual_use(mode:LOCAL)。"""
     label = expert.get("profession") or expert.get("name") or task_code
-    st, cur, tgt = prog(s, task_code)
+    _source, row, _sources = _expert_context(s, task_code)
+    if row is not None and _expert_unavailable(row):
+        log("   %s: %s，跳过" % (label, _expert_unavailable(row)))
+        return
+    progress = (row or {}).get("progress") or {}
+    st, cur, tgt = ((row or {}).get("accept_status") if row is not None else None,
+                    progress.get("current"), progress.get("target"))
     if st is None:
         log("   %s: 不在当前任务列表，跳过" % label)
         return
     if st in ("completed", "claimed"):
         log("   %s: %s %s/%s" % (label, st, cur, tgt))
         return
+    if st in ("", "not_accepted"):
+        if not _accept_expert_task(s, task_code, log):
+            log("   %s: 接受任务失败，停止本任务" % label)
+            return
+        st, cur, tgt = _expert_prog(s, task_code)
+        if st in ("completed", "claimed"):
+            log("   %s: %s %s/%s" % (label, st, cur, tgt))
+            return
+        if st != "accepted":
+            log("   %s: 接受后状态未确认，停止本任务" % label)
+            return
     expert = dict(expert)
     if expert.get("id") and not _EXPERT_ID_RE.fullmatch(str(expert.get("id") or "")):
         log("   %s: 专家 ID 格式无效，跳过" % label)
@@ -2538,6 +2710,9 @@ def _run_local_expert_task(s, uid, nick, log, task_code, expert, conv_name="expe
         conv_id, _txt, mid = webchat2(s, conv_name, prompt, meta)
     except Exception as exc:
         log("   %s: 对话异常 %s" % (label, str(exc)[:50]))
+    if not conv_id or not mid:
+        log("   %s: 真实对话结果未确认（缺少会话或消息 ID），停止上报" % label)
+        return
     if conv_id and mid:
         summon = [
             {"eventCode": "expert_summon_click", "id": expert["id"], "name": display_name,
@@ -2565,14 +2740,14 @@ def _run_local_expert_task(s, uid, nick, log, task_code, expert, conv_name="expe
         except Exception as exc:
             log("   %s: 桌面链上报失败 %s" % (label, str(exc)[:50]))
         time.sleep(4)
-        status = prog(s, task_code)[0]
+        status = _expert_prog(s, task_code)[0]
         if status in ("completed", "claimed"):
-            st, cur, tgt = prog(s, task_code)
+            st, cur, tgt = _expert_prog(s, task_code)
             log("   %s: %s %s/%s" % (label, st, cur, tgt))
             return
     try:
-        request_id = mid or _new_message_id()
-        conversation_id = conv_id or _new_conversation_id()
+        request_id = mid
+        conversation_id = conv_id
         report(s, uid, nick, [
             {"eventCode": "expert_summoned", "id": expert["id"], "name": display_name,
              "type": "agent", "expertTitle": expert_title, "expertType": "agent",
@@ -2589,8 +2764,10 @@ def _run_local_expert_task(s, uid, nick, log, task_code, expert, conv_name="expe
         time.sleep(3)
     except Exception as exc:
         log("   %s: 失败 %s" % (label, str(exc)[:60]))
-    st, cur, tgt = prog(s, task_code)
+    st, cur, tgt = _expert_prog(s, task_code)
     log("   %s: %s %s/%s" % (label, st, cur, tgt))
+    if st not in ("completed", "claimed"):
+        log("   %s: 服务端进度未确认完成，本轮不报成功" % label)
 
 
 def t_valorant(s, uid, nick, log):
@@ -2624,8 +2801,8 @@ def mp_base(uid, nick):
     指纹（android 14 / arm64），与 mp_mini_expert_event、上游 task_runner 同口径。
     """
     now = int(time.time() * 1000)
-    return {"timestamp": now, "ideType": "WorkBuddy_MP", "ideVersion": "2.2.8",
-            "extName": "workbuddy-mp", "extVersion": "2.2.8", "product": "SaaS",
+    return {"timestamp": now, "ideType": "WorkBuddy_MP", "ideVersion": "2.4.0",
+            "extName": "workbuddy-mp", "extVersion": "2.4.0", "product": "SaaS",
             "ideName": "wx_app_cloud", "platform": "mini_program",
             "source": "mini_program",   # 官方源码口径：mp 身份 = wx_app_cloud + WorkBuddy_MP + source
             "os": "android", "osVersion": "14", "arch": "arm64",
@@ -2735,12 +2912,11 @@ def mp_report(s, uid, nick, events):
 
 def _mp_prog(s, code):
     try:
-        r = s.get(BASE + "/v2/activity/growth/tasks", timeout=25, verify=False, headers=MP_HEADER)
-        for t in r.json().get("data", {}).get("tasks", []):
-            if t.get("task_code") == code:
-                pr = t.get("progress") or {}
-                return t.get("accept_status", ""), pr.get("current"), pr.get("target")
-    except Exception:
+        for task in growth_task_rows(s, headers=MP_HEADER):
+            if task.get("task_code") == code:
+                progress = task.get("progress") or {}
+                return task.get("accept_status", ""), progress.get("current"), progress.get("target")
+    except (SafeError, requests.RequestException):
         pass
     return None, None, None
 
@@ -2801,19 +2977,12 @@ def _mp_claim(s, code, log):
 
 
 def _mp_task_row(s, code):
-    """mp 口径任务原始行（含 locked / valid_start / reward_* 等字段）；未下发返回 None。
-
-    服务端每个任务行都带 locked；locked=true 表示未到上线时间（accept 会报
-    "task locked until <日期>"），此时上报与领奖都无意义且会被判无效。
-    """
+    """只读获取小程序任务（含 locked/valid_start），未下发返回 None。"""
     try:
-        r = s.get(BASE + "/v2/activity/growth/tasks", timeout=25, verify=False, headers=MP_HEADER)
-        for t in r.json().get("data", {}).get("tasks", []):
-            if t.get("task_code") == code:
-                return t
-    except Exception:
-        pass
-    return None
+        return next((task for task in growth_task_rows(s, headers=MP_HEADER)
+                     if task.get("task_code") == code), None)
+    except (SafeError, requests.RequestException):
+        return None
 
 
 def _wait_mp_target(s, code, label, log):
@@ -3126,9 +3295,7 @@ def t_unknown_tasks(s, uid, nick, log):
     )
     for headers, label, path in sources:
         try:
-            r = s.get(BASE + path, timeout=25, verify=False,
-                      headers=headers).json()
-            batch = (r.get("data") or {}).get("tasks") or []
+            batch = growth_task_rows(s, headers=headers, path=path)
         except Exception as e:
             errors.append("%s: %s" % (label, str(e)[:50]))
             continue
@@ -3696,8 +3863,8 @@ def report_desktop_events(s, uid, nick, events):
            "Accept": "application/json, text/plain, */*",
            "Content-Type": "application/json;charset=UTF-8",
            "User-Agent": DESKTOP_UA,
-           "X-Domain": DESKTOP_BASE, "X-Product": "SaaS",
-           "X-Request-ID": derive_id(uid, "req") + str(int(time.time() * 1000) % 1000000)}
+           "X-Domain": "copilot.tencent.com", "X-Product": "SaaS",
+           "X-Request-ID": _new_message_id()}
     if uid:
         hdr["X-User-Id"] = uid
     s2 = requests.Session()
@@ -3753,74 +3920,155 @@ def is_enterprise_denial(status_code, payload):
 
 
 def claim_ready_tasks(s, log):
-    """领取所有进度已达标但尚未入账的任务。
-
-    以 progress.current >= progress.target 为准，不依赖可能延迟或回滚的
-    accept_status。桌面与小程序任务分开扫描，按 task_code 去重；同一任务
-    两边都可领时优先小程序口径。
-    """
-    merged = {}
-
-    def claimable(task):
-        if task.get("locked"):
-            return False
-        status = str(task.get("accept_status") or "")
-        claimed_value = task.get("claimed")
-        if claimed_value is True or str(claimed_value).lower() == "true":
-            return False
-        if status == "claimed":
-            return False
-        progress = task.get("progress") or {}
-        current = _as_int(progress.get("current"))
-        target = _as_int(progress.get("target"))
-        if target > 0 and current >= target:
-            return True
-        return target <= 0 and status == "completed"
-
-    def collect(headers=None, mp=False):
-        try:
-            response = s.get(BASE + "/v2/activity/growth/tasks", timeout=25,
-                             verify=False, headers=headers)
-            payload = response.json() or {}
-            rows = (payload.get("data") or {}).get("tasks", [])
-        except Exception as exc:
-            log("   ⚠️领奖扫描失败(%s): %s" % ("小程序" if mp else "桌面", str(exc)[:50]))
-            return
-        for task in rows:
-            if not isinstance(task, dict):
-                continue
-            code = str(task.get("task_code") or "").strip()
-            if not code:
-                continue
-            can_claim = claimable(task)
-            old = merged.get(code)
-            if old is None:
-                merged[code] = {"task": task, "mp": mp, "claimable": can_claim}
-            elif can_claim and not old["claimable"]:
-                merged[code] = {"task": task, "mp": mp, "claimable": True}
-            elif can_claim and old["claimable"] and mp and not old["mp"]:
-                merged[code] = {"task": task, "mp": True, "claimable": True}
-
-    collect()
-    collect(MP_HEADER, mp=True)
+    """先确认任务来源，再按该来源的真实进度补领；失败不推断为任务缺席。"""
+    sources = _expert_sources(s)
+    by_code = {}
+    for source, result in sources.items():
+        if not result["ok"]:
+            log("   ⚠️领奖扫描失败（%s），该来源未确认" % source)
+        for row in result["rows"]:
+            code = str(row.get("task_code") or row.get("code") or "").strip()
+            if code:
+                by_code.setdefault(code, {})[source] = row
     claimed = 0
-    for code, item in merged.items():
-        if not item["claimable"]:
+    for code, rows in by_code.items():
+        if any(r.get("accept_status") == "claimed" or str(r.get("claimed")).lower() == "true" for r in rows.values()):
             continue
-        use_mp = False if code in DESKTOP_ONLY_TASK_CODES else bool(
-            item["mp"] or code in MP_TASK_CODES)
+        if not any(_task_claimable(r) for r in rows.values()):
+            continue
+        is_expert = code.startswith("expert_use_") or code in ("Expert_lighthouse", "WorkBuddy_Valorant")
+        if code == "Sequential_Tasks_7":
+            source = "desktop"
+        elif code in MP_TASK_CODES:
+            source = "mp"
+        elif is_expert:
+            if not sources["desktop"]["ok"]:
+                log("   ⚠️专家领奖来源未确认，暂缓 %s" % code)
+                continue
+            source = "desktop" if "desktop" in rows else "mp"
+            if len(rows) == 2 and _task_claimable(rows["desktop"]) != _task_claimable(rows["mp"]):
+                time.sleep(1.0)
+                try:
+                    _primary, _row, refreshed = _expert_context(s, code)
+                    a, b = refreshed["desktop"]["row"], refreshed["mp"]["row"]
+                except SafeError:
+                    log("   ⚠️专家任务进度回读失败，暂缓 %s" % code)
+                    continue
+                if a is None or b is None or _task_claimable(a) != _task_claimable(b):
+                    log("   ⚠️专家任务进度未确认（两侧不一致），暂缓 %s" % code)
+                    continue
+                rows = {"desktop": a, "mp": b}
+        elif code in DESKTOP_ONLY_TASK_CODES:
+            source = "desktop"
+        else:
+            source = "mp" if _task_claimable(rows.get("mp")) else "desktop"
+        if not _task_claimable(rows.get(source)):
+            continue
         try:
-            ok = _mp_claim(s, code, log) if use_mp else claim(s, code, log)
+            ok = _mp_claim(s, code, log) if source == "mp" else claim(s, code, log)
         except Exception as exc:
             ok = False
-            log("   ⚠️领奖[%s]异常: %s" % (code, str(exc)[:60]))
+            log("   ⚠️领奖[%s]异常（%s）" % (code, type(exc).__name__))
         if ok:
             claimed += 1
         time.sleep(1)
-    if claimed == 0:
-        log("   无达标未领奖励")
-    else:
-        log("   🎁 达标补领完成: %d 项" % claimed)
+    log("   🎁 达标补领完成: %d 项" % claimed if claimed else "   无达标未领奖励")
+
+
+def is_account_restricted(status_code, payload):
+    """识别明确的账号受限回执，不把普通 403 当成风控。"""
+    code = payload.get("code") if isinstance(payload, dict) else None
+    if code in (11140, "11140"):
+        return True
+    blob = (json.dumps(payload, ensure_ascii=False)
+            if isinstance(payload, (dict, list)) else str(payload or "")).lower()
+    return status_code == 403 and any(marker in blob for marker in (
+        "11140", "account restricted", "request illegal", "账号受限", "账号被限制", "账户受限"))
+
+
+def growth_probe(s):
+    """只读预检；保持原有 YYB 登录与续期流程，不额外刷新或重试。"""
+    try:
+        response = s.get(BASE + "/v2/activity/growth/profile", timeout=25, verify=False)
+        payload = _json_or_empty(response)
+    except requests.RequestException:
+        raise SafeError("成长状态查询失败（网络或超时）") from None
+    if is_account_restricted(response.status_code, payload or response.text):
+        return "restricted", {}, "账号受限（11140），本轮停止该账号"
+    if is_enterprise_denial(response.status_code, payload):
+        return "enterprise", {}, "企业版账号（无个人成长体系）"
+    if response.status_code == 401:
+        raise SafeError("成长状态查询失败（HTTP 401，凭据失效）")
+    if response.status_code == 403:
+        raise SafeError("成长状态查询失败（HTTP 403，访问被拒绝）")
+    if (not 200 <= response.status_code < 300 or not _api_code_ok(payload.get("code"))
+            or not isinstance(payload.get("data"), dict)):
+        code = payload.get("code")
+        code = code if isinstance(code, int) else "未知"
+        raise SafeError("成长状态查询失败（HTTP %s，业务码 %s）" % (response.status_code, code))
+    return "ready", payload["data"], ""
+
+
+def growth_task_rows(s, headers=None, path="/v2/activity/growth/tasks"):
+    """区分有效空任务表和读取失败，避免把错误响应报告成全部完成。"""
+    # 同一账号的任务列表查询统一节奏，不缓存进度，避免写操作后读到旧状态。
+    for attempt in range(3):
+        last = getattr(s, "_workbuddy_task_read_at", 0.0)
+        if isinstance(last, (int, float)):
+            delay = 0.5 - (time.monotonic() - last)
+            if delay > 0:
+                time.sleep(delay)
+        s._workbuddy_task_read_at = time.monotonic()
+        response = api_retry(s, "GET", BASE + path, retries=2, gap=1.0, headers=headers)
+        if response.status_code != 429 or attempt == 2:
+            break
+        retry_after = response.headers.get("Retry-After")
+        try:
+            wait = float(retry_after) if retry_after else 2.0 * (attempt + 1)
+        except (TypeError, ValueError):
+            from email.utils import parsedate_to_datetime
+            try:
+                wait = parsedate_to_datetime(retry_after).timestamp() - time.time()
+            except (TypeError, ValueError, OverflowError):
+                break
+        if wait > 30:
+            break
+        time.sleep(max(0.5, wait))
+    payload = _json_or_empty(response)
+    rows = (payload.get("data") or {}).get("tasks") if isinstance(payload.get("data"), dict) else None
+    if (not 200 <= response.status_code < 300 or not _api_code_ok(payload.get("code"))
+            or not isinstance(rows, list) or any(not isinstance(t, dict) for t in rows)):
+        code = payload.get("code")
+        code = code if isinstance(code, int) else "未知"
+        raise SafeError("任务列表读取失败（HTTP %s，业务码 %s，或任务结构无效）" % (response.status_code, code))
+    return rows
+
+
+def query_account(client, account):
+    """查询模式不调用准备、签到、领奖、对话；仅认证及读取状态。"""
+    client.authenticate()
+    s = client.api_session()
+    kind, prof, message = growth_probe(s)
+    if kind == "restricted":
+        raise SafeError(message)
+    credits, _paid = queryCredits(s)
+    usage = queryUsage(s)
+    issues = ["积分查询失败"] if credits.startswith("查询失败") else []
+    try:
+        sd = client.status() if kind != "enterprise" else {}
+        checked = sd.get("today_checked_in")
+    except SafeError:
+        checked = None
+        sd = {}
+        issues.append("签到状态查询失败")
+    return {"idx": account.number, "note": account.ref, "query": True,
+            "credits": credits, "usage": usage, "level": prof.get("level", "?"),
+            "energy": "?", "streak": "?", "checkin_streak": sd.get("streak_days", "?"),
+            "done": 0, "total": 0, "rest": [], "checked": checked is True,
+            "checked_in": checked is True, "task_errors": issues,
+            "checkin": "今日已签到" if checked is True else (
+                "今日未签到" if checked is False else "签到状态未知"),
+            "enterprise": kind == "enterprise", "error": ""}
 
 
 def run_account(idx, client, account, do_desktop):
@@ -3832,11 +4080,17 @@ def run_account(idx, client, account, do_desktop):
         line = "[%s][%s] %s" % (ts, tag, m)
         print(line, flush=True)
         msgs.append(line)
+        # 既有处理器会局部捕获异常，保留独立提示，不把签到成功当作任务无异常。
+        if any(marker in m for marker in ("失败", "异常", "未确认", "仍无法登记", "未到账")):
+            issue = m.strip()
+            if issue not in summary["task_errors"]:
+                summary["task_errors"].append(issue)
 
     note = account.ref
     summary = {"idx": idx, "note": note, "credits": "", "usage": "", "growth": "",
                "done": 0, "total": 0, "rest": [], "level": "?", "energy": "?",
-               "checked": False, "checkin": "", "checkin_streak": "?", "error": ""}
+               "checked": False, "checkin": "", "checkin_streak": "?", "error": "",
+               "task_errors": [], "tasks_loaded": False}
 
     try:
         client.authenticate()
@@ -3863,9 +4117,13 @@ def run_account(idx, client, account, do_desktop):
 
     # 先探成长域：企业版账号在这里就能识别（无个人成长体系），
     # 避免把上游 403 误报成「凭据失效」、也避免对注定被拒的端点空发请求。
-    rp = s.get(BASE + "/v2/activity/growth/profile", timeout=25, verify=False)
-    pj = _json_or_empty(rp)
-    if is_enterprise_denial(rp.status_code, pj):
+    kind, prof, probe_message = growth_probe(s)
+    if kind == "restricted":
+        log("  🚫 " + probe_message)
+        summary["restricted"] = True
+        summary["error"] = probe_message
+        return msgs, summary
+    if kind == "enterprise":
         log("  🏢 企业版账号：无个人成长体系（上游对签到/成长端点一律拒绝，实测口径）")
         log("     已跳过签到与全部成长/互动任务；积分额度请在企业后台或企业接口查询")
         summary["enterprise"] = True
@@ -3890,17 +4148,22 @@ def run_account(idx, client, account, do_desktop):
         log("   ❌ 签到失败：%s" % e)
         summary["error"] = str(e)
 
+    # 在产生新任务行为之前先补领已达标奖励；原签到/准备位置保持不变。
+    log("  🎁 ── 领奖预扫 ──")
+    try:
+        claim_ready_tasks(s, log)
+    except Exception as exc:
+        log("   ⚠️领奖预扫异常（%s）" % type(exc).__name__)
+
     # 每日活跃上报（成长中心热力墙口径，只认 /v2/report 的 chat_request_send）
-    t_daily_activity(s, uid, nick, log)
+    try:
+        t_daily_activity(s, uid, nick, log)
+    except Exception as exc:
+        log("   ⚠️每日活跃异常（%s）" % type(exc).__name__)
 
     # 查询
     credits, paid = queryCredits(s)
     usage = queryUsage(s)
-    if rp.status_code in (401, 403) or not pj:
-        log("  ❌ 凭据失效（HTTP %s）：请检查 YYB 取码/登录是否正常" % rp.status_code)
-        summary["error"] = summary["error"] or "凭据失效"
-        return msgs, summary
-    prof = pj.get("data", {}) or {}
     energy = (_json_or_empty(s.get(BASE + "/v2/activity/growth/energy", timeout=25,
                                             verify=False)).get("data") or {}).get("balance")
     streak = ((_json_or_empty(s.get(BASE + "/v2/activity/growth/streak", timeout=25,
@@ -3983,8 +4246,14 @@ def run_account(idx, client, account, do_desktop):
             return None
 
     # 前置：无 Buddy 实例时，其余任务 accept 会被服务端拒绝（prerequisite not met: first_buddy）
-    t_first_buddy(s, uid, nick, log)
-    t_accept_all(s, uid, nick, log)
+    try:
+        t_first_buddy(s, uid, nick, log)
+    except Exception as exc:
+        log("   ⚠️领取Buddy异常（%s）" % type(exc).__name__)
+    try:
+        t_accept_all(s, uid, nick, log)
+    except Exception as exc:
+        log("   ⚠️批量接受异常（%s），后续任务继续" % type(exc).__name__)
     _run("召唤3次专家团", ["Expert_team_use_3"], lambda: t_team_3(s, uid, nick, log))
     _run("发现应用/企鹅教师助手", ["Buddy_App", "Buddy_App_QQ"], lambda: t_buddy_apps(s, uid, nick, log))
     _run("和平精英主题", ["Hp_Appearance"], lambda: t_theme(s, uid, nick, log))
@@ -4027,15 +4296,25 @@ def run_account(idx, client, account, do_desktop):
     _run("抽奖", ["lottery"], lambda: t_lottery(s, uid, nick, log))
     _run("礼包/补偿", ["gift"], lambda: t_gift_compensation(s, uid, nick, log))
     _run("工作台搭建师", ["workstation_expert"], lambda: t_workstation(s, uid, nick, log, tok))
-    t_unknown_tasks(s, uid, nick, log)   # 未覆盖任务检测不受过滤影响
+    try:
+        t_unknown_tasks(s, uid, nick, log)   # 未覆盖任务检测不受过滤影响
+    except Exception as exc:
+        log("   ⚠️任务发现异常（%s）" % type(exc).__name__)
 
     # 领奖：按进度补领，不依赖 accept_status 的瞬时状态
     log("  🎁 ── 领奖 ──")
-    claim_ready_tasks(s, log)
+    try:
+        claim_ready_tasks(s, log)
+    except Exception as exc:
+        log("   ⚠️领奖末扫异常（%s）" % type(exc).__name__)
 
-    # 终态
-    st_all = (_json_or_empty(s.get(BASE + "/v2/activity/growth/tasks", timeout=25,
-                                      verify=False)).get("data") or {}).get("tasks", [])
+    # 终态：读取失败不能折算成 0/0 全部完成。
+    try:
+        st_all = growth_task_rows(s)
+    except (SafeError, requests.RequestException):
+        log("   ⚠️任务终态读取失败，完成数量未确认")
+        return msgs, summary
+    summary["tasks_loaded"] = True
     done = sum(1 for t in st_all if isinstance(t, dict) and t.get("accept_status") in ("claimed", "completed"))
     rest = [task_cn(t.get("task_code", "")) for t in st_all if isinstance(t, dict) and t.get("accept_status") not in ("claimed", "completed")]
     prof2 = (_json_or_empty(s.get(BASE + "/v2/activity/growth/profile", timeout=25,
@@ -4078,17 +4357,30 @@ def build_summary(summaries):
             lines.append("")
             continue
         if checkin:
-            lines.append("   ✅ %s" % checkin)
+            icon = "✅" if sm.get("checked_in") else ("ℹ️" if sm.get("query") else "⚠️")
+            lines.append("   %s %s" % (icon, checkin))
         lines.append("   💰 %s" % (credits if credits else "暂无数据"))
         lines.append("   📊 %s" % (usage if usage else "暂无数据"))
         lines.append("   🌱 等级%s | 签到连签%s天 | 活跃连签%s天 | 能量%s"
                      % (level, sm.get("checkin_streak", "?"), streak, energy))
         if str(streak).strip() in ("0", "0.0"):
             lines.append("      ℹ️ 活跃连签=0 属正常：它由成长中心「使用事件（热力墙）」驱动，与积分签到无关")
-        if rest_cn:
+        if sm.get("query"):
+            lines.append("   ℹ️ 仅查询状态，未执行任务")
+        elif sm.get("enterprise"):
+            lines.append("   ℹ️ 企业版账号，无个人成长任务")
+        elif not sm.get("tasks_loaded"):
+            lines.append("   ⚠️ 任务结果未确认")
+        elif total == 0:
+            lines.append("   ℹ️ 当前任务列表为空")
+        elif rest_cn:
             lines.append("   ⏳ 未完成: %s" % "、".join(rest_cn))
         else:
-            lines.append("   ✅ 全部完成！")
+            lines.append("   ✅ 当前任务列表全部完成（%s/%s）" % (done, total))
+        issues = sm.get("task_errors") or []
+        if issues:
+            lines.append("   ⚠️ 本轮任务/查询异常 %d 项（见运行日志）" % len(issues))
+            lines.extend("      · " + issue for issue in issues[:3])
         lines.append("")
     lines.append("📊 ══ 总计 ══")
     lines.append("👥 共%d个账号，任务完成 %d/%d 项" % (len(summaries), total_done, total_tasks))
@@ -4218,15 +4510,17 @@ def print_banner(query=False):
 
 
 def _notify_ok(summaries):
-    """本轮是否「一切正常」。
-
-    判据只看签到结论：成功分支（含幂等命中「今天已签到」）会写 checked_in=True。
-    账号级异常中断（run_account 抛错）也视为不正常——那种 summary 没有
-    checked_in 字段，自然落到 False。
-    """
+    """查询按读取结果判断；业务轮次分别检查签到、任务读取与局部异常。"""
     if not summaries:
         return False
-    return all(bool(sm.get("checked_in")) for sm in summaries)
+    for sm in summaries:
+        if sm.get("error") or sm.get("restricted") or sm.get("task_errors"):
+            return False
+        if sm.get("query") or sm.get("enterprise"):
+            continue
+        if not sm.get("checked_in") or not sm.get("tasks_loaded"):
+            return False
+    return True
 
 
 def _notify_or_skip(summaries, summary_text, blocked=False):
@@ -4300,25 +4594,7 @@ def main(argv=None):
                 try:
                     client = Client(account, state)
                     if args.query:
-                        # 仅查询：登录 + 签到状态 + 积分/用量/成长
-                        client.authenticate()
-                        s = client.api_session()
-                        credits, paid = queryCredits(s)
-                        usage = queryUsage(s)
-                        prof = (_json_or_empty(s.get(BASE + "/v2/activity/growth/profile",
-                                                    timeout=25, verify=False)).get("data") or {})
-                        try:
-                            sd = client.status()
-                            checked = sd.get("today_checked_in")
-                        except Exception:
-                            checked = False
-                        summary = {"idx": account.number, "note": account.ref,
-                                   "credits": credits, "usage": usage,
-                                   "level": prof.get("level", "?"), "energy": "?",
-                                   "streak": "?", "done": 0, "total": 0, "rest": [],
-                                   "checked": bool(checked),
-                                   "checkin": "今日已签到" if checked else "今日未签到",
-                                   "error": ""}
+                        summary = query_account(client, account)
                         reports.append(summary)
                     else:
                         msgs_part, summary = run_account(account.number, client, account,
@@ -4356,7 +4632,7 @@ def main(argv=None):
     else:
         _notify_or_skip(reports, summary_text, blocked=True)
 
-    ok = sum(1 for r in reports if not r.get("error"))
+    ok = sum(1 for r in reports if not r.get("error") and not r.get("task_errors"))
     return 0 if total > 0 and ok == total and not errors else 1
 
 
