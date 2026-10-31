@@ -11,7 +11,7 @@ cron: 31 7,12,23 * * *
 修改作者：lcmovie https://github.com/lcmovie/YYB-GO-Script-i
 修改后主要适配：https://github.com/525815266/YYB-Go-Enhanced，实现无感取码，自动打卡 + 全部成长任务！
 ════════════════════════════════════════════════════════════════
-🌱 WorkBuddy Daily - 全能签到脚本 v3.33（YYB 无感取码版）
+🌱 WorkBuddy Daily - 全能签到脚本 v3.35（YYB 无感取码版）
 ════════════════════════════════════════════════════════════════
 
 📌 这是什么
@@ -76,7 +76,7 @@ cron: 31 7,12,23 * * *
    PUSH_PLUS_TOKEN / PLUSPLUS_TOKEN / PUSH_KEY / QYWX_KEY / BARK_PUSH
                         【可选】脚本自带通知通道（青龙 notify.py 未配置时回落）
 
-📦 任务清单（参考上游 v3.33，以下任务以实际下发为准）
+📦 任务清单（参考上游 v3.35，以下任务以实际下发为准）
    ☁️ 已适配成长任务：每日签到 · 设计创意模式 · 探索优秀灵感 · 桌面端对话 ·
       尝鲜热门技能 · 体验资料库 · 腾讯轻量云专家 · 和平精英主题 · 发现应用 ·
       企鹅教师助手 · GLM-5.2模型对话 · 和AI聊天5次 · 夜猫子活动 · 召唤3次专家团 ·
@@ -134,6 +134,7 @@ import argparse
 import base64
 import contextlib
 import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import hashlib
 import importlib.util
 import io
@@ -160,9 +161,9 @@ try:
 except Exception:
     pass
 
-VERSION = "1.9.1"
-UPSTREAM_VERSION = "3.33"
-UPSTREAM_COMMIT = "d1ae050ee5338457a6adaf7fce895c24b623dc19"
+VERSION = "1.9.2"
+UPSTREAM_VERSION = "3.35"
+UPSTREAM_COMMIT = "c442bab4d356e3450433df83de9c2dabe3248239"
 APP_ID = "wx907c65e5e107ddcf"                     # WorkBuddy 小程序 AppID
 LOGIN_URL = "https://www.codebuddy.cn/v2/plugin/login/token"
 PROFILE_URL = "https://www.codebuddy.cn/v2/as/wechatmp/user/profile"
@@ -1459,33 +1460,115 @@ def _clean_num(v):
     return ("%.2f" % r).rstrip("0").rstrip(".")
 
 
-def queryCredits(s):
-    """积分查询：剩余积分合计 + 各套餐明细（对齐客户端 App 顶部显示的剩余积分）。
+def _credit_decimal(value):
+    if value is None or isinstance(value, bool):
+        raise ValueError("积分数值缺失或类型错误")
+    result = Decimal(str(value))
+    if not result.is_finite():
+        raise ValueError("积分数值无效")
+    return result
 
-    App 顶部"剩余积分"= 所有套餐 CycleRemainCapacity 之和（如 2425.4 = 主套餐1925.4
-    + 加量包1 500 + 加量包2 0），合计在前、明细在后，避免"看着不匹配"。
-    """
+def _format_credit(value):
+    number = _credit_decimal(value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if number == 0:
+        number = Decimal("0.00")
+    return format(number, "f").rstrip("0").rstrip(".")
+
+def _sample_credit(s, summary, phase, log):
+    meta = {}
     try:
-        # 瞬时错误（网络/5xx）有界重试：2s/4s 退避，业务错误不重试（上游 panel 同款口径）
-        r = api_retry(s, "POST", BASE + "/billing/meter/get-user-resource-summary", body={},
-                      retries=3, gap=2.0).json()
-        pkgs = r.get("data", {}).get("Packages", [])
-        paid = r.get("data", {}).get("IsPaidUser")
+        text, _paid = queryCredits(s, meta)
+        value = str(_credit_decimal(meta.get("total_remain")))
+    except Exception:
+        text, value = "余额查询失败", None
+    summary["credits_" + phase] = value
+    if value is not None:
+        summary["credits"] = text
+        summary["credits_detail_phase"] = phase
+    elif not summary.get("credits"):
+        summary["credits"] = text
+    if value is None:
+        log("   ⚠️%s余额查询失败，保留其他业务结果" % ("操作前" if phase == "before" else "操作后"))
+
+def _credit_lines(summary):
+    if summary.get("query") or summary.get("enterprise") or not any(k in summary for k in ("credits_before", "credits_after")):
+        return ["   💰 %s" % (summary.get("credits") or "暂无数据")]
+    values = []
+    for phase in ("before", "after"):
+        try:
+            values.append(_credit_decimal(summary.get("credits_" + phase)))
+        except (ValueError, InvalidOperation):
+            values.append(None)
+    before, after = values
+    labels = [_format_credit(value) if value is not None else "未知" for value in values]
+    if before is not None and after is not None:
+        delta = _credit_decimal(_format_credit(after - before))
+        sign = "+" if delta > 0 else ""
+        tail = "（本轮净变 %s%s）" % (sign, _format_credit(delta))
+    else:
+        tail = "（净变化未知）"
+    result = ["   💰 积分: %s → %s%s" % (labels[0], labels[1], tail)]
+    if summary.get("credits_detail_phase"):
+        label = "操作后" if summary["credits_detail_phase"] == "after" else "操作前"
+        result.append("   💳 %s套餐明细: %s" % (label, summary["credits"]))
+    return result
+
+def _finish_credit_sample(s, summary, log):
+    try:
+        _sample_credit(s, summary, "after", log)
+        before, after = summary.get("credits_before"), summary.get("credits_after")
+        if before is not None and after is not None:
+            summary["credits_delta"] = str(_credit_decimal(after) - _credit_decimal(before))
+        for line in _credit_lines(summary):
+            log(line.strip())
+    except Exception as exc:
+        log("   ⚠️余额收尾异常（%s），保留原始业务结果" % type(exc).__name__)
+
+def _settle_before_play(s, log):
+    # 单独判断每个开关，避免某一个黑名单项目屏蔽其他已启用玩法。
+    if not any(want(code) for code in ("badges", "blindbox", "buddy_info", "travel", "makeup", "redeem", "lottery")):
+        return
+    log("  🎁 ── 玩法前领奖 ──")
+    try:
+        claim_ready_tasks(s, log)
+    except Exception as exc:
+        log("   ⚠️玩法前领奖异常（%s），继续后续流程" % type(exc).__name__)
+
+
+def queryCredits(s, meta=None):
+    """保留文本/paid 返回值；仅确认成功的套餐回执可提供结构化余额。"""
+    if meta is not None:
+        meta.pop("total_remain", None)
+    try:
+        response = api_retry(s, "POST", BASE + "/billing/meter/get-user-resource-summary",
+                             body={}, retries=3, gap=2.0)
+        payload = _json_or_empty(response)
+        if (not 200 <= response.status_code < 300 or not _api_code_ok(payload.get("code"))
+                or isinstance(payload.get("code"), bool) or not isinstance(payload.get("data"), dict)):
+            raise SafeError("积分查询回执无效")
+        data = payload["data"]
+        packages = data.get("Packages")
+        if not isinstance(packages, list):
+            raise SafeError("积分查询缺少套餐数据")
+        total = Decimal(0)
         out = []
-        total_remain = 0.0
-        for i, p in enumerate(pkgs):
-            remain_f = float(p.get("CycleRemainCapacity", 0) or 0)
-            total_f = float(p.get("CycleTotalCapacity", 0) or 0)
-            used_f = float(p.get("CycleUsedCapacity", 0) or 0)
-            total_remain += remain_f
-            pkg_name = "主套餐" if i == 0 else "加量包%d" % i
-            out.append("%s剩余%s(共%s,已用%s)" % (pkg_name,
-                       _clean_num(remain_f), _clean_num(total_f), _clean_num(used_f)))
-        if not out:
-            return "暂无套餐", paid
-        return ("剩余积分合计%s（%s）" % (_clean_num(total_remain), "；".join(out))), paid
-    except Exception as e:
-        return "查询失败:" + str(e)[:40], False
+        for index, package in enumerate(packages):
+            if not isinstance(package, dict) or "CycleRemainCapacity" not in package:
+                raise SafeError("积分查询缺少余额字段")
+            remain = _credit_decimal(package["CycleRemainCapacity"])
+            total += remain
+            capacity = _format_credit(package["CycleTotalCapacity"]) if package.get("CycleTotalCapacity") is not None else "?"
+            used = _format_credit(package["CycleUsedCapacity"]) if package.get("CycleUsedCapacity") is not None else "?"
+            name = "主套餐" if index == 0 else "加量包%d" % index
+            out.append("%s剩余%s(共%s,已用%s)" % (name, _format_credit(remain), capacity, used))
+        text = "剩余积分合计%s（%s）" % (_format_credit(total), "；".join(out)) if out else "暂无套餐"
+        if meta is not None:
+            # 字符串保留十进制精度，且兼容潜在 JSON 摘要消费者。
+            meta["total_remain"] = str(total)
+        return text, data.get("IsPaidUser")
+    except Exception as exc:
+        # 不把接口正文、URL 或账号材料带入日志。
+        return "查询失败（%s）" % type(exc).__name__, False
 
 
 def queryUsage(s):
@@ -2050,29 +2133,41 @@ def t_lottery(s, uid, nick, log):
 
 def t_blindbox(s, uid, nick, log):
     try:
-        q = s.get(BASE + "/v2/activity/growth/buddy/quota", timeout=20, verify=False).json()
-        qd = q.get("data", {})
-        affordable = qd.get("affordable", 0)
-        if not affordable or affordable <= 0:
-            log("   📦盲盒: 能量不足 (%s/10)" % qd.get("balance", "?"))
-            return
-        n = min(affordable, 5)
+        response = s.get(BASE + "/v2/activity/growth/buddy/quota", timeout=20, verify=False)
+        payload = _json_or_empty(response)
+        if (not 200 <= response.status_code < 300 or not _api_code_ok(payload.get("code"))
+                or isinstance(payload.get("code"), bool) or not isinstance(payload.get("data"), dict)):
+            raise SafeError("盲盒额度回执无效")
+        data = payload["data"]
+        affordable = _credit_decimal(data.get("affordable"))
+        balance = _credit_decimal(data.get("balance"))
+        if affordable < 0 or affordable != affordable.to_integral_value():
+            raise ValueError()
+    except Exception as exc:
+        log("   📦盲盒查询失败（%s），本次不开启" % type(exc).__name__)
+        return
+    if affordable == 0:
+        if balance < 10:
+            log("   📦盲盒: 能量不足 (%s/10)" % _format_credit(balance))
+        else:
+            log("   📦盲盒: 当前无可开启次数（能量 %s）" % _format_credit(balance))
+        return
+    try:
         got = []
-        for _ in range(n):
-            rr = s.post(BASE + "/v2/activity/growth/buddy/open", json={"count": 1}, timeout=20, verify=False).json()
-            if rr.get("code") == 0:
-                results = rr.get("data", {}).get("results", [])
+        for _ in range(min(int(affordable), 5)):
+            payload = s.post(BASE + "/v2/activity/growth/buddy/open", json={"count": 1}, timeout=20, verify=False).json()
+            if payload.get("code") == 0:
+                results = payload.get("data", {}).get("results", [])
                 if results:
-                    it = results[0]
-                    ins = it.get("instance", {})
-                    tpl = it.get("template", {})
-                    got.append("%s(%s)" % (ins.get("name", tpl.get("name", "?")), ins.get("rarity", tpl.get("rarity", ""))))
+                    item = results[0]
+                    instance, template = item.get("instance", {}), item.get("template", {})
+                    got.append("%s(%s)" % (instance.get("name", template.get("name", "?")), instance.get("rarity", template.get("rarity", ""))))
             else:
                 break
             time.sleep(1.5)
         log("   📦盲盒: %s" % ("、".join(got) if got else "开启失败"))
-    except Exception as e:
-        log("   📦盲盒异常: %s" % str(e)[:50])
+    except Exception as exc:
+        log("   📦盲盒异常（%s）" % type(exc).__name__)
 
 
 def t_buddy_info(s, uid, nick, log):
@@ -4130,200 +4225,210 @@ def run_account(idx, client, account, do_desktop):
         summary["rest"] = ["企业版账号（无个人成长体系）"]
         return msgs, summary
 
-    # 签到（YYB 回读确认流程）
+    _sample_credit(s, summary, "before", log)
     try:
-        checkin_line, checkin_ok = client.run_checkin()
-        log("   %s" % checkin_line)
-        summary["checked"] = checkin_ok
-        summary["checked_in"] = bool(checkin_ok)
-        summary["checkin"] = checkin_line
+        # 签到（YYB 回读确认流程）
         try:
-            st_data = client.status()
-            warn = _checkin_activity_warn(st_data)
-            if warn:
-                log("   %s" % warn)
+            checkin_line, checkin_ok = client.run_checkin()
+            log("   %s" % checkin_line)
+            summary["checked"] = checkin_ok
+            summary["checked_in"] = bool(checkin_ok)
+            summary["checkin"] = checkin_line
+            try:
+                st_data = client.status()
+                warn = _checkin_activity_warn(st_data)
+                if warn:
+                    log("   %s" % warn)
+            except Exception:
+                pass
+        except SafeError as e:
+            log("   ❌ 签到失败：%s" % e)
+            summary["error"] = str(e)
+
+        # 在产生新任务行为之前先补领已达标奖励；原签到/准备位置保持不变。
+        log("  🎁 ── 领奖预扫 ──")
+        try:
+            claim_ready_tasks(s, log)
+        except Exception as exc:
+            log("   ⚠️领奖预扫异常（%s）" % type(exc).__name__)
+
+        # 每日活跃上报（成长中心热力墙口径，只认 /v2/report 的 chat_request_send）
+        try:
+            t_daily_activity(s, uid, nick, log)
+        except Exception as exc:
+            log("   ⚠️每日活跃异常（%s）" % type(exc).__name__)
+
+        # 查询
+        credits = summary.get("credits", "暂无数据")
+        usage = queryUsage(s)
+        energy = (_json_or_empty(s.get(BASE + "/v2/activity/growth/energy", timeout=25,
+                                                verify=False)).get("data") or {}).get("balance")
+        streak = ((_json_or_empty(s.get(BASE + "/v2/activity/growth/streak", timeout=25,
+                                                 verify=False)).get("data") or {}).get("streak") or {})
+        summary["credits"] = credits
+        summary["usage"] = usage
+        summary["streak"] = streak.get("days", "?")
+        # 签到活动口径的连签（与活跃连签/热力墙分开显示，issue #21）
+        try:
+            _ck = client.status()
+            summary["checkin_streak"] = _ck.get("streak_days", "?")
         except Exception:
-            pass
-    except SafeError as e:
-        log("   ❌ 签到失败：%s" % e)
-        summary["error"] = str(e)
-
-    # 在产生新任务行为之前先补领已达标奖励；原签到/准备位置保持不变。
-    log("  🎁 ── 领奖预扫 ──")
-    try:
-        claim_ready_tasks(s, log)
-    except Exception as exc:
-        log("   ⚠️领奖预扫异常（%s）" % type(exc).__name__)
-
-    # 每日活跃上报（成长中心热力墙口径，只认 /v2/report 的 chat_request_send）
-    try:
-        t_daily_activity(s, uid, nick, log)
-    except Exception as exc:
-        log("   ⚠️每日活跃异常（%s）" % type(exc).__name__)
-
-    # 查询
-    credits, paid = queryCredits(s)
-    usage = queryUsage(s)
-    energy = (_json_or_empty(s.get(BASE + "/v2/activity/growth/energy", timeout=25,
-                                            verify=False)).get("data") or {}).get("balance")
-    streak = ((_json_or_empty(s.get(BASE + "/v2/activity/growth/streak", timeout=25,
-                                             verify=False)).get("data") or {}).get("streak") or {})
-    summary["credits"] = credits
-    summary["usage"] = usage
-    summary["streak"] = streak.get("days", "?")
-    # 签到活动口径的连签（与活跃连签/热力墙分开显示，issue #21）
-    try:
-        _ck = client.status()
-        summary["checkin_streak"] = _ck.get("streak_days", "?")
-    except Exception:
-        _ck = {}
-    log("💰 积分: %s" % credits)
-    log("📊 用量: %s" % usage)
-    try:
-        hm = s.get(BASE + "/v2/activity/growth/heatmap", timeout=20, verify=False).json()
-        cells = hm.get("data", {}).get("cells", [])
-        signed = sum(1 for c in cells if isinstance(c, dict) and c.get("score", 0) > 0)
-    except Exception:
-        signed = "?"
-    log("🌱 成长: 等级%s 签到连签%s天 活跃连签%s天 能量%s 累签%s天"
-        % (prof.get("level", "?"), summary["checkin_streak"], streak.get("days", "?"), energy, signed))
-
-    # 活跃连签口径说明：=0 属正常（由成长中心「使用事件（热力墙）」驱动，与积分签到无关）
-    if str(streak.get("days", "?")).strip() in ("0", "0.0"):
-        log("      ℹ️ 活跃连签=0 属正常：它由成长中心「使用事件（热力墙）」驱动，与积分签到无关")
-
-    # 桌面任务（非 Windows 自动降级为指纹上报）
-    rich_st = prog(s, "RichMeow_Chat")[0]
-    skill_st = prog(s, "skill_1")[0]
-    # 未下发（None）＝该任务当前不可做：不能当「未完成」去跑桌面对话，否则白扣积分
-    need_rich = rich_st is not None and rich_st not in ("completed", "claimed")
-    need_skill = skill_st is not None and skill_st not in ("completed", "claimed")
-    if rich_st is None or skill_st is None:
-        log("  🖥️ 桌面任务: 有任务未下发（RichMeow=%s skill_1=%s），未下发项不执行" % (rich_st, skill_st))
-    desktop_skipped = False
-    if (need_rich or need_skill) and not want("desktop", "RichMeow_Chat", "skill_1"):
-        log("  🖥️ 桌面任务: 按配置跳过（desktop）")
-        need_rich = need_skill = False
-        desktop_skipped = True
-    if do_desktop and (need_rich or need_skill):
-        log("  🖥️ ── 桌面任务（引导优先） ──")
+            _ck = {}
+        log("💰 积分: %s" % credits)
+        log("📊 用量: %s" % usage)
         try:
-            t_desktop_tasks(s, uid, nick, tok, log, need_rich, need_skill)
-        except Exception as e:
-            log("  🖥️ 桌面任务异常: %s" % str(e)[:80])
-    elif need_rich or need_skill:
-        log("── 桌面任务跳过(--no-desktop): RichMeow=%s skill_1=%s ──" % (need_rich, need_skill))
-    else:
-        if not desktop_skipped:
-            log("  🖥️ 桌面任务: 已完成（RichMeow/skill_1），跳过")
+            hm = s.get(BASE + "/v2/activity/growth/heatmap", timeout=20, verify=False).json()
+            cells = hm.get("data", {}).get("cells", [])
+            signed = sum(1 for c in cells if isinstance(c, dict) and c.get("score", 0) > 0)
+        except Exception:
+            signed = "?"
+        log("🌱 成长: 等级%s 签到连签%s天 活跃连签%s天 能量%s 累签%s天"
+            % (prof.get("level", "?"), summary["checkin_streak"], streak.get("days", "?"), energy, signed))
 
-    # 云端任务
-    log("  ☁️ ── 云端任务 ──")
-    if TASK_ONLY or TASK_SKIP:
-        log("   ⚙️ 任务过滤生效：%s%s" % (
-            ("仅执行 " + ",".join(sorted(TASK_ONLY))) if TASK_ONLY else "",
-            (("；跳过 " + ",".join(sorted(TASK_SKIP))) if TASK_SKIP else "")))
-        # 「使用类」任务才会给成长中心记活跃（热力墙）。全被过滤掉时明确提醒：
-        # 签到只给积分、不点热力墙——别把页面上的「开始使用以点亮今日热力墙」当成签到失败
-        _usage = {"chat_5", "model_chat_glm5.2", "desktop", "richmeow_chat", "skill_1", "black_cat",
-                  "expert_5", "expert_team_use_3", "template_5", "create_canvas", "playbook_prompt",
-                  "sequential_tasks_1", "sequential_tasks_3", "sequential_tasks_5",
-                  "automation_1", "library_read", "hp_appearance", "buddy_app", "buddy_app_qq"}
-        _kept = {t for t in (TASK_ONLY or _usage) if t not in TASK_SKIP}
-        if not (_kept & _usage):
-            log("   ⚠️ 未包含任何「使用类」任务 → 成长中心的今日活跃（热力墙）不会点亮")
-            log("      （签到/积分不受影响；想同时点亮热力墙建议保留一个对话类任务：WORKBUDDY_TASKS=checkin,travel,chat_5）")
+        # 活跃连签口径说明：=0 属正常（由成长中心「使用事件（热力墙）」驱动，与积分签到无关）
+        if str(streak.get("days", "?")).strip() in ("0", "0.0"):
+            log("      ℹ️ 活跃连签=0 属正常：它由成长中心「使用事件（热力墙）」驱动，与积分签到无关")
 
-    def _run(label, codes, fn):
-        """子任务调度：按 TASK_ONLY / TASK_SKIP 决定是否执行，单项异常不拖垮整轮。"""
-        if not want(*codes):
-            log("   ⏭️ %s: 按配置跳过" % label)
-            return None
+        # 桌面任务（非 Windows 自动降级为指纹上报）
+        rich_st = prog(s, "RichMeow_Chat")[0]
+        skill_st = prog(s, "skill_1")[0]
+        # 未下发（None）＝该任务当前不可做：不能当「未完成」去跑桌面对话，否则白扣积分
+        need_rich = rich_st is not None and rich_st not in ("completed", "claimed")
+        need_skill = skill_st is not None and skill_st not in ("completed", "claimed")
+        if rich_st is None or skill_st is None:
+            log("  🖥️ 桌面任务: 有任务未下发（RichMeow=%s skill_1=%s），未下发项不执行" % (rich_st, skill_st))
+        desktop_skipped = False
+        if (need_rich or need_skill) and not want("desktop", "RichMeow_Chat", "skill_1"):
+            log("  🖥️ 桌面任务: 按配置跳过（desktop）")
+            need_rich = need_skill = False
+            desktop_skipped = True
+        if do_desktop and (need_rich or need_skill):
+            log("  🖥️ ── 桌面任务（引导优先） ──")
+            try:
+                t_desktop_tasks(s, uid, nick, tok, log, need_rich, need_skill)
+            except Exception as e:
+                log("  🖥️ 桌面任务异常: %s" % str(e)[:80])
+        elif need_rich or need_skill:
+            log("── 桌面任务跳过(--no-desktop): RichMeow=%s skill_1=%s ──" % (need_rich, need_skill))
+        else:
+            if not desktop_skipped:
+                log("  🖥️ 桌面任务: 已完成（RichMeow/skill_1），跳过")
+
+        # 云端任务
+        log("  ☁️ ── 云端任务 ──")
+        if TASK_ONLY or TASK_SKIP:
+            log("   ⚙️ 任务过滤生效：%s%s" % (
+                ("仅执行 " + ",".join(sorted(TASK_ONLY))) if TASK_ONLY else "",
+                (("；跳过 " + ",".join(sorted(TASK_SKIP))) if TASK_SKIP else "")))
+            # 「使用类」任务才会给成长中心记活跃（热力墙）。全被过滤掉时明确提醒：
+            # 签到只给积分、不点热力墙——别把页面上的「开始使用以点亮今日热力墙」当成签到失败
+            _usage = {"chat_5", "model_chat_glm5.2", "desktop", "richmeow_chat", "skill_1", "black_cat",
+                      "expert_5", "expert_team_use_3", "template_5", "create_canvas", "playbook_prompt",
+                      "sequential_tasks_1", "sequential_tasks_3", "sequential_tasks_5",
+                      "automation_1", "library_read", "hp_appearance", "buddy_app", "buddy_app_qq"}
+            _kept = {t for t in (TASK_ONLY or _usage) if t not in TASK_SKIP}
+            if not (_kept & _usage):
+                log("   ⚠️ 未包含任何「使用类」任务 → 成长中心的今日活跃（热力墙）不会点亮")
+                log("      （签到/积分不受影响；想同时点亮热力墙建议保留一个对话类任务：WORKBUDDY_TASKS=checkin,travel,chat_5）")
+
+        def _run(label, codes, fn):
+            """子任务调度：按 TASK_ONLY / TASK_SKIP 决定是否执行，单项异常不拖垮整轮。"""
+            if not want(*codes):
+                log("   ⏭️ %s: 按配置跳过" % label)
+                return None
+            try:
+                return fn()
+            except Exception as e:
+                log("   ⚠️ %s 异常: %s" % (label, str(e)[:80]))
+                return None
+
+        # 前置：无 Buddy 实例时，其余任务 accept 会被服务端拒绝（prerequisite not met: first_buddy）
         try:
-            return fn()
-        except Exception as e:
-            log("   ⚠️ %s 异常: %s" % (label, str(e)[:80]))
-            return None
+            t_first_buddy(s, uid, nick, log)
+        except Exception as exc:
+            log("   ⚠️领取Buddy异常（%s）" % type(exc).__name__)
+        try:
+            t_accept_all(s, uid, nick, log)
+        except Exception as exc:
+            log("   ⚠️批量接受异常（%s），后续任务继续" % type(exc).__name__)
+        _run("召唤3次专家团", ["Expert_team_use_3"], lambda: t_team_3(s, uid, nick, log))
+        _run("发现应用/企鹅教师助手", ["Buddy_App", "Buddy_App_QQ"], lambda: t_buddy_apps(s, uid, nick, log))
+        _run("和平精英主题", ["Hp_Appearance"], lambda: t_theme(s, uid, nick, log))
+        _run("体验资料库", ["Library_read"], lambda: t_library(s, uid, nick, log))
+        _run("设计/自动化/灵感", ["create_canvas", "automation_1", "playbook_prompt"],
+             lambda: t_canvas_automation(s, uid, nick, log))
+        _run("召唤5次专家", ["expert_5"], lambda: t_expert_5(s, uid, nick, log))
+        _run("使用5个模板", ["template_5"], lambda: t_template_5(s, uid, nick, log))
+        _run("GLM-5.2/和AI聊天5次", ["Model_chat_GLM5.2", "chat_5"], lambda: t_glm52(s, uid, nick, log))
+        _run("夜猫子", ["black_cat"], lambda: t_black_cat(s, uid, nick, log))
+        _run("腾讯轻量云专家", ["Expert_lighthouse"], lambda: t_lighthouse(s, uid, nick, log))
+        _run("无畏契约拼豆专家", ["WorkBuddy_Valorant"], lambda: t_valorant(s, uid, nick, log))
+        expert_codes = set(EXPERT_TASK_SPECS)
+        expert_codes.update(_dynamic_expert_task_codes(s))
+        for expert_code in sorted(expert_codes):
+            expert_spec = _expert_spec_for_task(s, expert_code) or {}
+            expert_label = expert_spec.get("profession") or expert_spec.get("name") or expert_code
+            _run(expert_label, [expert_code],
+                 lambda code=expert_code: t_expert_use_task(s, uid, nick, log, code))
+        _run("小程序对话", ["Sequential_Tasks_1"], lambda: t_sequential_tasks(s, uid, nick, log))
+        _run("小程序专家对话", ["Sequential_Tasks_2"], lambda: t_sequential_tasks_2(s, uid, nick, log))
+        _run("小程序对话5次", ["Sequential_Tasks_3"], lambda: t_sequential_tasks_3(s, uid, nick, log))
+        _run("小程序定时任务", ["Sequential_Tasks_4"], lambda: t_sequential_tasks_4(s, uid, nick, log))
+        _run("小程序GLM5.2", ["Sequential_Tasks_5"], lambda: t_sequential_tasks_5(s, uid, nick, log))
+        _run("小程序对话10次", ["Sequential_Tasks_6"], lambda: t_sequential_tasks_6(s, uid, nick, log))
+        _run("PC灵感功能", ["Sequential_Tasks_7"], lambda: t_sequential_tasks_7(s, uid, nick, log))
+        _settle_before_play(s, log)
+        _run("徽章", ["badges"], lambda: t_badges(s, uid, nick, log))
+        _run("盲盒", ["blindbox"], lambda: t_blindbox(s, uid, nick, log))
+        _run("Buddy 信息", ["buddy_info"], lambda: t_buddy_info(s, uid, nick, log))
+        _run("派猫猫旅行", ["travel"], lambda: t_travel(s, uid, nick, log))
+        # 连登闭环顺序（上游 v3.13）：补签 → 连登兑换 → 抽奖。
+        # 补签先保住活跃连签，兑换的 7/14/28d 档位判定才准；兑换发放的抽奖次数
+        # （chances_granted）当轮抽奖即可抽掉——抽奖若在兑换前跑，新发次数要等下一轮。
+        streak_days_for_redeem = streak.get("days")
+        makeup_days = _run("补签", ["makeup"], lambda: t_makeup(s, uid, nick, log))
+        if makeup_days is not None:
+            streak_days_for_redeem = makeup_days
+        _run("连登兑换", ["redeem"],
+             lambda: t_redeem(s, uid, nick, log, streak_days_for_redeem))
+        _run("抽奖", ["lottery"], lambda: t_lottery(s, uid, nick, log))
+        _run("礼包/补偿", ["gift"], lambda: t_gift_compensation(s, uid, nick, log))
+        _run("工作台搭建师", ["workstation_expert"], lambda: t_workstation(s, uid, nick, log, tok))
+        try:
+            t_unknown_tasks(s, uid, nick, log)   # 未覆盖任务检测不受过滤影响
+        except Exception as exc:
+            log("   ⚠️任务发现异常（%s）" % type(exc).__name__)
 
-    # 前置：无 Buddy 实例时，其余任务 accept 会被服务端拒绝（prerequisite not met: first_buddy）
-    try:
-        t_first_buddy(s, uid, nick, log)
-    except Exception as exc:
-        log("   ⚠️领取Buddy异常（%s）" % type(exc).__name__)
-    try:
-        t_accept_all(s, uid, nick, log)
-    except Exception as exc:
-        log("   ⚠️批量接受异常（%s），后续任务继续" % type(exc).__name__)
-    _run("召唤3次专家团", ["Expert_team_use_3"], lambda: t_team_3(s, uid, nick, log))
-    _run("发现应用/企鹅教师助手", ["Buddy_App", "Buddy_App_QQ"], lambda: t_buddy_apps(s, uid, nick, log))
-    _run("和平精英主题", ["Hp_Appearance"], lambda: t_theme(s, uid, nick, log))
-    _run("体验资料库", ["Library_read"], lambda: t_library(s, uid, nick, log))
-    _run("设计/自动化/灵感", ["create_canvas", "automation_1", "playbook_prompt"],
-         lambda: t_canvas_automation(s, uid, nick, log))
-    _run("召唤5次专家", ["expert_5"], lambda: t_expert_5(s, uid, nick, log))
-    _run("使用5个模板", ["template_5"], lambda: t_template_5(s, uid, nick, log))
-    _run("GLM-5.2/和AI聊天5次", ["Model_chat_GLM5.2", "chat_5"], lambda: t_glm52(s, uid, nick, log))
-    _run("夜猫子", ["black_cat"], lambda: t_black_cat(s, uid, nick, log))
-    _run("腾讯轻量云专家", ["Expert_lighthouse"], lambda: t_lighthouse(s, uid, nick, log))
-    _run("无畏契约拼豆专家", ["WorkBuddy_Valorant"], lambda: t_valorant(s, uid, nick, log))
-    expert_codes = set(EXPERT_TASK_SPECS)
-    expert_codes.update(_dynamic_expert_task_codes(s))
-    for expert_code in sorted(expert_codes):
-        expert_spec = _expert_spec_for_task(s, expert_code) or {}
-        expert_label = expert_spec.get("profession") or expert_spec.get("name") or expert_code
-        _run(expert_label, [expert_code],
-             lambda code=expert_code: t_expert_use_task(s, uid, nick, log, code))
-    _run("小程序对话", ["Sequential_Tasks_1"], lambda: t_sequential_tasks(s, uid, nick, log))
-    _run("小程序专家对话", ["Sequential_Tasks_2"], lambda: t_sequential_tasks_2(s, uid, nick, log))
-    _run("小程序对话5次", ["Sequential_Tasks_3"], lambda: t_sequential_tasks_3(s, uid, nick, log))
-    _run("小程序定时任务", ["Sequential_Tasks_4"], lambda: t_sequential_tasks_4(s, uid, nick, log))
-    _run("小程序GLM5.2", ["Sequential_Tasks_5"], lambda: t_sequential_tasks_5(s, uid, nick, log))
-    _run("小程序对话10次", ["Sequential_Tasks_6"], lambda: t_sequential_tasks_6(s, uid, nick, log))
-    _run("PC灵感功能", ["Sequential_Tasks_7"], lambda: t_sequential_tasks_7(s, uid, nick, log))
-    _run("徽章", ["badges"], lambda: t_badges(s, uid, nick, log))
-    _run("盲盒", ["blindbox"], lambda: t_blindbox(s, uid, nick, log))
-    _run("Buddy 信息", ["buddy_info"], lambda: t_buddy_info(s, uid, nick, log))
-    _run("派猫猫旅行", ["travel"], lambda: t_travel(s, uid, nick, log))
-    # 连登闭环顺序（上游 v3.13）：补签 → 连登兑换 → 抽奖。
-    # 补签先保住活跃连签，兑换的 7/14/28d 档位判定才准；兑换发放的抽奖次数
-    # （chances_granted）当轮抽奖即可抽掉——抽奖若在兑换前跑，新发次数要等下一轮。
-    streak_days_for_redeem = streak.get("days")
-    makeup_days = _run("补签", ["makeup"], lambda: t_makeup(s, uid, nick, log))
-    if makeup_days is not None:
-        streak_days_for_redeem = makeup_days
-    _run("连登兑换", ["redeem"],
-         lambda: t_redeem(s, uid, nick, log, streak_days_for_redeem))
-    _run("抽奖", ["lottery"], lambda: t_lottery(s, uid, nick, log))
-    _run("礼包/补偿", ["gift"], lambda: t_gift_compensation(s, uid, nick, log))
-    _run("工作台搭建师", ["workstation_expert"], lambda: t_workstation(s, uid, nick, log, tok))
-    try:
-        t_unknown_tasks(s, uid, nick, log)   # 未覆盖任务检测不受过滤影响
-    except Exception as exc:
-        log("   ⚠️任务发现异常（%s）" % type(exc).__name__)
+        # 领奖：按进度补领，不依赖 accept_status 的瞬时状态
+        log("  🎁 ── 领奖 ──")
+        try:
+            claim_ready_tasks(s, log)
+        except Exception as exc:
+            log("   ⚠️领奖末扫异常（%s）" % type(exc).__name__)
 
-    # 领奖：按进度补领，不依赖 accept_status 的瞬时状态
-    log("  🎁 ── 领奖 ──")
-    try:
-        claim_ready_tasks(s, log)
-    except Exception as exc:
-        log("   ⚠️领奖末扫异常（%s）" % type(exc).__name__)
-
-    # 终态：读取失败不能折算成 0/0 全部完成。
-    try:
-        st_all = growth_task_rows(s)
-    except (SafeError, requests.RequestException):
-        log("   ⚠️任务终态读取失败，完成数量未确认")
+        # 终态：读取失败不能折算成 0/0 全部完成。
+        try:
+            st_all = growth_task_rows(s)
+        except (SafeError, requests.RequestException):
+            log("   ⚠️任务终态读取失败，完成数量未确认")
+            return msgs, summary
+        summary["tasks_loaded"] = True
+        done = sum(1 for t in st_all if isinstance(t, dict) and t.get("accept_status") in ("claimed", "completed"))
+        rest = [task_cn(t.get("task_code", "")) for t in st_all if isinstance(t, dict) and t.get("accept_status") not in ("claimed", "completed")]
+        prof2 = (_json_or_empty(s.get(BASE + "/v2/activity/growth/profile", timeout=25,
+                                           verify=False)).get("data") or {})
+        summary.update({"done": done, "total": len(st_all), "rest": rest,
+                        "level": prof2.get("level", "?"), "energy": energy})
+        log("🏁 %s: 完成%s/%s 等级%s 剩余: %s" % (note, done, len(st_all), prof2.get("level", "?"),
+                                                 ", ".join(rest) if rest else "无"))
         return msgs, summary
-    summary["tasks_loaded"] = True
-    done = sum(1 for t in st_all if isinstance(t, dict) and t.get("accept_status") in ("claimed", "completed"))
-    rest = [task_cn(t.get("task_code", "")) for t in st_all if isinstance(t, dict) and t.get("accept_status") not in ("claimed", "completed")]
-    prof2 = (_json_or_empty(s.get(BASE + "/v2/activity/growth/profile", timeout=25,
-                                       verify=False)).get("data") or {})
-    summary.update({"done": done, "total": len(st_all), "rest": rest,
-                    "level": prof2.get("level", "?"), "energy": energy})
-    log("🏁 %s: 完成%s/%s 等级%s 剩余: %s" % (note, done, len(st_all), prof2.get("level", "?"),
-                                             ", ".join(rest) if rest else "无"))
-    return msgs, summary
+    except Exception as exc:
+        summary["error"] = str(exc) if isinstance(exc, SafeError) else "账号流程异常（%s）" % type(exc).__name__
+        log("   ❌ " + summary["error"])
+        return msgs, summary
+    finally:
+        _finish_credit_sample(s, summary, log)
+
 
 
 # ============================================================================ #
@@ -4354,12 +4459,14 @@ def build_summary(summaries):
         lines.append("👤 账号%d  %s" % (idx, note))
         if error:
             lines.append("   ❌ %s" % error)
+            if "credits_before" in sm or "credits_after" in sm:
+                lines.extend(_credit_lines(sm))
             lines.append("")
             continue
         if checkin:
             icon = "✅" if sm.get("checked_in") else ("ℹ️" if sm.get("query") else "⚠️")
             lines.append("   %s %s" % (icon, checkin))
-        lines.append("   💰 %s" % (credits if credits else "暂无数据"))
+        lines.extend(_credit_lines(sm))
         lines.append("   📊 %s" % (usage if usage else "暂无数据"))
         lines.append("   🌱 等级%s | 签到连签%s天 | 活跃连签%s天 | 能量%s"
                      % (level, sm.get("checkin_streak", "?"), streak, energy))
