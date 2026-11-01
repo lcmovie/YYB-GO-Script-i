@@ -1,5 +1,5 @@
 // name:红色火箭
-// cron: 1 9,13 * * *
+// cron: 26 10,13 * * *
 //  红色火箭（华泰基金指慧家）
 
 //  环境变量：
@@ -7,7 +7,6 @@
 //    YYB_API_KEY / YYB_PROTOCOL_TOKEN  可选，启用协议鉴权时配置
 //    WX_ID              可选，仅运行指定ref，格式：ref#备注，多账号换行或 & 分隔
 //    WECHAT_SERVER      可选，旧微信协议服务回退地址
-//    HSJJ_NOTIFY        可选，0关闭通知；默认调用青龙sendNotify，仅推送账号汇总
 //    2026-10-30 手动领取版：签到、口令兑换、积分与红包记录查询。
 //    获得现金红包后请到小程序手动领取；不包含自动提现、领取或H5授权代码。
 
@@ -360,7 +359,8 @@ function putCache(cache, key, value) {
 function getEncryptKeyCache(cache, key) {
     const cached = getCache(cache, key);
     if (!cached) return { encryptKey: '', version: '' };
-    if (cached.encryptExpireTime && Number(cached.encryptExpireTime) <= Date.now()) return { encryptKey: '', version: '' };
+    // 2026-11-01：服务端按 key_version 解密，不校验 expireTime（实测过期 47.8h 的密钥仍可签到成功），
+    // 过期即弃会导致协议侧取不到新密钥时（YYB login_buffer 失效）直接停签，故保留历史密钥兜底。
     if (cached.encryptKey && cached.encryptVer) {
         return { encryptKey: cached.encryptKey, version: String(cached.encryptVer), expireTime: cached.encryptExpireTime || '' };
     }
