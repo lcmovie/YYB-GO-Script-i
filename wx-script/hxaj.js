@@ -12,9 +12,18 @@
  *
  * 说明：
  *   1) 签名算法已完整内嵌 sign.js（X-Sign-For + appKey）
- *   2) 每个账号即时从 YYB-Go-Enhanced 获取 code 和手机号授权数据并登录
- *   3) 登录成功后缓存 refreshToken，并在业务请求前自动续期
- *   4) 自动流程：任务列表 -> 尝试完成未完成任务 -> 签到 -> 抽奖 -> 查询积分前后变化
+ *   2) 登录采用「缓存凭据优先」：本地 refreshToken 可续期就直接跑，
+ *      仅在缓存缺失/失效时才向 YYB-Go-Enhanced 取 code + 手机号授权
+ *   3) 手机号授权被上游拒绝（shortlink code=-14 / 目标熔断）时，
+ *      自动回落到缓存里的旧 token 继续执行，不再让整号失败
+ *   4) 登录成功后缓存 refreshToken，并在业务请求前自动续期
+ *   5) 自动流程：任务列表 -> 尝试完成未完成任务 -> 签到 -> 抽奖 -> 查询积分前后变化
+ *   6) 无可用凭据（无 customerId / refreshToken / token）时不写入缓存，避免脏数据
+ *
+ * 依赖：Node 内置模块 + 仓库根目录 sendNotify
+ * 通知：使用青龙内置 notify.py / sendNotify.js；通知失败不影响任务结果
+ *
+ * 作者：lcmovie https://github.com/lcmovie
  */
 
 const fs = require('fs');
@@ -1375,17 +1384,104 @@ function _yybAuthHeaders() {
     return headers;
 }
 
-async function yybRequest(entry, endpoint) {
+async function yybRequest(entry, endpoint, { timeout = 25000 } = {}) {
   const { data } = await request('POST', `${entry.server}${endpoint}`, {
     headers: _yybAuthHeaders(),
     data: { ref: entry.ref, app_id: CONSTS.WX_APP_ID },
-    timeout: 25000,
+    timeout,
   });
   const result = data?.data?.result;
   if (Number(data?.code ?? -1) !== 0 || !result || typeof result !== 'object') {
-    throw new Error(`${endpoint}失败: ${data?.msg || data?.message || safeJsonPreview(data)}`);
+    throw new Error(`${endpoint}失败: ${sanitizeYybError(data)}`);
   }
   return result;
+}
+
+/** 把 YYB 上游错误压成一行可读文案，保留 http code / stage / upstream_code。 */
+function sanitizeYybError(data) {
+  if (!data || typeof data !== 'object') return String(data);
+  const msg = String(data.msg || data.message || '').trim();
+  const body = data.data || {};
+  const stages = Array.isArray(body.upstream_errors)
+    ? body.upstream_errors.map((x) => `${x?.stage}:${x?.upstream_code}`).join(',')
+    : '';
+  const parts = [];
+  if (msg) parts.push(msg);
+  if (data.code !== undefined) parts.push(`code=${data.code}`);
+  if (stages) parts.push(`stage=${stages}`);
+  if (body.circuit_open) parts.push(`circuit=${body.circuit_open}`);
+  if (body.retry_after) parts.push(`retry_after=${body.retry_after}s`);
+  return parts.join(' | ') || safeJsonPreview(data);
+}
+
+/** 手机号授权是否属于“上游风控/短链被拒/熔断”这类可回退错误 */
+function isPhoneAuthFailoverError(err) {
+  const text = String((err && err.message) || err || '');
+  return (
+    /getPhoneNumber失败|getphonenumber失败/i.test(text) ||
+    /shortlink/i.test(text) ||
+    /code=-1[34]/.test(text) ||
+    /circuit/i.test(text) ||
+    /熔断/.test(text)
+  );
+}
+
+/** 用已缓存的 refreshToken 恢复登录态：先续期，刷新失败再拿旧 token 验一次积分接口。 */
+async function restoreByCachedCredential(entry, cache) {
+  const cached = findCachedAccountByRef(cache, entry);
+  if (!cached) return null;
+  const seed = {
+    remark: entry.remark,
+    yybRef: entry.ref,
+    token: String(cached.token || cached.accessToken || ''),
+    refreshToken: String(cached.refreshToken || ''),
+    customerId: String(cached.customerId || ''),
+    phone: String(cached.phone || ''),
+    phoneEncrypted: String(cached.phoneEncrypted || ''),
+    deviceId: String(cached.deviceId || ''),
+    subscriberId: String(cached.subscriberId || ''),
+    tokenCreateTime: Number(cached.tokenCreateTime || 0),
+    tokenExpiredTime: Number(cached.tokenExpiredTime || 0),
+    refreshTokenExpiredTime: Number(cached.refreshTokenExpiredTime || 0),
+  };
+  if (!seed.refreshToken && !seed.token) return null;
+
+  console.log(`  - 命中本地缓存凭据 (customerId=${seed.customerId || '-'}, token尾=${tokenTail(seed.token)})`);
+
+  let account = seed;
+  if (seed.refreshToken) {
+    const r = await refreshTokenIfPossible(seed);
+    if (r.refreshed) {
+      account = Object.assign({}, seed, r.account, { yybRef: entry.ref, remark: entry.remark });
+      console.log('  - 缓存 refreshToken 续期成功');
+    } else if (r.error) {
+      console.log(`  - 缓存 refreshToken 续期失败: ${r.error.message}`);
+    }
+  }
+
+  const norm = resolvePhoneFields(account.phone, account.phoneEncrypted);
+  account.phone = norm.phone;
+  account.phoneEncrypted = norm.phoneEncrypted;
+
+  if (!account.customerId && account.token) {
+    account.customerId = guessCustomerIdFromToken(account.token) || '';
+  }
+
+  if (account.token) {
+    try {
+      const points = await getTotalPointsDetail(account);
+      console.log(`  - 缓存凭据校验通过，当前积分 ${points.totalScore}`);
+      if (!account.customerId && points.raw) {
+        const cid = pickValue(points.raw, ['userId', 'customerId']);
+        if (cid) account.customerId = String(cid);
+      }
+      return account;
+    } catch (err) {
+      console.log(`  - 缓存凭据校验失败: ${err.message}`);
+    }
+  }
+
+  return null;
 }
 
 async function loginByYYB(entry) {
@@ -1394,7 +1490,15 @@ async function loginByYYB(entry) {
   if (!loginCode) throw new Error('YYB-Go返回缺少微信code');
   console.log('  - YYB-Go获取微信code成功');
 
-  const phoneResult = await yybRequest(entry, '/wxapp/getPhoneNumber');
+  let phoneResult;
+  try {
+    phoneResult = await yybRequest(entry, '/wxapp/getPhoneNumber');
+  } catch (err) {
+    if (!isPhoneAuthFailoverError(err)) throw err;
+    const e = new Error(`YYB-Go手机号授权被上游拒绝: ${err.message}`);
+    e.code = 'PHONE_AUTH_REJECTED';
+    throw e;
+  }
   const phoneCode = String(phoneResult.code || '').trim();
   const encryptedData = String(phoneResult.encryptedData || phoneResult.encrypted_data || '').trim();
   const iv = String(phoneResult.iv || '').trim();
@@ -1545,6 +1649,43 @@ function parseAccounts(raw) {
       return null;
     })
     .filter((x) => x && (x.refreshToken || x.token));
+}
+
+/**
+ * 按 YYB ref（账号序号/UIN/openid）在缓存里找回账号。
+ * 同一 ref 可能存在多条历史记录（旧版本曾用 md5 做 key），
+ * 排序优先级：remark 与当前序号一致 > updateTime 更新 > 带 refreshToken。
+ */
+function findCachedAccountByRef(cache, entry) {
+  if (!cache || !cache.accounts || !entry) return null;
+  const ref = String(entry.ref || '').trim();
+  if (!ref) return null;
+  const remark = String(entry.remark || '').trim();
+
+  const hits = [];
+  for (const key of Object.keys(cache.accounts)) {
+    const c = cache.accounts[key];
+    if (!c || typeof c !== 'object') continue;
+    if (String(c.yybRef || '').trim() !== ref) continue;
+    if (!c.refreshToken && !c.token) continue;
+    hits.push({ key, item: c });
+  }
+  if (!hits.length) return null;
+
+  hits.sort((a, b) => {
+    const ra = remark && a.item.remark === remark ? 1 : 0;
+    const rb = remark && b.item.remark === remark ? 1 : 0;
+    if (ra !== rb) return rb - ra;
+    const ta = Date.parse(a.item.updateTime || '') || 0;
+    const tb = Date.parse(b.item.updateTime || '') || 0;
+    if (ta !== tb) return tb - ta;
+    const rta = a.item.refreshToken ? 1 : 0;
+    const rtb = b.item.refreshToken ? 1 : 0;
+    if (rta !== rtb) return rtb - rta;
+    return String(b.key).length - String(a.key).length;
+  });
+
+  return hits[0].item;
 }
 
 function findCachedAccount(cache, acc) {
@@ -2691,8 +2832,41 @@ async function main() {
     let merged = { remark: entry.remark, yybRef: entry.ref };
 
     try {
-      const fresh = await loginByYYB(entry);
+      let fresh = null;
+      // ① 缓存凭据优先：本地 refreshToken 仍在有效期内就先续期跑，
+      //    避免每次开机都去打 YYB 的 getPhoneNumber，触发上游 shortlink 风控。
+      const cachedAccount = findCachedAccountByRef(cache, entry);
+      if (cachedAccount && cachedAccount.refreshToken) {
+        const restorable = !isRefreshTokenExpired(cachedAccount) || cachedAccount.token;
+        if (restorable) {
+          console.log('  ↪ 优先尝试本地缓存凭据');
+          fresh = await restoreByCachedCredential(entry, cache);
+        }
+      }
+
+      // ② 缓存不可用（无缓存 / 凭据失效）时，才走 YYB 实时取 code + 手机号授权。
+      if (!fresh) {
+        try {
+          fresh = await loginByYYB(entry);
+        } catch (err) {
+          // YYB 上游手机号授权被风控拒绝（shortlink code=-14 / 熔断）时，
+          // 不再让整个账号直接失败：如果缓存里有旧 token 就再兜一次。
+          if (err.code === 'PHONE_AUTH_REJECTED') {
+            console.log(`  ⚠️ ${err.message}`);
+            console.log('  ↪ 缓存已尝试，改用旧 token 直接校验');
+            const fallback = await restoreByCachedCredential(entry, cache);
+            if (!fallback) throw err;
+            fresh = fallback;
+            console.log('  - 已通过旧 token 恢复登录态');
+          } else {
+            throw err;
+          }
+        }
+      }
+
       merged = mergeWithCache(fresh, cache);
+      merged.remark = entry.remark;
+      merged.yybRef = entry.ref;
       const result = await runOneAccount(merged, i + 1, yybEntries.length);
       ok += 1;
       notifyLines.push(
@@ -2704,6 +2878,8 @@ async function main() {
       const toSave = Object.assign({}, merged, result.account, {
         updateTime: new Date().toISOString(),
       });
+      toSave.yybRef = entry.ref;
+      if (!toSave.remark) toSave.remark = entry.remark;
       cache.accounts[getCacheKey(toSave)] = toSave;
       saveCache(cache);
     } catch (err) {
@@ -2711,12 +2887,19 @@ async function main() {
       console.log(`❌ 账号失败: ${merged.remark} -> ${err.message}`);
       notifyLines.push(`❌ ${merged.remark || `账号${i + 1}`}: ${err.message}`);
 
-      const toSave = Object.assign({}, merged, {
-        lastError: err.message,
-        updateTime: new Date().toISOString(),
-      });
-      cache.accounts[getCacheKey(toSave)] = toSave;
-      saveCache(cache);
+      // 失败时只在已有可用凭据（customerId / refreshToken）时才写缓存，
+      // 避免产生 md5(remark) 这类没有凭据的垃圾记录污染下一次回退。
+      const existing = findCachedAccountByRef(cache, entry);
+      const target = existing ? Object.assign({}, existing) : Object.assign({}, merged);
+      target.yybRef = entry.ref;
+      target.lastError = err.message;
+      target.updateTime = new Date().toISOString();
+      if (target.customerId || target.refreshToken || target.token) {
+        cache.accounts[getCacheKey(target)] = target;
+        saveCache(cache);
+      } else {
+        console.log('  （该账号暂无可用凭据，本次不写入缓存）');
+      }
     }
   }
 

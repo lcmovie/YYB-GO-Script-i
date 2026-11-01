@@ -76,6 +76,7 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 | 顺丰速运自动任务 | `sfsy.py` |
 | 影视飓风 | `YSJF.js` |
 | 铛铛一下 | `DDYX.py` |
+| 海信爱家 | `hxaj.js` |
 
 
 红色火箭（`wx-script/hshj.js`）保留签到、当日 ROE 口令兑换、积分及红包记录查询；现金红包需在小程序手动领取。青龙通知仅推送账号汇总，不包含详细执行日志；设置 `HSJJ_NOTIFY=0` 可关闭该脚本通知。
