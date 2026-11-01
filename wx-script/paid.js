@@ -1,9 +1,47 @@
 #!/usr/bin/env node
 // name: 平安i动
-'use strict';
-/*
- * 平安i动 (Ping An iDong) 健康币脚本  —  平安i动.js
+// cron: 34 10 * * *
+/**
+ * 平安i动 (Ping An iDong) 健康币任务 - 青龙自动化脚本
  * appid: wx340f915763f3ed2b   货币: 健康币
+ *
+ * 变量名：
+ *   YYB_SERVER
+ *   YYB_API_KEY / YYB_PROTOCOL_TOKEN  可选，启用协议鉴权时配置
+ *
+ * 变量格式：
+ *   YYB_SERVER=YYB-Go-Enhanced地址@微信账号标识
+ *   多账号一行一个，地址可写 yyb-go:8000 或完整 http(s) URL；可在 ref 后用 # 添加备注。
+ *   例：yyb-go:8000@1
+ *
+ * 其它可选变量：
+ *   PAID_TOKENS            兜底 TOKEN，格式 openid|{"authToken":..,"signKey":..,"degradeToken":..,"userInfo":..}，多账号换行
+ *   PAID_NOTIFY            默认 1；设为 0 关闭青龙汇总通知
+ *   PAID_ACCOUNT_DELAY     账号间固定等待秒数；默认随机 10-18 秒，测试可设为 0
+ *   PAID_BROWSE_MAX        单账号单轮最多处理几条浏览任务；默认 5
+ *   PAID_BROWSE_SETTLE_MS  浏览上报→重拉列表→领取的最小间隔毫秒；默认 1500
+ *   PAID_DEGRADED_SKIP_HOURS 降级会话重登失败后的冷却小时数；默认 6
+ *   PAID_HTTP_RETRY        网络层重试次数；默认 3
+ *   PAID_RETRY_BASE_MS     重试退避基数毫秒；默认 800
+ *   PAID_DEBUG             设为 1 输出请求/签名调试日志
+ *
+ * 功能：
+ *   1) 每日签到（completeJgjStepSignInTask）
+ *   2) 浏览任务两条：取列表 → 上报浏览 → 重拉列表取真实 rewardId → 领取奖励
+ *   3) 健康币余额前后对比，Bark / 青龙通知汇总
+ *   4) 会话降级自愈：检测到 userId=null 的降级会话时强制重登一次；
+ *      重登仍降级则打冷却标记，避免白耗 YYB 取码配额触发上游熔断
+ *   5) 网络层重试：读写接口 3 次指数退避；登录与 YYB 取码因 code 一次性，仅对连接层失败重试
+ *
+ * 登录链路（三位一体，高优先级命中即跳过后续）：
+ *   ① 兜底 TOKEN(PAID_TOKENS) 命中 → 直接复用，跳过登录且不写缓存
+ *   ② 缓存(PAID_cookies.json) 有效 → 复用
+ *   ③ 无兜底/缓存 → YYB-Go-Enhanced(wxapp/getCode) 取 code → 业务登录 → 写缓存
+ *
+ * 依赖：Node 内置模块（fs / path / crypto / child_process），无需 npm 依赖
+ * 通知：使用青龙内置 notify.py；通知失败不影响任务结果。
+ *
+ * 作者：lcmovie https://github.com/lcmovie
  *
  * ============================================================
  * 抓取字段总表：
@@ -25,6 +63,24 @@
  *  - 每日签到: POST https://incubator.lifeapp.pingan.com.cn/health-core/ledong/healthStep/step/completeJgjStepSignInTask
  *          ( wrapper v(){return request(b)} 无参 → GET，无 body；token 失效时返回 CODE=10000「登录失效」)
  *          已签到时服务端返回非00或 MSG 含"已签到"；成功计入健康币
+ *
+ *  - 浏览任务(两条，签到之外的额外健康币来源，2026-11-01 抓包补全)：
+ *      ① 取任务列表 POST /health-core/external/ledong/equity/getTaskListAndBalance
+ *            body: displayChannel=MINI_PROGRAM
+ *            -> DATA.tasks[]；浏览任务特征 eventType="BROWSE" && onlineStatus="ONLINE"
+ *               status="0" 未完成 / "1" 已完成待领取 / 其它 已领取
+ *               生产环境当前固定两条：浏览安医保产品页(902496218870026240)、浏览安盈保产品页(902503776953802752)
+ *      ② 上报浏览 POST /health-core/ledong/equity/completeBrowseTask
+ *            body: taskId=<task.id>
+ *            -> DATA.jumpUrl；rewardStatus="PENDING"
+ *            ⚠️ status="0" 时此响应里的 rewardId 是**无效占位**，拿去 claim 必返 41019201
+ *      ③ 重拉列表 POST /health-core/external/ledong/equity/getTaskListAndBalance
+ *            -> 该任务变 status="1"，并带上**可用的** rewardId（服务端此刻才配发奖励）
+ *      ④ 领取奖励 POST /health-core/healthEquity/claimReward
+ *            body: rewardId=<第三步拿到的 rewardId>
+ *            -> DATA.rewardStatus="ISSUED"，rewardValue="10"
+ *      签名层与上面其它接口完全相同（同一 buildHeaders），无需额外密钥。
+ *      ⚠️ 唯一正解顺序：上报 → 重拉列表 → 用新列表 rewardId 领取。不可直接用第②步的 rewardId。
  *
  * 登录链路（优先级三段式，高优先级命中即跳过后续）：
  *   ① 兜底 TOKEN(PAID_TOKENS, JSON) 命中→直接复用，跳过登录且不写缓存
@@ -50,20 +106,8 @@
  *     （openid 即你 yyb_go 里存活账号的 openid；多账号换行分隔）
  *   命中后脚本不再走 YYB 取号，也不写本地缓存；TOKEN 失效时自动回退到 ②/③ 重登。
  * ============================================================
- *
- * ── 账号获取（适配 YYB-Go-Enhanced）──
- *   环境变量：
- *     YYB_SERVER   必填，格式为 地址@账号ref，多账号一行一个；可在 ref 后用 # 添加备注
- *                  ql2 内建议使用 http://yyb-go:8000@ref
- *     YYB_API_KEY / YYB_PROTOCOL_TOKEN  可选，启用协议鉴权时配置，二选一
- *     PAID_NOTIFY  可选，默认 1；设为 0 时关闭青龙 notify.py 汇总通知
- *     PAID_ACCOUNT_DELAY 可选，账号间固定等待秒数；默认随机 10-18 秒，测试可设为 0
- *   登录链路优先级（命中即跳过后续）：
- *     ① 兜底 TOKEN(PAID_TOKENS) → 直接复用，跳过登录且不写缓存
- *     ② 缓存(PAID_cookies.json) 有效 → 复用
- *     ③ 无兜底/缓存 → getSingleCode 取 code → 业务登录 → 写缓存
- * ============================================================
  */
+
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -152,7 +196,7 @@ const ACCOUNT_DELAY = process.env.PAID_ACCOUNT_DELAY;
 const NOTIFY_ON_FAIL_ONLY = (process.env.NOTIFY_ON_FAIL_ONLY || process.env.PAID_NOTIFY_ON_FAIL_ONLY || 'true').trim().toLowerCase() !== 'false'; // 全局无前缀（YYB 标准栈）；兼容旧 PAID_ 前缀
 
 const APPID = 'wx340f915763f3ed2b';
-const SCRIPT_VER = '2026-09-11 14:32';   // 更新脚本此值
+const SCRIPT_VER = '2026-11-01 15:30';   // 更新脚本此值
 const AES_PASS = '123456789aasdfgh';                               // 模块135常量 m.a
 const LOGIN_PUBKEY = `-----BEGIN PUBLIC KEY-----
 MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDRxFgN1vGYDSkfH90SI9Ixr1wxyTah3+ShYIDvEL1cI4XCvXHfnBkGb6dQPsiNj1skENyF9zEEWv0jshvgpgNleDzd6vnJRf8LQtolFv4dWXzJwruGTCq6lYTM/K+4E8iaiXarD9z3fsR4nIUcu5QRRY1m//nLhRtxonva/ubO+QIDAQAB
@@ -282,7 +326,36 @@ function serverUrl(serverType, apiPath){
   return `https://${sub}.lifeapp.pingan.com.cn${apiPath}`;
 }
 
+// HTTP 层重试（2026-11-01 新增）
+//   NAS 容器出网偶发 `fetch failed`（连接被重置/DNS 抖动），一次抖动就会让整个账号判失败。
+//   对**读写幂等安全**的接口做 3 次指数退避重试；写接口（签到/上报/领取）因涉及发奖，同样重试——
+//   服务端对这些接口自身幂等（重复上报只返回 jumpUrl、重复领取返回 41019201），重试不会多发币。
+const HTTP_RETRY = Number(process.env.PAID_HTTP_RETRY || 3);
+const RETRY_BASE_MS = Number(process.env.PAID_RETRY_BASE_MS || 800);
+async function fetchWithRetry(url, opts, tag){
+  let lastErr;
+  for (let attempt = 1; attempt <= HTTP_RETRY; attempt++){
+    try {
+      return await fetch(url, opts);
+    } catch (e){
+      lastErr = e;
+      const code = (e.cause && (e.cause.code || e.cause.errno)) || e.message;
+      dbg('RETRY', tag, attempt + '/' + HTTP_RETRY, String(code));
+      if (attempt < HTTP_RETRY) await new Promise(r => setTimeout(r, RETRY_BASE_MS * attempt + Math.floor(Math.random() * 400)));
+    }
+  }
+  const code = (lastErr && lastErr.cause && (lastErr.cause.code || lastErr.cause.errno)) || (lastErr && lastErr.message);
+  const err = new Error('网络请求失败（已重试 ' + HTTP_RETRY + ' 次）：' + String(code));
+  err.isNetwork = true;
+  throw err;
+}
+
 async function callApi(serverType, apiPath, { method = 'GET', data = null, auth = null } = {}){
+  // 测试注入点：设置 globalThis.__PAID_REPLAY__ = fn(apiPath, data) 时改用回放桩，不产生真实网络请求
+  if (typeof globalThis !== 'undefined' && typeof globalThis.__PAID_REPLAY__ === 'function'){
+    const r = await globalThis.__PAID_REPLAY__(apiPath, data, serverType);
+    if (r) return r;
+  }
   let url = serverUrl(serverType, apiPath);
   // GET: 参数拼进 URL query（ r += "?" + queryString），并参与签名
   if (method === 'GET' && data && Object.keys(data).length){
@@ -294,7 +367,7 @@ async function callApi(serverType, apiPath, { method = 'GET', data = null, auth 
   const opts = { method, headers: Object.assign({ 'Content-Type': ct }, headers) };
   if (method === 'POST') opts.body = typeof data === 'string' ? data : JSON.stringify(data || {});
   dbg('REQ', method, url, opts.body || '');
-  const resp = await fetch(url, opts);
+  const resp = await fetchWithRetry(url, opts, apiPath);
   // 每次响应都从服务器 Date 头刷新时间锚点：即便启动预同步失败，首个成功的 /external/ 调用也会校正，
   // 后续严格验签接口即可用准时间（规避 NAS 本地钟漂移 → "手机时间不正确"）。
   const dh = resp.headers.get('date');
@@ -327,14 +400,21 @@ function _yybAuthHeaders() {
 
 async function yybGetCode(account){
   const headers = _yybAuthHeaders();
-  const resp = await fetch(`${account.server}/wxapp/getCode`, {
+  // ⚠️ YYB 取码不可盲目重试：上游有短链风控（code=-14）与熔断（429）。仅在连接层失败时重试一次。
+  const resp = await fetchWithRetry(`${account.server}/wxapp/getCode`, {
     method: 'POST',
     headers: headers,
     body: JSON.stringify({ ref: account.ref, app_id: APPID }),
-  });
+  }, 'yybGetCode');
   const j = await resp.json().catch(() => ({}));
   const code = j && j.data && j.data.result && j.data.result.code;
-  if (!resp.ok || Number(j.code) !== 0 || !code) throw new Error('YYB-Go-Enhanced取code失败: ' + String(j.message || j.msg || `HTTP ${resp.status}`).slice(0, 160));
+  if (!resp.ok || Number(j.code) !== 0 || !code){
+    // 429/熔断 要明确告知，不要被误当成账号问题
+    const msg = String(j.message || j.msg || `HTTP ${resp.status}`).slice(0, 160);
+    const hint = (Number(j.code) === 429 || /熔断/.test(msg)) ? '（YYB 上游熔断，稍后自动恢复）'
+      : (Number(j.code) === 502 || /shortlink|code=-14/.test(msg)) ? '（YYB 短链风控，稍后自动恢复）' : '';
+    throw new Error('YYB-Go-Enhanced取code失败: ' + msg + hint);
+  }
   dbg('YYB getCode ok', mask(account.ref));
   return code;
 }
@@ -369,7 +449,9 @@ async function doLogin(account){
     'Content-Type': 'application/x-www-form-urlencoded',
   };
   dbg('REQ', 'POST', url, body);
-  const resp = await fetch(url, { method: 'POST', headers, body });
+  // ⚠️ 登录不能盲目重试：微信 code 一次性，重试同一 code 必然失败。
+  //   故此处只对「连接层失败」重试一次（此时请求很可能未到达服务端），业务码失败不重试。
+  const resp = await fetchWithRetry(url, { method: 'POST', headers, body }, 'login');
   const j = await resp.json().catch(() => ({}));
   dbg('RES', '/user-session/external/wxMiniProgram/login', JSON.stringify(j).slice(0, 600));
   if (j.CODE !== '00'){
@@ -417,7 +499,184 @@ async function signInSmart(auth){
 // 解析任务字段（不同接口字段名不一，做防御性取值）
 function taskField(t, names, def){ for (const n of names){ if (t[n] !== undefined && t[n] !== null) return t[n]; } return def; }
 
+// ============================== 浏览任务（签到之外的额外健康币来源） ==============================
+// 链路（2026-11-01 HAR 实测）：
+//   ① getTaskListAndBalance 取任务 -> 筛 eventType=BROWSE && onlineStatus=ONLINE
+//   ② completeBrowseTask (taskId) 上报浏览 -> 返回 rewardId / rewardStatus=PENDING
+//   ③ claimReward (rewardId) 领取 -> rewardStatus=ISSUED，健康币 +10
+// 幂等语义（实测）：
+//   · 已完成(status!=0)的任务再上报 completeBrowseTask 仍返回 00，但不发新 reward，
+//     且重复 claimReward 返回 41019201「奖励状态已变更」——均视为「本日已做过」，不算失败
+//   · 任务列表已无该任务（被下线/当日额度耗尽）→ 直接跳过
+// 降级会话（userId=null，即微信会话未绑定平安一账通）下三者全返回 CODE=500
+//   → 单独识别并给出明确指引，不与其他失败混为一谈
+
+const BROWSE_MAX_PER_RUN = Number(process.env.PAID_BROWSE_MAX || 5); // 单账号单轮最多尝试的任务条数
+const BROWSE_SETTLE_MS = Number(process.env.PAID_BROWSE_SETTLE_MS || 1500); // 上报→领取之间的最小间隔
+
+function isBrowseTask(t){
+  const et = String(taskField(t, ['eventType', 'taskType', 'type'], '')).toUpperCase();
+  if (et === 'BROWSE') return true;
+  // 兜底：eventType 缺失时按名称/规则文本识别（"浏览…产品页"）
+  const text = String(taskField(t, ['taskName', 'displayTitle'], '')) + String(taskField(t, ['extInfo'], ''));
+  return /浏览/.test(text) && !/添加|兑换/.test(text);
+}
+function taskDone(t){ return String(taskField(t, ['status'], '0')) !== '0'; }
+
+// 取浏览任务清单（失败返回 { error }）
+async function fetchBrowseTasks(auth){
+  const j = await callApi('SpringCloud_incubator', '/health-core/external/ledong/equity/getTaskListAndBalance',
+    { method: 'POST', data: 'displayChannel=MINI_PROGRAM', auth });
+  if (j.CODE !== '00') return { error: j };
+  const d = j.DATA || {};
+  const tasks = (d.tasks || []).filter(t => isBrowseTask(t) && String(taskField(t, ['onlineStatus', 'status_online'], 'ONLINE')).toUpperCase() !== 'OFFLINE');
+  const balance = d.coinBalance && d.coinBalance.balance != null ? Number(d.coinBalance.balance) : null;
+  return { tasks, balance };
+}
+
+// 单条浏览任务：上报 + 领取。返回 { added, note, fail?, code?, rewardId? }
+// status 语义（HAR + 实盘双向实测）：
+//   "0" = 未浏览       → ① completeBrowseTask 打点 ② **重新拉列表** 取刷新后的 task.rewardId ③ claimReward
+//   "1" = 已浏览待领取 → task.rewardId 已在手，直接 claimReward
+//   其它 = 已领取      → 跳过
+// ⚠️⚠️ rewardId 取证的唯一正解（2026-11-01 实盘踩坑两次后确认）：
+//   · status="0" 时任务对象上**没有** rewardId，上报响应里的 rewardId 是**无效占位**（拿去 claim 必返
+//     41019201「奖励记录不存在」，币白丢）；
+//   · 上报成功后服务端才配发奖励，必须**重新调用 getTaskListAndBalance**，此时该任务变 status="1"
+//     并带上真正可用的 rewardId；
+//   · status="1" 时再调 completeBrowseTask 只会回 jumpUrl 不带 rewardId —— 所以不能靠上报响应。
+//   → 结论：先上报 → 重拉列表 → 用新列表里该任务的 rewardId 领取。
+async function runOneBrowseTask(auth, task){
+  const tid = String(taskField(task, ['id', 'taskId', 'taskCode'], ''));
+  const name = String(taskField(task, ['taskName', 'displayTitle'], tid));
+  const status = String(taskField(task, ['status'], '0'));
+  if (!tid) return { added: 0, note: '⚠️ ' + name + '：任务ID缺失，跳过' };
+
+  let rewardId = String(taskField(task, ['rewardId'], '') || '');
+  let pending = '';
+
+  // ① 未浏览 → 上报打点
+  if (status === '0'){
+    const r1 = await callApi('SpringCloud_incubator', '/health-core/ledong/equity/completeBrowseTask',
+      { method: 'POST', data: 'taskId=' + tid, auth });
+    if (r1.CODE !== '00'){
+      return { added: 0, note: '❌ ' + name + '：上报失败 CODE=' + r1.CODE + ' ' + (r1.MSG || ''), fail: true, code: r1.CODE };
+    }
+    // ★ 上报响应里的 rewardId 不可信，一律丢弃；改为重拉列表拿真实 rewardId
+    pending = String((r1.DATA || {}).rewardStatus || '').toUpperCase();
+    rewardId = '';
+  } else if (status !== '1'){
+    return { added: 0, note: 'ℹ️ ' + name + '：今日已完成（无需重复）' };
+  }
+
+  // ② status=0 报过 / status=1 但本地没带 rewardId → 重拉任务列表取刷新后的 rewardId
+  if (!rewardId){
+    // 给服务端一点时间完成奖励配发（实测 1.5s 足够，拉太急会拿到空 rewardId）
+    await new Promise(r => setTimeout(r, BROWSE_SETTLE_MS));
+    const lr = await fetchBrowseTasks(auth);
+    if (lr.error){
+      return { added: 0, note: '❌ ' + name + '：奖励配发后取列表失败 CODE=' + lr.error.CODE + ' ' + (lr.error.MSG || ''), fail: true, code: lr.error.CODE };
+    }
+    const cur = (lr.tasks || []).find(t => String(taskField(t, ['id', 'taskId', 'taskCode'], '')) === tid);
+    if (!cur){
+      // 任务已从列表消失：视为当日额度耗尽/已下线，不算失败
+      return { added: 0, note: 'ℹ️ ' + name + '：已上报，任务已下架（无待领取奖励）' };
+    }
+    rewardId = String(taskField(cur, ['rewardId'], '') || '');
+    const curStatus = String(taskField(cur, ['status'], '0'));
+    if (!rewardId){
+      if (curStatus === '1'){
+        return { added: 0, note: '⚠️ ' + name + '：已浏览但服务端未配发 rewardId（status=1），待下次重试' };
+      }
+      return { added: 0, note: 'ℹ️ ' + name + '：已上报，无待领取奖励（status=' + curStatus + '）' };
+    }
+  }
+
+  if (pending === 'ISSUED'){
+    return { added: 0, note: 'ℹ️ ' + name + '：已领取（ISSUED）' };
+  }
+
+  // ③ 领取奖励（与上报/拉列表再拉开一点间隔，贴近真机节奏）
+  await new Promise(r => setTimeout(r, BROWSE_SETTLE_MS + Math.floor(Math.random() * 1200)));
+  const r2 = await callApi('SpringCloud_incubator', '/health-core/healthEquity/claimReward',
+    { method: 'POST', data: 'rewardId=' + rewardId, auth });
+  if (r2.CODE === '00'){
+    const d2 = r2.DATA || {};
+    const v = Number(taskField(d2, ['rewardValue', 'prizeValue'], 0)) || 0;
+    const st = String(d2.rewardStatus || '').toUpperCase();
+    if (st && st !== 'ISSUED') return { added: 0, note: '⚠️ ' + name + '：领取返回 ' + st + '，待下次重试' };
+    return { added: v, note: '✅ ' + name + '：浏览完成并领取 +' + v + ' 健康币', rewardId };
+  }
+  if (/奖励状态已变更|已领取|奖励记录不存在|重复/.test(String(r2.MSG || '') + String(r2.CODE || ''))){
+    return { added: 0, note: 'ℹ️ ' + name + '：奖励已领取/已变更（' + (r2.MSG || r2.CODE) + '）' };
+  }
+  return { added: 0, note: '❌ ' + name + '：领取失败 CODE=' + r2.CODE + ' ' + (r2.MSG || ''), fail: true, code: r2.CODE };
+}
+
+// 会话等级探测：一账通绑定态（决定所有写接口是否可用）
+//   userInfo 第二段为真实 userId + isBind=true  → FULL（可写）
+//   userInfo 第二段为 null 或 isBind=false      → DEGRADED（写接口一律 500）
+// 说明：身份完全由 X-Token 决定，服务端不认 X-EncryptedUserID 里的伪造 userId
+//       （2026-11-01 已用「账号1 token + 账号2 EncryptedUserID」双向交叉验证，仍返回 500）
+async function probeSessionLevel(auth){
+  const uid = String((auth.userInfo || '').split('|')[1] || '');
+  let isBind = null;
+  try {
+    const j = await callApi('SpringCloud_platform', '/user-auth/wxMiniProgram/getUserInfo',
+      { method: 'POST', data: '', auth });
+    if (j.CODE === '00') isBind = !!(j.DATA && j.DATA.isBind);
+  } catch { /* 探测失败不阻断主流程 */ }
+  const level = (uid && uid !== 'null' && isBind !== false) ? 'FULL' : 'DEGRADED';
+  return { level, uid, isBind };
+}
+
+// 批量跑浏览任务。返回 { lines, added, failCount, lastCode }
+async function runBrowseTasks(auth, { max = BROWSE_MAX_PER_RUN, level = null } = {}){
+  const lines = []; let added = 0, failCount = 0, lastCode = '';
+  if (level === 'DEGRADED'){
+    lines.push('⏭️ 浏览任务：会话为降级态（未绑定平安一账通），跳过以避免无效请求');
+    return { lines, added, failCount, lastCode, skipped: true };
+  }
+  const lr = await fetchBrowseTasks(auth);
+  if (lr.error){
+    const e = lr.error;
+    const isDegraded = String(e.CODE) === '500';
+    lines.push('❌ 浏览任务：任务列表获取失败 CODE=' + e.CODE + ' ' + (e.MSG || '') +
+      (isDegraded ? '（会话为降级态，见末尾说明）' : ''));
+    return { lines, added, failCount: 1, lastCode: String(e.CODE), balance: null };
+  }
+  const all = lr.tasks;
+  if (!all.length){
+    lines.push('ℹ️ 浏览任务：当前无在线浏览任务');
+    return { lines, added, failCount, lastCode, balance: lr.balance };
+  }
+  // 优先处理未完成(0)与待领取(1)，已领取的仅回显
+  const targets = all.slice(0, Math.max(1, max));
+  const todo = targets.filter(t => {
+    const s = String(taskField(t, ['status'], '0'));
+    return s === '0' || s === '1';
+  });
+  lines.push('📋 浏览任务：共 ' + targets.length + ' 条（待处理 ' + todo.length + '）');
+  for (const t of targets){
+    const r = await runOneBrowseTask(auth, t);
+    lines.push('   ' + r.note);
+    added += r.added;
+    if (r.fail){ failCount++; lastCode = String(r.code || ''); }
+    await new Promise(s => setTimeout(s, 900 + Math.floor(Math.random() * 800)));
+  }
+  return { lines, added, failCount, lastCode, balance: lr.balance };
+}
+
 // ============================== 单账号运行 ==============================
+// 会话降级自愈（2026-11-01 关键修复）
+//   【现象】缓存里的 authToken 属「降级会话」，userInfo 第二段为 null，写接口一律 CODE=500。
+//   【旧逻辑缺陷】原脚本只在 CODE=10000（登录失效）时重登；降级会话返回的是 500 而非 10000，
+//                 于是永远不重登，账号永久卡死在降级态（9/11 起全部日志均为此症状）。
+//   【实测依据】用同一套 doLogin 重新登录后：
+//                 ref=2  userInfo 从 null → 2067191207872160（余额 10，写接口恢复 00）
+//                 ref=1  null → 2049113707979168（本就 FULL，重登后依然 FULL）
+//                 ref=3/4/5 重登后仍为 null → 属账号侧未在平安侧建档，重登无解
+//   【结论】降级态必须触发一次重登重试；重登后仍降级则如实标记账号侧问题，不再空转。
 async function runOne(account, cache, tkmap){
   const openid = account.ref;
   const line = [];           // 本账号输出行
@@ -442,6 +701,41 @@ async function runOne(account, cache, tkmap){
     }
     line.push('🔑 ' + (tkmap[openid] ? 'TOKENS 兜底有效' : (src.includes('缓存') ? '缓存有效→复用' : '缓存已失效')));
     if (src.includes('YYB')) line.push('✅ YYB-Go-Enhanced 登录成功（已更新缓存）');
+
+    // 会话等级：FULL（已绑一账通，写接口可用）/ DEGRADED（userId=null，写接口一律 500）
+    let lv = await probeSessionLevel(auth);
+
+    // ★ 降级自愈：缓存/兜底 token 已是降级态 → 强制重登一次（降级态返回 500 而非 10000，旧逻辑不会重登）
+    //   限流保护：重登仍降级时记 `_degradedAt`，FAIL_TTL 内不再重复重登，避免白耗 YYB 取码配额被风控熔断
+    const DEGRADED_SKIP_MS = Number(process.env.PAID_DEGRADED_SKIP_HOURS || 6) * 3600 * 1000;
+    const lastDeg = (cache[openid] && cache[openid]._degradedAt) || 0;
+    const degCooling = lastDeg && (Date.now() - lastDeg < DEGRADED_SKIP_MS);
+    if (lv.level === 'DEGRADED' && src !== 'YYB-Go-Enhanced 登录成功'){
+      if (degCooling){
+        line.push('⏸️ 降级会话（距上次重登仍失败 ' + Math.round((Date.now() - lastDeg) / 3600000) + 'h，冷却中，跳过重登）');
+      } else {
+        line.push('🔄 检测到降级会话（userId=null），强制重登一次');
+        try {
+          const fresh = await doLogin(account);
+          const freshLv = await probeSessionLevel(fresh);
+          if (freshLv.level === 'FULL'){
+            auth = fresh; lv = freshLv; src = 'YYB-Go-Enhanced 登录成功';
+            delete fresh._degradedAt;
+            cache[openid] = fresh; saveCache(cache);
+            line.push('✅ 重登成功，已恢复完整会话（userId=' + freshLv.uid + '）');
+          } else {
+            // 重登仍降级：更新 token 并打冷却标记，如实标注账号侧问题
+            auth = fresh; lv = freshLv;
+            fresh._degradedAt = Date.now();
+            cache[openid] = fresh; saveCache(cache);
+            line.push('⚠️ 重登后仍为降级会话（userId=null）→ 该微信账号在平安侧无健康档案，需手动进小程序授权登录一次');
+          }
+        } catch (e){
+          line.push('⚠️ 重登失败（' + String(e.message || e).slice(0, 120) + '），继续用旧 token 尝试');
+        }
+      }
+    }
+    line.push('🪪 会话等级: ' + (lv.level === 'FULL' ? 'FULL（一账通已绑定，可写入）' : 'DEGRADED（userId 为空，写接口不可用）'));
 
     // 初始健康币（用户总币，与"我的健康币"页一致）
     const initBalance = await getCoinBalance(auth);
@@ -477,10 +771,29 @@ async function runOne(account, cache, tkmap){
       }
     } catch (e){ success = false; failMsg = e.message || String(e); line.push('❌ 签到异常 ' + failMsg); }
 
+    // ────── 浏览任务（签到之外的两条额外健康币）──────
+    // 降级会话（userId=null）下所有写接口恒 500，直接跳过并明确提示，避免无效请求
+    let browseAdded = 0, browseFail = 0;
+    try {
+      const br = await runBrowseTasks(auth, { level: lv.level });
+      br.lines.forEach(l => line.push(l));
+      browseAdded = br.added;
+      browseFail = br.failCount;
+      if (browseFail > 0){
+        success = false;
+        const tag = br.lastCode === '500' ? '浏览任务(会话降级)' : '浏览任务';
+        failMsg = failMsg ? failMsg + ' | ' + tag + '失败' : tag + '失败 CODE=' + br.lastCode;
+        if (br.lastCode === '500'){
+          line.push('   ↳ 该会话 userId 为空（未绑定平安一账通），写接口全部 500；需在小程序内完成一次一账通授权绑定');
+        }
+      }
+    } catch (e){ line.push('❌ 浏览任务异常 ' + (e.message || e)); browseFail = 1; }
+
     // 末次余额
     const finalBalance = await getCoinBalance(auth);
     const todayAdd = finalBalance - initBalance;
     line.push(`💰 签到前 ${initBalance}｜本次增加 +${todayAdd >= 0 ? todayAdd : 0}｜当前 ${finalBalance}`);
+    if (browseAdded) line.push(`🎁 浏览任务贡献 +${browseAdded} 健康币`);
 
   } catch (e){
     success = false; failMsg = e.message;
@@ -569,11 +882,15 @@ async function main(){
     if (r.success) okCount++;
     const accountTitle = `【账号${idx + 1}${account.note ? ` · ${account.note}` : ''}】`;
     const signLine = r.line.find(l => /签到成功|今日已签到|签到返回|签到异常|失败:/.test(l));
+    const browseLine = r.line.find(l => /浏览任务：共|浏览任务：当前无|浏览任务：任务列表/.test(l));
+    const browseGot = r.line.filter(l => /^\s+✅ .*浏览完成并领取/.test(l)).length;
     const coinLine = r.line.find(l => l.startsWith('💰 签到前'));
     notifyBlocks.push([
       accountTitle,
       r.success ? '✅ 执行成功' : '❌ 执行失败',
       signLine,
+      browseLine,
+      browseGot ? `🎁 浏览任务领取：${browseGot} 条` : null,
       coinLine,
     ].filter(Boolean).join('\n'));
     if (idx < accounts.length - 1){
@@ -602,4 +919,5 @@ async function main(){
 
 if (require.main === module) main().catch(e => { W('❌ 运行异常: ' + e.message); process.exit(1); });
 
-module.exports = { doLogin, buildHeaders, callApi, decryptLoginToken, encryptUserID, serverUrl, rand16, APPID, AES_PASS, loadCache };
+module.exports = { doLogin, buildHeaders, callApi, decryptLoginToken, encryptUserID, serverUrl, rand16, APPID, AES_PASS, loadCache,
+  runBrowseTasks, runOneBrowseTask, fetchBrowseTasks, probeSessionLevel, isBrowseTask, taskField };
