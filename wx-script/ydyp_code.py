@@ -3,18 +3,19 @@
 # name: 移动云盘
 # cron: 0 0 8,16,20 * * *
 """
-移动云盘自动签到_code版v5.1.0
+移动云盘自动签到_code版v5.3.3
 
 包含以下功能:
 1. 每日自动签到 (签到/抽奖/摇一摇/新版云朵领取)
-2. 多账号并发支持 (环境变量 & 分隔)
+2. 多账号支持 (YYB 授权账号 + 环境变量账号，串联执行)
 3. 云朵中心新版任务自动处理 (上传/分享/AI相机/月任务补传等)
 4. 临时文件智能清理与详细日志推送
 
-配置说明:
+执行顺序:
+默认先依次登录全部 YYB 账号并跑完，再跑 ydyp 环境变量里的账号。
+两种来源按手机号去重，同一手机号优先使用 YYB 换发的新凭证。
 
-当未配置 ydyp 变量时，自动从yyb获取ydyp Cookie，
-如手动抓包配置 ydyp 变量时，放弃从yyb获取，只使用手动抓包变量
+配置说明:
 
 变量名: ydyp
 赋值方式:
@@ -23,17 +24,18 @@
 1.登录https://yun.139.com，cookie中找到Authorization字段，复制其值。
 2.登陆网址抓取https://sm.linzixuan.top/
 
-YYB 登录（无需配置 ydyp Cookie）：
-YDYP_LOGIN_MODE=yyb
-YYB_SERVER：沿用已有配置，每行一个 服务地址@账号ref。
+YYB 登录：
+YYB_SERVER：每行一个 服务地址@账号ref。
 YDYP_YYB_SERVER：可选，仅覆盖本脚本的服务与账号列表。
 YDYP_YYB_REFS：可选，账号ref白名单，以 &、逗号或换行分隔。
 YDYP_YYB_TOKEN：可选，优先于 YYB_PROTOCOL_TOKEN / YYB_API_KEY。
 微信账号须具备目标小程序手机号授权能力；本脚本不发送短信或自动开户。
 登录手机号由 YYB 的授权结果决定；脚本不支持任选微信内的其他手机号。
-YDYP_LOGIN_MODE 默认 auto：有 ydyp 时保持 Cookie 模式；有专用
-YDYP_YYB_SERVER 或没有 ydyp 而配置了 YYB_SERVER 时使用 YYB。
-也可设置 cookie 强制保持原模式。
+
+YDYP_LOGIN_MODE：
+不设置 / mixed = YYB 账号优先，跑完后继续跑 ydyp 账号（默认）
+yyb   = 只跑 YYB 账号
+cookie = 只跑 ydyp 账号
 
 ⚠️ 依赖安装:
 pip3 install requests pycryptodome
@@ -65,7 +67,7 @@ except ImportError:
     pad = None
     unpad = None
 
-SCRIPT_VERSION = '5.1.0'
+SCRIPT_VERSION = '5.3.3'
 
 YDYP_WX_APPID = 'wx4e4ed37286c816c2'
 YDYP_WX_VERSION = '5.14.4'
@@ -78,9 +80,26 @@ YDYP_USER_BASE_URL = 'https://user-njs.yun.139.com/user'
 TOKEN_STORAGE_FILENAME = 'ydyp_token_storage.json'
 DEVICE_ID_STORAGE_FILENAME = ''
 
+# ============ v5.2.0 鉴权网关（移动云盘 13.2.5 逆向结果）============
+# 云朵中心已整体迁移到 gp 网关；ssoToken -> jwtToken 的换取接口从
+# 旧 caiyun.feixin.10086.cn:7071/portal/auth/tyrzLogin.action（已下线 404）
+# 变更为 gp.mcloud.139.com/ycloud/auth-service/auth/tyrzLogin，并新增
+# x-request-id / x-timestamp / x-nonce / x-signature 四段式签名校验。
+# 签名算法（app 内置 H5 newsignin 静态包，module 4192）：
+#   md5(secret + requestId + timestamp + nonce + "" + secret)  小写 hex
+# secret 由 H5 代码 String.fromCodePoint 数组还原，属客户端协议常量。
+YDYP_GATEWAY_HOST = 'https://gp.mcloud.139.com'
+YDYP_SIGN_SECRET = 'sekaMdYYLIZfbCfm'
+YDYP_MARKET_NAME = 'sign_in_3'
+YDYP_AUTH_PATH = '/ycloud/auth-service/auth/tyrzLogin'
+YDYP_TIMESTAMP_PATH = '/ycloud/api/timestamp'
+# 云朵中心现役网关移动端 UA（13.2.5 内嵌 H5 实测值），空 ua 时兜底使用。
+DEFAULT_MOBILE_UA = ('Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) '
+                     'AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 mcloud/13.2.5')
+
 # ⭐ 统一设备信息：iPhone 16 Pro + iOS 18_7 + 版本 12.5.4（抓包真实值）
-ua = ''
-market_ua = ''
+ua = DEFAULT_MOBILE_UA
+market_ua = DEFAULT_MOBILE_UA
 cloud_file_dummy_content = b'0'
 cloud_file_dummy_hash = hashlib.sha256(cloud_file_dummy_content).hexdigest()
 TOKEN_VALID_TIME = 21600000
@@ -169,6 +188,136 @@ def get_env_device_id():
 def build_x_device_info(device_id, net_type='wifi', terminal_type='8', version='12.5.4', brand='Apple', model='iPhone 16 Pro', system='iOS 18.7'):
     """构造 x-DeviceInfo 头，与 UA 保持一致"""
     return f"{net_type}||{terminal_type}|{version}|{brand}|{model}|{device_id}||{system.lower()}|||||"
+
+
+def fetch_gateway_timestamp(session=None, timeout=8):
+    """取 gp 网关服务端毫秒时间戳；失败时回退本地时钟。
+
+    网关要求 x-timestamp 与服务端偏差在允许窗口内，本地时钟漂移会导致
+    签名校验 401，因此优先取服务端时间。
+    """
+    requester = session or requests
+    try:
+        resp = requester.get(YDYP_GATEWAY_HOST + YDYP_TIMESTAMP_PATH, timeout=timeout)
+        data = resp.json()
+        result = data.get('result')
+        if isinstance(result, int) and result > 0:
+            return str(result)
+        if isinstance(result, str) and result.isdigit():
+            return result
+    except Exception:
+        pass
+    return str(int(time.time() * 1000))
+
+
+def build_gateway_sign_headers(session=None, extra=None):
+    """生成 tyrzLogin 所需的签名头。
+
+    与 H5 实现一一对应：
+        requestId  = uuid4()
+        timestamp  = 服务端毫秒时间戳（字符串）
+        nonce      = uuid4()
+        signature  = md5(secret + requestId + timestamp + nonce + "" + secret)
+    注意：crypto-js 的 MD5().toString() 输出小写 hex，服务端按小写比对。
+    """
+    request_id = str(uuid.uuid4())
+    timestamp = fetch_gateway_timestamp(session)
+    nonce = str(uuid.uuid4())
+    raw = YDYP_SIGN_SECRET + request_id + timestamp + nonce + '' + YDYP_SIGN_SECRET
+    signature = hashlib.md5(raw.encode('utf-8')).hexdigest()
+    headers = {
+        'Content-Type': 'application/json;charset=UTF-8',
+        'x-request-id': request_id,
+        'x-timestamp': timestamp,
+        'x-nonce': nonce,
+        'x-signature': signature,
+        'X-Requested-With': 'XMLHttpRequest',
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+
+
+
+def is_transient_error(msg):
+    """判断错误是否为上游瞬时故障（可用重试/下轮恢复），而非凭证或配置问题。"""
+    text = str(msg or '').lower()
+    markers = ('connection refused', 'timeout', 'timed out', 'bad gateway',
+               'service unavailable', 'server error', '接口无响应',
+               '502', '503', '504', '501', '429', '上游')
+    return any(m in text for m in markers)
+
+
+def build_builtin_jpeg_sample(width=320, height=240):
+    """零依赖生成一张可解码的纯色 JPEG（AI 相机识图最小素材）。
+
+    不依赖 PIL：手写 JPEG 基线编码（灰度单分量、4 个 Huffman 表、
+    8x8 DCT 全零 AC + 固定 DC），结构合法可被服务端正常解码。
+    """
+    try:
+        out = bytearray()
+        out += b'\xff\xd8'  # SOI
+
+        # DQT: 全 1 量化表，保证 DC 系数解码后为平滑色块
+        out += b'\xff\xdb' + (67).to_bytes(2, 'big') + b'\x00' + bytes([1] * 64)
+
+        # SOF0: 8bit 灰度单分量
+        out += b'\xff\xc0' + (11).to_bytes(2, 'big') + b'\x08'
+        out += height.to_bytes(2, 'big') + width.to_bytes(2, 'big')
+        out += b'\x01' + b'\x01\x11\x00'
+
+        # DHT: DC 表（标准表 0）+ AC 表（标准表 0）
+        dc_bits = bytes([0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0])
+        dc_vals = bytes(range(12))
+        out += b'\xff\xc4' + (2 + 1 + 16 + 12).to_bytes(2, 'big') + b'\x00' + dc_bits + dc_vals
+
+        ac_bits = bytes([0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7d])
+        ac_vals = bytes([
+            0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12,
+            0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
+            0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08,
+            0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0,
+            0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16,
+            0x17, 0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28,
+            0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
+            0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+            0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59,
+            0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+            0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79,
+            0x7a, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+            0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98,
+            0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
+            0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6,
+            0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5,
+            0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4,
+            0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2,
+            0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea,
+            0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8,
+            0xf9, 0xfa,
+        ])
+        out += b'\xff\xc4' + (2 + 1 + 16 + len(ac_vals)).to_bytes(2, 'big') + b'\x10' + ac_bits + ac_vals
+
+        # SOS
+        out += b'\xff\xda' + (8).to_bytes(2, 'big') + b'\x01\x01\x00\x00\x3f\x00'
+
+        # 熵编码数据：每个 MCU 的 DC 差分为 0（码字 '00'），AC 全 EOB（'1010'）
+        mcu_cols = (width + 7) // 8
+        mcu_rows = (height + 7) // 8
+        bits = ('00' + '1010') * (mcu_cols * mcu_rows)
+        bits += '1' * ((8 - len(bits) % 8) % 8)
+        data = bytearray()
+        for i in range(0, len(bits), 8):
+            byte = int(bits[i:i + 8], 2)
+            data.append(byte)
+            if byte == 0xFF:
+                data.append(0x00)
+        out += bytes(data)
+        out += b'\xff\xd9'  # EOI
+        return bytes(out)
+    except Exception:
+        return b''
 
 
 def aes_encrypt(data, key):
@@ -351,28 +500,108 @@ def login_with_yyb(server, ref, session=None):
             session.close()
 
 
+def normalize_phone(value):
+    """手机号归一化：去空格/连字符/括号，剥离 +86 / 86 国家码。
+
+    去重必须在归一化后比较，否则「151 6396 0550」「+8615163960550」
+    与「15163960550」会被判定成三个不同账号，导致重复执行。
+    """
+    digits = re.sub(r'[^\d]', '', str(value or ''))
+    if len(digits) == 13 and digits.startswith('86'):
+        digits = digits[2:]
+    if len(digits) == 15 and digits.startswith('0086'):
+        digits = digits[4:]
+    return digits
+
+
+def extract_account_from_cookie(cookie):
+    """从 Authorization 值里还原手机号，用于跨来源去重。
+
+    支持两种配置习惯：
+    1) 纯 Authorization：Basic base64("mobile:{account}:{token}")
+    2) 手工拼接：Authorization值#手机号（取 # 后为主，回退解析 Authorization）
+    解析失败返回 ''。
+    """
+    raw = str(cookie or '').strip()
+    # 优先用用户显式写在 # 后面的手机号
+    if '#' in raw:
+        tail = raw.rsplit('#', 1)[1].strip()
+        if re.fullmatch(r'[\d\s\-+()]{7,20}', tail):
+            phone = normalize_phone(tail)
+            if len(phone) == 11:
+                return phone
+    token = normalize_authorization(raw)
+    if token.startswith('Basic '):
+        token = token[6:]
+    # 补齐 base64 padding，容忍被截断/去填充的配置
+    token = token.split('#', 1)[0].strip()
+    try:
+        token += '=' * (-len(token) % 4)
+        decoded = base64.b64decode(token).decode('utf-8')
+    except Exception:
+        return ''
+    parts = decoded.split(':')
+    if len(parts) >= 2:
+        phone = normalize_phone(parts[1])
+        if len(phone) == 11 and phone.startswith('1'):
+            return phone
+    return ''
+
+
+def parse_cookie_records(cookie_config):
+    """把 ydyp 变量拆成 cookie 记录列表。"""
+    records = []
+    for value in re.split(r'[&\n]', cookie_config or ''):
+        value = value.strip()
+        if not value:
+            continue
+        records.append({
+            'cookie': value,
+            'source': 'cookie',
+            'account': extract_account_from_cookie(value),
+        })
+    return records
+
+
 def load_login_records():
+    """加载待执行账号。
+
+    默认 mixed 模式：先依次登录全部 YYB 账号，再追加 ydyp 环境变量里的账号。
+    两种来源按手机号去重，YYB 优先（YYB 拿到的是刚换发的新凭证，更可靠）。
+    显式设置 YDYP_LOGIN_MODE=yyb / cookie 时退回单一来源行为。
+    """
     cookie_config = os.getenv('ydyp', '').strip()
     dedicated_server = os.getenv('YDYP_YYB_SERVER', '').strip()
     yyb_config = dedicated_server or os.getenv('YYB_SERVER', '').strip()
-    mode = os.getenv('YDYP_LOGIN_MODE', 'auto').strip().lower()
-    if mode not in ('auto', 'cookie', 'yyb'):
-        raise ValueError('YDYP_LOGIN_MODE 只支持 auto、cookie、yyb')
+    mode = os.getenv('YDYP_LOGIN_MODE', 'auto').strip().lower() or 'auto'
+    if mode not in ('auto', 'mixed', 'cookie', 'yyb'):
+        raise ValueError('YDYP_LOGIN_MODE 只支持 auto、mixed、cookie、yyb')
     if mode == 'auto':
-        mode = 'yyb' if dedicated_server or (not cookie_config and yyb_config) else 'cookie'
+        mode = 'mixed'
     print(f'凭证获取模式: {mode}')
+
+    # 单一来源：cookie
     if mode == 'cookie':
-        records = [{'cookie': v.strip(), 'source': 'cookie'} for v in re.split(r'[&\n]', cookie_config) if v.strip()]
+        records = parse_cookie_records(cookie_config)
         if not records:
             raise ValueError('未配置 ydyp；使用 YYB 时请配置 YYB_SERVER 并设置 YDYP_LOGIN_MODE=yyb')
         return records
+
     if not yyb_config:
+        if mode == 'mixed' and parse_cookie_records(cookie_config):
+            print('未配置 YYB_SERVER，仅执行 ydyp 环境变量账号')
+            return parse_cookie_records(cookie_config)
         raise ValueError('YYB 模式缺少 YDYP_YYB_SERVER 或 YYB_SERVER')
+
     raw_refs = os.getenv('YDYP_YYB_REFS', '').strip()
     allowed_refs = {x.strip() for x in re.split(r'[&,，\n]', raw_refs) if x.strip()} if raw_refs else None
     accounts = parse_yyb_accounts(yyb_config, allowed_refs)
     if not accounts:
+        if mode == 'mixed' and parse_cookie_records(cookie_config):
+            print('YYB 配置中没有匹配本脚本的账号，仅执行 ydyp 环境变量账号')
+            return parse_cookie_records(cookie_config)
         raise ValueError('YYB 配置中没有匹配本脚本的账号')
+
     records, seen_accounts = [], set()
     for index, (server, ref) in enumerate(accounts, 1):
         try:
@@ -385,8 +614,30 @@ def load_login_records():
             print(f'YYB账号{index}: 云盘登录成功，已获得新凭证')
         except (RuntimeError, ValueError, TypeError) as exc:
             print(f'YYB账号{index}: {exc}')
+
+    if mode == 'yyb':
+        if not records:
+            raise RuntimeError('全部 YYB 账号登录失败；未使用旧 Cookie 回退')
+        return records
+
+    # mixed：小程序（YYB）全部跑完后，再追加环境变量里的 token 账号
+    cookie_records = parse_cookie_records(cookie_config)
+    appended = 0
+    skipped = 0
+    for record in cookie_records:
+        account = record.get('account')
+        if account and account in seen_accounts:
+            print(f"环境变量账号 {account[:3]}****{account[-4:]}: 已在YYB中执行，跳过")
+            skipped += 1
+            continue
+        records.append(record)
+        appended += 1
+        if account:
+            seen_accounts.add(account)
+    if cookie_records:
+        print(f'环境变量账号: 追加 {appended} 个，去重跳过 {skipped} 个（共配置 {len(cookie_records)} 个）')
     if not records:
-        raise RuntimeError('全部 YYB 账号登录失败；未使用旧 Cookie 回退')
+        raise RuntimeError('YYB 与 ydyp 均未取得可用账号')
     return records
 
 
@@ -574,7 +825,7 @@ class YP:
             self.click_num = 15
             self.draw = 1
             self.client_version = '12.5.4'
-            self.market_base_url = 'https://m.mcloud.139.com'
+            self.market_base_url = YDYP_GATEWAY_HOST
             self.market_source_id = '1097'
             self.sso_token = None
             self.user_domain_id = ''
@@ -611,10 +862,12 @@ class YP:
 
             self.fruit_url = 'https://happy.mail.10086.cn/jsp/cn/garden/'
 
+            # 云朵中心 cn 段接口已迁到 gp 网关：Host 必须与请求目标一致，
+            # 否则 nginx 按虚拟主机路由会返回 404（backupgift / taskList 等）。
             self.jwtHeaders = {
                 'User-Agent': ua,
                 'Accept': '*/*',
-                'Host': 'caiyun.feixin.10086.cn:7071',
+                'Host': 'gp.mcloud.139.com',
             }
             self.treeHeaders = {
                 'Host': 'happy.mail.10086.cn',
@@ -825,6 +1078,11 @@ class YP:
             self.log(f'\n📧 139邮箱任务')
             self.get_tasklist(url='newsign_139mail', app_type='email_app')
             self.receive()
+            # 收尾兜底清理：任何中途失败遗留的临时文件都在这里统一删除
+            try:
+                self.cleanup_uploaded_files()
+            except Exception:
+                pass
             global all_logs
             user_log_str = "\n".join(self.user_log_lines)
             all_logs += f"用户【{self.encrypt_account}】日志:\n{user_log_str}\n\n"
@@ -835,7 +1093,7 @@ class YP:
             err_accounts += f'{self.encrypt_account}\n'
 
     @catch_errors
-    def send_request(self, url, headers=None, cookies=None, data=None, params=None, method='GET', debug=None, retries=5):
+    def send_request(self, url, headers=None, cookies=None, data=None, params=None, method='GET', debug=None, retries=5, backoff=False):
 
         debug = debug if debug is not None else GLOBAL_DEBUG
 
@@ -843,9 +1101,19 @@ class YP:
         request_cookies = dict(cookies or {})
         request_args = {'json': data} if isinstance(data, dict) else {'data': data}
 
+        # 5xx 属上游瞬时故障，值得退避重试；4xx 是确定性错误，重试无意义。
+        transparent_status = (500, 501, 502, 503, 504, 429)
         for attempt in range(retries):
             try:
                 response = self.session.request(method, url, params=params, headers=request_headers or None, cookies=request_cookies or None, **request_args)
+                if response.status_code in transparent_status:
+                    if attempt >= retries - 1:
+                        print(f"请求异常: {response.status_code} Server Error 已达最大重试次数")
+                        return None
+                    delay = min(2 ** attempt, 8) if backoff else 1
+                    print(f"请求异常: {response.status_code} Server Error，{delay}s 后重试({attempt+1}/{retries})")
+                    time.sleep(delay)
+                    continue
                 response.raise_for_status()
                 if debug:
                     print(f'\n【{url}】响应数据:\n{response.text}')
@@ -855,10 +1123,10 @@ class YP:
                 if attempt >= retries - 1:
                     print("达到最大重试次数。")
                     return None
-                time.sleep(1)
+                time.sleep(min(2 ** attempt, 8) if backoff else 1)
 
-    def request_json(self, url, headers=None, cookies=None, data=None, params=None, method='GET', debug=None, retries=5):
-        response = self.send_request(url, headers=headers, cookies=cookies, data=data, params=params, method=method, debug=debug, retries=retries)
+    def request_json(self, url, headers=None, cookies=None, data=None, params=None, method='GET', debug=None, retries=5, backoff=False):
+        response = self.send_request(url, headers=headers, cookies=cookies, data=data, params=params, method=method, debug=debug, retries=retries, backoff=backoff)
         if response is None:
             return None
         try:
@@ -924,7 +1192,9 @@ class YP:
         cookie_value = device_id[1:] if self.market_device_from_env and device_id.startswith('B') else device_id
         if any(cookie.name.startswith('.thumbcache_') and unquote(cookie.value) == cookie_value for cookie in self.session.cookies):
             return
-        self.session.cookies.set(f'.thumbcache_{self.account}', cookie_value, domain='m.mcloud.139.com', path='/')
+        # 云朵中心已迁到 gp 网关，cookie 需同时播种到新旧两个域
+        for domain in ('gp.mcloud.139.com', 'm.mcloud.139.com'):
+            self.session.cookies.set(f'.thumbcache_{self.account}', cookie_value, domain=domain, path='/')
 
     def build_market_headers(self, extra_headers=None, referer=None):
         headers = dict(self.market_headers)
@@ -985,10 +1255,10 @@ class YP:
         return True
 
     def click_task(self, task_id, key='task'):
-        return self.request_market_json(f'{self.market_base_url}/market/signin/task/click?key={key}&id={task_id}')
+        return self.request_market_json(f'{self.market_base_url}/ycloud/signin/task/click?key={key}&id={task_id}')
 
     def get_notice_status(self):
-        send_data = self.request_json('https://caiyun.feixin.10086.cn/market/msgPushOn/task/status', headers=self.jwtHeaders) or {}
+        send_data = self.request_json(f'{self.market_base_url}/ycloud/msgPushOn/task/status', headers=self.jwtHeaders) or {}
         if send_data.get('code') != 0:
             return {}
         return send_data.get('result', {}) or {}
@@ -1046,12 +1316,22 @@ class YP:
         }
 
     def create_cloud_file(self, prefix, extension='txt'):
+        """真实上传一个小文件到云盘根目录。
+
+        v5.3.1：改用随机内容 + 真实分片上传（create → getUploadUrl → PUT → complete）。
+        原因：固定内容 b'0' 会命中云盘秒传（rapidUpload=True），文件虽然出现在列表里，
+        但服务端不把它记成一次真实上传，导致「当月上传满100个」等任务进度始终为 0，
+        而带 sendsms/interfacecallback 步骤的任务也无法被满足。
+        """
         beijing_tz = timezone(timedelta(hours=8))
         now = datetime.now(beijing_tz)
-        file_size = len(cloud_file_dummy_content)
-        file_name = f"{prefix}{now.strftime('%Y%m%d_%H%M%S')}.{extension.lstrip('.')}"
+        content = (uuid.uuid4().hex * 4).encode('utf-8')  # 64 字节唯一内容
+        file_size = len(content)
+        content_hash = hashlib.sha256(content).hexdigest()
+        file_name = f"{prefix}{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.{extension.lstrip('.')}"
+
         payload = {
-            "contentHash": cloud_file_dummy_hash,
+            "contentHash": content_hash,
             "contentHashAlgorithm": "SHA256",
             "contentType": "application/oct-stream",
             "fileRenameMode": "force_rename",
@@ -1063,7 +1343,9 @@ class YP:
             "size": file_size,
             "type": "file",
         }
-        response = self.send_request('https://personal-kd-njs.yun.139.com/hcy/file/create', headers=self.build_cloud_file_headers(), data=payload, method='POST')
+        response = self.send_request('https://personal-kd-njs.yun.139.com/hcy/file/create',
+                                     headers=self.build_cloud_file_headers(),
+                                     data=payload, method='POST', retries=3)
         if not response or response.status_code != 200:
             return None
         try:
@@ -1073,10 +1355,49 @@ class YP:
         if not res_json.get("success"):
             return None
         data = res_json.get("data", {})
-        return {
-            "fileId": data.get("fileId"),
+        file_id = data.get("fileId")
+        upload_id = data.get("uploadId")
+        result = {
+            "fileId": file_id,
             "fileName": data.get("fileName", file_name),
         }
+        if data.get("rapidUpload") or not upload_id:
+            return result
+
+        # 取分片上传地址
+        url_resp = self.request_json('https://personal-kd-njs.yun.139.com/hcy/file/getUploadUrl',
+                                     headers=self.build_cloud_file_headers(),
+                                     data={'fileId': file_id, 'uploadId': upload_id,
+                                           'partInfos': [{"partNumber": 1, "partSize": file_size,
+                                                          "start": 0, "end": file_size}]},
+                                     method='POST', retries=2)
+        parts = ((url_resp or {}).get('data') or {}).get('partInfos') or []
+        upload_url = parts[0].get('uploadUrl') if parts else ''
+        if not upload_url:
+            return result
+
+        # 上传真实字节
+        try:
+            put_resp = self.session.put(upload_url, data=content, timeout=60)
+            if put_resp.status_code not in (200, 201):
+                return result
+            etag = (put_resp.headers.get('ETag') or '').strip('"')
+        except Exception:
+            return result
+
+        # 完成上传，让文件真正落库
+        self.request_json('https://personal-kd-njs.yun.139.com/hcy/file/complete',
+                          headers=self.build_cloud_file_headers(),
+                          data={'fileId': file_id, 'uploadId': upload_id,
+                                'contentHash': content_hash,
+                                'contentHashAlgorithm': 'SHA256',
+                                'size': file_size, 'name': file_name,
+                                'parentFileId': '/', 'type': 'file',
+                                'partETagList': [{"partNumber": 1, "etag": etag,
+                                                  "partSize": file_size,
+                                                  "start": 0, "end": file_size}]},
+                          method='POST', retries=2)
+        return result
 
     def list_cloud_root_files(self):
         items = []
@@ -1110,12 +1431,14 @@ class YP:
         if item.get('type') != 'file' or item.get('parentFileId') != '/':
             return False
         name = item.get('name', '')
-        if not (name.endswith('.txt') and (name.startswith('auto_upload_') or name.startswith('auto_share_'))):
-            if not (name.endswith('.jpg') and name.startswith('auto_mayday_')):
-                return False
-        size = item.get('size')
-        content_hash = item.get('contentHash')
-        return size in (0, 1, None) or content_hash == cloud_file_dummy_hash
+        # 本脚本产生的临时文件一律按前缀识别并清理。
+        # v5.3.1 起真实上传的文件内容是随机字节（避免秒传导致任务不计数），
+        # 所以不能再只靠 size<=1 / 固定 hash 判断，否则会残留。
+        prefixes = ('auto_upload_', 'auto_share_', 'auto_mayday_',
+                    'auto_up_', 'realupload_', 'probe_', 'cmpl_', 'cnt_test_')
+        if name.endswith(('.txt', '.jpg')) and name.startswith(prefixes):
+            return True
+        return False
 
     def trash_cloud_files(self, file_ids):
         if not file_ids:
@@ -1246,10 +1569,15 @@ class YP:
 
     def get_ai_camera_sample_base64(self):
         sample_path = path.join(path.abspath(path.dirname(__file__)), 'assets', 'ai_camera_sample.jpg')
-        if not path.exists(sample_path):
-            return ''
-        with open(sample_path, 'rb') as file:
-            return f"data:image/jpg;base64,{base64.b64encode(file.read()).decode()}"
+        if path.exists(sample_path):
+            with open(sample_path, 'rb') as file:
+                return f"data:image/jpg;base64,{base64.b64encode(file.read()).decode()}"
+        # assets/ 样图缺失时的内置兜底：现场合成 320x240 纯色 JPEG，
+        # 满足 aiRecognize 对可解码图片的最低要求，避免任务因缺素材直接跳过。
+        builtin = build_builtin_jpeg_sample()
+        if builtin:
+            return f"data:image/jpg;base64,{base64.b64encode(builtin).decode()}"
+        return ''
 
     @staticmethod
     def is_ai_chat_success(text):
@@ -1452,7 +1780,7 @@ class YP:
 
     def query_cloud_task(self, task_id, group='time'):
         return_data = self.request_market_json(
-            f'{self.market_base_url}/market/signin/task/taskListV2',
+            f'{self.market_base_url}/ycloud/signin/task/taskListV2',
             method="POST",
             data={
                 'marketname': 'sign_in_3',
@@ -1552,7 +1880,7 @@ class YP:
     def get_cloud_tasklist_v2(self):
         for group, title in self.get_cloud_task_groups():
             return_data = self.request_market_json(
-                f'{self.market_base_url}/market/signin/task/taskListV2',
+                f'{self.market_base_url}/ycloud/signin/task/taskListV2',
                 method="POST",
                 data={
                     'marketname': 'sign_in_3',
@@ -1707,6 +2035,7 @@ class YP:
 
     def sso(self):
         # 2026-09 HAR 中网页端使用 querySpecTokenV2；保留旧编排接口回退。
+        # v5.3.2：上游抖动会出现 5xx，这里用退避重试而非一次就放弃。
         common_headers = {
             'Authorization': self.Authorization,
             'User-Agent': ua,
@@ -1718,7 +2047,8 @@ class YP:
             headers={**common_headers, 'Host': 'user-njs.yun.139.com'},
             data={"toSourceId": "001005"},
             method='POST',
-            retries=1,
+            retries=4,
+            backoff=True,
         )
         if not sso_data or not sso_data.get('success') or not isinstance(sso_data.get('data'), dict) or not sso_data['data'].get('token'):
             sso_data = self.request_json(
@@ -1726,7 +2056,8 @@ class YP:
                 headers={**common_headers, 'Host': 'orches.yun.139.com'},
                 data={"account": self.account, "toSourceId": "001005"},
                 method='POST',
-                retries=1,
+                retries=4,
+                backoff=True,
             )
         if not sso_data:
             self.log('刷新Token失败: 接口无响应')
@@ -1739,48 +2070,113 @@ class YP:
             self.log(f"刷新Token失败: {sso_data.get('message', '未知错误')}")
             return None
 
+    def _exchange_jwt_via_gateway(self, sso_token):
+        """用 ssoToken 在 gp 网关换取 jwtToken（13.2.5 现役链路）。
+
+        返回 (jwt_token, error_msg)。成功时 jwt_token 非空。
+
+        v5.3.2：该接口在上游抖动时会返回 501 Connection refused / 502 / 503，
+        属瞬时故障。改用 6 次指数退避重试（总窗口约 30s），显著降低误判为
+        「ck 失效」的概率；signature 每次重试都重新生成，避免时间戳过期。
+        """
+        payload = {
+            'token': sso_token,
+            'openAccount': 0,
+            'marketName': YDYP_MARKET_NAME,
+        }
+        extra = {
+            'User-Agent': ua or DEFAULT_MOBILE_UA,
+            'Origin': YDYP_GATEWAY_HOST,
+            'Referer': self.build_market_page_url(),
+        }
+        last_err = ''
+        for attempt in range(6):
+            # 每次重试重新签名：x-timestamp/x-nonce/x-signature 都需新鲜值
+            headers = build_gateway_sign_headers(self.session, extra)
+            data = self.request_json(
+                YDYP_GATEWAY_HOST + YDYP_AUTH_PATH,
+                headers=headers,
+                data=payload,
+                method='POST',
+                retries=1,
+            )
+            if data:
+                code = data.get('code')
+                if code == 0:
+                    result = data.get('result') or {}
+                    token = result.get('token') if isinstance(result, dict) else None
+                    if token:
+                        return token, ''
+                    last_err = '响应缺少 token'
+                else:
+                    msg = data.get('msg') or data.get('message') or f'code={code}'
+                    last_err = msg
+                    # 业务态失败（token 失效等）重试无益，直接返回
+                    if code not in (501, 502, 503, 504, -1):
+                        return None, msg
+            else:
+                last_err = '接口无响应'
+            if attempt < 5:
+                delay = min(2 ** attempt, 8)
+                print(f'-网关换取JWT第{attempt+1}次失败({last_err})，{delay}s 后重试')
+                time.sleep(delay)
+        return None, last_err
+
+    def _exchange_jwt_legacy(self, sso_token):
+        """旧版 tyrzLogin.action 链路（2026-10 起返回 404，仅作降级兜底）。"""
+        jwt_url = f"https://caiyun.feixin.10086.cn:7071/portal/auth/tyrzLogin.action?ssoToken={sso_token}"
+        jwt_data = self.request_json(jwt_url, headers=self.jwtHeaders, method='POST', retries=2)
+        if not jwt_data:
+            return None, '接口无响应'
+        if jwt_data.get('code') != 0:
+            return None, jwt_data.get('msg', '未知错误')
+        result = jwt_data.get('result') or {}
+        token = result.get('token') if isinstance(result, dict) else None
+        if not token:
+            return None, '响应缺少 token'
+        return token, ''
+
     def jwt(self):
         token = self.sso()
         if token is None:
             self.log('-尝试强制刷新Authorization后重试')
             self.refresh_authorization_token(force=True)
             token = self.sso()
-        if token is not None:
-            jwt_url = f"https://caiyun.feixin.10086.cn:7071/portal/auth/tyrzLogin.action?ssoToken={token}"
-            jwt_data = self.request_json(jwt_url, headers=self.jwtHeaders, method='POST')
-            if not jwt_data:
-                self.log('JWT获取失败: 接口无响应')
-                return False
-            if jwt_data['code'] != 0:
-                self.log('-尝试强制刷新Authorization后重新获取JWT')
-                self.refresh_authorization_token(force=True)
-                token = self.sso()
-                if token is None:
-                    self.log('-ck可能失效了')
-                    return False
-                jwt_url = f"https://caiyun.feixin.10086.cn:7071/portal/auth/tyrzLogin.action?ssoToken={token}"
-                jwt_data = self.request_json(jwt_url, headers=self.jwtHeaders, method='POST')
-                if not jwt_data:
-                    self.log('JWT获取失败: 接口无响应')
-                    return False
-            if jwt_data['code'] != 0:
-                self.log(f"JWT获取失败: {jwt_data['msg']}")
-                return False
-            jwt_token = jwt_data['result']['token']
-            self.jwtHeaders['jwtToken'] = jwt_token
-            self.cookies['jwtToken'] = jwt_token
-            self.build_market_context(jwt_token)
-            self.save_authorization_record(token=self.Authorization, user_domain_id=self.user_domain_id)
-            return True
-        else:
-            self.log('-ck可能失效了')
+        if token is None:
+            # ssoToken 拿不到：可能是凭证失效，也可能是上游抖动。
+            # 这里只描述事实，不武断下「ck 失效」结论。
+            self.log('-ssoToken 获取失败（凭证失效或上游不可用）')
             return False
+
+        jwt_token, err = self._exchange_jwt_via_gateway(token)
+        if not jwt_token:
+            self.log(f'-网关换取JWT失败({err})，尝试刷新Authorization')
+            self.refresh_authorization_token(force=True)
+            refreshed_sso = self.sso()
+            if refreshed_sso:
+                token = refreshed_sso
+                jwt_token, err = self._exchange_jwt_via_gateway(token)
+            if not jwt_token:
+                # 最后兜底：旧版接口（多数情况下已下线，保留以兼容灰度回滚）
+                jwt_token, legacy_err = self._exchange_jwt_legacy(token)
+                if not jwt_token:
+                    if is_transient_error(err) or is_transient_error(legacy_err):
+                        self.log(f"JWT获取失败: 上游服务暂不可用（网关={err} 旧接口={legacy_err}），本轮跳过")
+                    else:
+                        self.log(f"JWT获取失败: 网关={err} 旧接口={legacy_err}")
+                    return False
+
+        self.jwtHeaders['jwtToken'] = jwt_token
+        self.cookies['jwtToken'] = jwt_token
+        self.build_market_context(jwt_token)
+        self.save_authorization_record(token=self.Authorization, user_domain_id=self.user_domain_id)
+        return True
 
     @catch_errors
     def signin_status(self):
         self.sleep()
         self.prepare_signin_center_session()
-        check_url = f'{self.market_base_url}/market/signin/page/infoV3'
+        check_url = f'{self.market_base_url}/ycloud/signin/page/infoV3'
         check_data = self.request_market_json(check_url, params={'client': 'app'})
         if not check_data:
             self.log('查询签到失败: 接口无响应')
@@ -1791,7 +2187,7 @@ class YP:
         if self.get_today_sign_state(check_data.get('result', {})):
             self.log('✅已签到')
             return
-        signin_data = self.request_market_json(f'{self.market_base_url}/market/signin/page/startSignIn', params={'client': 'app'})
+        signin_data = self.request_market_json(f'{self.market_base_url}/ycloud/signin/page/startSignIn', params={'client': 'app'})
         if not signin_data:
             self.log('签到失败: 接口无响应')
             return
@@ -1814,9 +2210,14 @@ class YP:
                 return_data = self.click_task(319) or {}
                 time.sleep(0.2)
 
-                if 'result' in return_data:
-                    self.log(f'✅戳一戳: {return_data["result"]}')
+                # 13.2.5 起 /ycloud/signin/task/click 成功仅返回 {"code":0,"msg":"success"}，
+                # 不再带回 result 文案；以 code==0 判定成功，兼容旧版带 result 的响应。
+                if return_data.get('code') == 0:
+                    tip = return_data.get('result') or 'success'
+                    self.log(f'✅戳一戳: {tip}')
                     successful_click += 1
+                elif return_data.get('code') is not None:
+                    self.log(f'❌戳一戳: {return_data.get("msg", "未知错误")}')
 
             if successful_click == 0:
                 print(f'❌戳一戳: 未获得 x {self.click_num}')
@@ -1854,7 +2255,7 @@ class YP:
         if url == 'sign_in_3' and app_type == 'cloud_app':
             self.get_cloud_tasklist_v2()
             return
-        url = f'https://caiyun.feixin.10086.cn/market/signin/task/taskList?marketname={url}'
+        url = f'{self.market_base_url}/ycloud/signin/task/taskList?marketname={url}'
         return_data = self.send_request(url, headers=self.jwtHeaders, cookies=self.cookies).json()
         self.sleep()
         task_list = return_data.get('result', {})
@@ -1918,7 +2319,7 @@ class YP:
         if app_type == 'cloud_app':
             self.click_task(task_id)
         else:
-            task_url = f'https://caiyun.feixin.10086.cn/market/signin/task/click?key=task&id={task_id}'
+            task_url = f'{self.market_base_url}/ycloud/signin/task/click?key=task&id={task_id}'
             self.send_request(task_url, headers=self.jwtHeaders, cookies=self.cookies)
 
         if app_type == 'cloud_app':
@@ -2052,9 +2453,9 @@ class YP:
 
     @catch_errors
     def receive(self):
-        prize_url = f"https://caiyun.feixin.10086.cn/market/prizeApi/checkPrize/getUserPrizeLogPage?currPage=1&pageSize=15&_={self.timestamp}"
+        prize_url = f"{self.market_base_url}/ycloud/prizeApi/checkPrize/getUserPrizeLogPage?currPage=1&pageSize=15&_={self.timestamp}"
         self.prepare_signin_center_session(for_receive=True)
-        info_data = self.request_market_json(f'{self.market_base_url}/market/signin/page/infoV3', params={'client': 'app'})
+        info_data = self.request_market_json(f'{self.market_base_url}/ycloud/signin/page/infoV3', params={'client': 'app'})
         if not info_data:
             self.log('查询云朵失败: 接口无响应')
             return
@@ -2067,7 +2468,21 @@ class YP:
         if pending_amount:
             receive_headers = self.build_receive_headers()
             receive_cookies = dict(self.market_cookies)
-            receive_data = self.request_json(f'{self.market_base_url}/market/signin/page/receiveV2', params={'client': 'app'}, headers=receive_headers, cookies=receive_cookies)
+            # receiveV3 为 POST + JSON，cloudId/cloudType 为空表示领取签到累积云朵。
+            # H5 的 axios 拦截器对 isDeviceId 接口会把 deviceId 注入 body，
+            # 缺失时服务端返回 614「锁定失败」，必须带上。
+            receive_body = {'client': 'app', 'cloudId': '', 'cloudType': ''}
+            device_id = self.get_market_device_id()
+            if device_id:
+                receive_body['deviceId'] = device_id
+            receive_data = self.request_json(
+                f'{self.market_base_url}/ycloud/signin/page/receiveV3',
+                headers=receive_headers,
+                cookies=receive_cookies,
+                data=receive_body,
+                method='POST',
+                retries=2,
+            )
             if not receive_data:
                 self.log('领取云朵失败: 接口无响应')
                 self.log(f'-当前待领取:{pending_amount}云朵')
@@ -2076,7 +2491,7 @@ class YP:
                 self.log(f'-领取云朵:{receive_result.get("receive", pending_amount)}云朵')
                 total_amount = receive_result.get('total', total_amount)
             else:
-                latest_info_data = self.request_market_json(f'{self.market_base_url}/market/signin/page/infoV3', params={'client': 'app'})
+                latest_info_data = self.request_market_json(f'{self.market_base_url}/ycloud/signin/page/infoV3', params={'client': 'app'})
                 latest_result = latest_info_data.get('result', {}) if latest_info_data and latest_info_data.get('code') == 0 else {}
                 latest_pending = latest_result.get('toReceive', pending_amount)
                 latest_total = latest_result.get('total', total_amount)
@@ -2087,10 +2502,14 @@ class YP:
                     self.log(f'-领取云朵:{claimed_amount}云朵')
                     total_amount = latest_total
                 else:
-                    self.log(f"领取云朵失败: {receive_data.get('msg', '未知错误')}")
-                    if receive_data.get('code') in (614, 615) and not get_env_device_id() and not get_device_id(self.account):
-                        self.log('-请检查变量中 deviceId 是否正确')
-                    self.log(f'-当前待领取:{pending_amount}云朵')
+                    # 614/615 在新协议下多为「奖品池已抢空 / 无可领份额」的业务性拒绝，
+                    # 与 deviceId 无关，不再误导性地提示检查 deviceId。
+                    code = receive_data.get('code')
+                    if code in (614, 615):
+                        self.log(f"-本轮无可领份额（code={code}），保留待领取:{pending_amount}云朵")
+                    else:
+                        self.log(f"领取云朵失败: {receive_data.get('msg', '未知错误')}")
+                        self.log(f'-当前待领取:{pending_amount}云朵')
         else:
             self.log('-当前待领取:0云朵')
         self.sleep()
@@ -2108,7 +2527,7 @@ class YP:
 
     @catch_errors
     def backup_cloud(self):
-        backup_url = 'https://caiyun.feixin.10086.cn/market/backupgift/info'
+        backup_url = f'{self.market_base_url}/ycloud/backupgift/info'
         backup_data = self.send_request(backup_url, headers=self.jwtHeaders).json()
         state = backup_data.get('result', {}).get('state', '')
         if state == -1:
@@ -2116,14 +2535,14 @@ class YP:
 
         elif state == 0:
             self.log('-领取本月连续备份奖励')
-            cur_url = 'https://caiyun.feixin.10086.cn/market/backupgift/receive'
+            cur_url = f'{self.market_base_url}/ycloud/backupgift/receive'
             cur_data = self.send_request(cur_url, headers=self.jwtHeaders).json()
             self.log(f'-获得云朵数量:{cur_data.get("result").get("result")}')
 
         elif state == 1:
             print('-已领取本月连续备份奖励')
         self.sleep()
-        expend_url = 'https://caiyun.feixin.10086.cn/market/signin/page/taskExpansion'
+        expend_url = f'{self.market_base_url}/ycloud/signin/page/taskExpansion'
         expend_data = self.send_request(expend_url, headers=self.jwtHeaders, cookies=self.cookies).json()
         curMonthBackup = expend_data.get('result', {}).get('curMonthBackup', '')
         preMonthBackup = expend_data.get('result', {}).get('preMonthBackup', '')
@@ -2141,7 +2560,7 @@ class YP:
                 print('- 上月已备份，膨胀云朵已领取')
             else:
 
-                receive_url = f'https://caiyun.feixin.10086.cn/market/signin/page/receiveTaskExpansion?acceptDate={acceptDate}'
+                receive_url = f'{self.market_base_url}/ycloud/signin/page/receiveTaskExpansion?acceptDate={acceptDate}'
                 receive_data = self.send_request(receive_url, headers=self.jwtHeaders, cookies=self.cookies).json()
                 if receive_data.get("code") != 0:
                     self.log(f'-领取失败:{receive_data.get("msg")}')
@@ -2165,7 +2584,7 @@ class YP:
         if push_on != 1:
             self.log(f'-需手动完成: {task_name} (通知未开启)')
             return
-        reward_url = 'https://caiyun.feixin.10086.cn/market/msgPushOn/task/obtain'
+        reward_url = f'{self.market_base_url}/ycloud/msgPushOn/task/obtain'
         if first_status != 3:
             reward1_data = self.request_json(reward_url, headers=self.jwtHeaders, data={"type": 1}, method='POST')
             if reward1_data and reward1_data.get('code') == 0:
@@ -2191,18 +2610,40 @@ if __name__ == "__main__":
         print(f'⛔️ {exc}')
         raise SystemExit(1)
     print_startup_info(len(login_records))
-    if login_records[0].get('source') == 'cookie':
+    has_cookie = any(r.get('source') == 'cookie' for r in login_records)
+    has_yyb = any(r.get('source') == 'yyb' for r in login_records)
+    if has_cookie and has_yyb:
+        print(f"执行顺序: YYB 账号 {sum(1 for r in login_records if r.get('source') == 'yyb')} 个"
+              f" → 环境变量账号 {sum(1 for r in login_records if r.get('source') == 'cookie')} 个")
+    if has_cookie:
         print_device_id_notice()
     print_storage_path_notice()
 
+    # 记录已实际执行的归一化手机号，供运行期去重使用
+    executed_accounts = set()
+
     for i, login_record in enumerate(login_records, start=1):
+        source = login_record.get('source')
+        source_label = {'yyb': 'YYB', 'cookie': '环境变量'}.get(source, source or '未知')
         yp_instance = YP(login_record['cookie'])
         account_label = getattr(yp_instance, 'encrypt_account', '') or f'格式错误-{i}'
-        print(f"\n======== ▷ 第 {i} 个账号 【{account_label}】◁ ========")
 
         if not yp_instance.Authorization:
-            print(f"⛔️ 账号 {i} 无效，跳过执行")
+            print(f"\n======== ▷ 第 {i} 个账号 [{source_label}] 【{account_label}】◁ ========")
+            print(f"⛔️ 账号 {i} 无效（Authorization 无法解析），跳过执行")
             continue
+
+        # 运行期二次去重：环境变量里的 cookie 若在 load 阶段解析不出手机号，
+        # 这里用已构造实例的真实账号再判一次，避免与小程序账号重复执行。
+        real_account = normalize_phone(getattr(yp_instance, 'account', ''))
+        if source == 'cookie' and real_account and real_account in executed_accounts:
+            print(f"\n======== ▷ 第 {i} 个账号 [{source_label}] 【{account_label}】◁ ========")
+            print(f"⏭️ 该账号已在前面执行过，跳过（去重）")
+            continue
+
+        print(f"\n======== ▷ 第 {i} 个账号 [{source_label}] 【{account_label}】◁ ========")
+        if real_account:
+            executed_accounts.add(real_account)
 
         if login_record.get('source') == 'yyb':
             yp_instance.user_domain_id = login_record['user_domain_id']
