@@ -2,13 +2,15 @@
 # cron: 0 58 9,13 * * *
 # name: 电信光耀网龄
 """
-电信光耀网龄（2026.10.10-31）：签到、10/14点领取实物资格、通知。
-活动网址：https://apps.telefen.com/nstars/iage?promoid=e5db6cc35afadcef&channel=SWX
+电信光耀网龄 v2026.11.02.1（2026.11.1-30）：签到、10/14点领取实物资格、通知。
+活动网址：https://apps.telefen.com/nstars/iage?promoid=63db914eb803c94c&channel=SWX
 环境变量：
 必填 TELEFEN_AUTH：备注#手机号#服务密码#clientType#androidId
 获取地址：https://dx.lcmovie.qzz.io/
 依赖：requests、pycryptodome、certifi。通知复用青龙 notify.py。
 默认真实签到；仅09:58~10:00、13:58~14:00进入定点抢券。
+首签100积分商城优惠券；7日签到奖励按网龄分为生活好物3选1/音视频月卡7选1资格券。
+11月状态独立保存，只复用10月认证缓存；签到奖励不占随心领抢购停抢状态。
 脚本不兑换、不支付、不提交地址。
 """
 from __future__ import annotations
@@ -42,16 +44,17 @@ BASE = "https://apps.telefen.com"
 LOGIN_URL = "https://fnostelecomlogin.iepose.cn/api/step1_login"
 TICKET_URL = "https://appgologin.189.cn:9031/map/clientXML"
 ACTIVITY = "iage2026"
-SIGN_ID = "iage202610"
-CYCLE = "2026-10"
-SECKILL_ID = "202380"
+SIGN_ID = "iage202611"
+CYCLE = "2026-11"
+SECKILL_ID = "202388"
 MERCHANT_PROMO = "e4aaf9573aa5dff9"
-ACTIVITY_PROMO = "b7749bcd2c1139af"
-COUPONS = ("NCA5FF34FA9AE2A84B172F1DC1C", "NCA53044920834895C88C963C50", "NCA54F14E92B5AA9A357E2B39E8")
-OTHER_COUPONS = ("NCA146A4239ABF374F0337699F7", "NCA12C245A59584CD8F62281D6B", "NCA11C040EF85B7CE26DC80B27B")
+ACTIVITY_PROMO = "63db914eb803c94c"
+COUPONS = ("NCA5DD942278280DB75549C099B", "NCA5C4E4DE1A6D7E82A4934DA3A", "NCA56644B08AE431441DB8C7FA0")
+OTHER_COUPONS = ("NCA10D547CEAB703F06B4AB4FD8", "NCA19B04468B945F9A7D31710C1", "NCA11B443AA891C97DC6771CE1D")
+SIGN_COUPONS = ("NCA54C842A98F57DE9EA7A9879B", "NCA5AF240289A684C18D0CB9F99")
 ALL_COUPONS = COUPONS + OTHER_COUPONS
-YZ_PROVINCES = set("02,27,08,29,12,14,18,17,28,06,16,20,13,07,11,23,31,04,21,19".split(","))
-START_DAY, END_DAY = "2026-10-10", "2026-10-31"
+YZ_PROVINCES = set("02,27,08,29,12,14,18,17,28,06,16,20,13,07,11,23,31,04,21,19,10,30,26,09,15,22,24".split(","))
+START_DAY, END_DAY = "2026-11-01", "2026-11-30"
 PATTERN = re.compile(r"(?P<remark>[^#\r\n]+)#(?P<phone>1[3-9]\d{9})#(?P<password>[^#\r\n]+)#(?P<client_type>#[^#\r\n]+#[^#\r\n]+#[^#\r\n]+#)#(?P<encoded_id>[^#\r\n]+)")
 RECORD_PATTERN = re.compile(PATTERN.pattern.replace(r"(?P<encoded_id>[^#\r\n]+)", r"(?P<encoded_id>[2-9:;c-h]{16})"))
 DES_KEY = b"1234567`90koiuyhgtfrdews"
@@ -329,6 +332,14 @@ class Client:
         self.deadline, self.session = deadline, requests.Session()
         self.channel, self.info = "HGOKHD", None
         self.cache = store.read(account, "auth")
+        # Reuse authentication only. October's completed/claimed state stays untouched.
+        legacy_root = store.root.parent / ".telefen_iage_202610"
+        if not self.cache and store.root.name == ".telefen_iage_202611" and (legacy_root / ".salt").is_file():
+            legacy = Store(legacy_root)
+            cached = legacy.read(account, "auth")
+            if cached.get("fingerprint") == legacy.fingerprint(account):
+                self.cache = dict(cached, fingerprint=store.fingerprint(account))
+                store.save(account, "auth", self.cache)
         if self.cache.get("fingerprint") != store.fingerprint(account):
             self.cache = {}
         model, version = account.client_type.split("#")[3], account.client_type.split("#")[1]
@@ -503,6 +514,26 @@ class Context:
         self.lease.release()
 
 
+def sign_reward_status(ctx):
+    age = number((ctx.client.info.get("prodInfo") or {}).get("ageYear"), 0)
+    coupon = SIGN_COUPONS[int(age >= 15)]
+    reward = "音视频会员月卡7选1" if age >= 15 else "生活好物3选1"
+    android_tip = "请手动使用安卓手机登录中国电信APP，进入该账号的光耀网龄活动页，查看并领取/兑换签到奖励"
+    try:
+        rows = ctx.client.call("GET", "/nstars/api/coupon/usedcoupon", params={"couponIds": coupon, "noload": "true"})
+        row = next((r for r in rows if isinstance(r, dict) and r.get("couponId") == coupon), None) if isinstance(rows, list) else None
+        if row is None:
+            raise TaskError("签到奖励券查询缺项")
+        received = number(row.get("userReceivedCount"), 0) > 0 or number(row.get("userUnusedCount"), 0) > 0
+        ctx.state["sign_reward_confirmed"] = received
+        ctx.save()
+        if received:
+            return f"已确认{reward}资格券；{android_tip}，兑换需支付1积分，有效期以券面为准"
+        return f"{reward}资格券尚未确认到账；签到完成不代表获奖，名额有限；{android_tip}，实际到账以我的优惠券/订单为准"
+    except (TaskError, requests.RequestException):
+        return f"{reward}资格券查询未完成；{android_tip}，以我的优惠券/订单实际到账为准"
+
+
 def sign_progress(ctx):
     client, state = ctx.client, ctx.state
     data = client.call("POST", "/nstars/api/active/getSignIn", payload={"appId": SIGN_ID})
@@ -515,9 +546,8 @@ def sign_progress(ctx):
         state["sign_pending_day"] = ""
         state["sign_complete"] = True
         ctx.save()
-        age = number((client.info.get("prodInfo") or {}).get("ageYear"), 0)
-        ctx.summary = f"签到{count}/7，已完成7日；{'4' if age >= 15 else '2'}元话费档位，奖品/到账以我的订单为准"
-        ctx.log(ctx.summary + "（活动后按平台规则充值）")
+        ctx.summary = f"签到{count}/7，已完成7日；" + sign_reward_status(ctx)
+        ctx.log(ctx.summary)
         return
     if today:
         state["sign_pending_day"] = ""
@@ -559,6 +589,7 @@ def sign_progress(ctx):
         submitted = client.call("POST", "/nstars/api/active/signInN", payload={"activeIdWeb": SIGN_ID, "commoditys": SIGN_ID, "appCode": client.channel})
         if isinstance(submitted, dict) and submitted.get("outOrderId"):
             state["sign_reward_order_seen"] = True
+            state["sign_reward_order_day"] = number(submitted.get("totalCount"))
         checked = client.call("POST", "/nstars/api/active/getSignIn", payload={"appId": SIGN_ID})
         if not isinstance(checked, dict) or number(checked.get("canSignIn")) != 1 or number(checked.get("totalCount")) is None:
             raise TaskError("签到返回后尚未核实今日状态，保留待核验标记")
@@ -567,14 +598,19 @@ def sign_progress(ctx):
         if state["sign_count"] >= 7:
             state["sign_complete"] = True
             ctx.save()
-            ctx.summary = f"签到{state['sign_count']}/7，7日全部完成；{'4' if age >= 15 else '2'}元话费档位，请查我的订单，实际到账以平台为准"
+            ctx.summary = f"签到{state['sign_count']}/7，7日全部完成；" + sign_reward_status(ctx)
         else:
             ctx.summary = f"签到成功，累计{state['sign_count']}/7"
+            if state["sign_count"] == 1:
+                has_order = isinstance(submitted, dict) and bool(submitted.get("outOrderId"))
+                ctx.summary += "；首签100积分商城优惠券已返回订单，请查我的优惠券" if has_order else "；首签优惠券未返回奖励订单，可能名额已满，请查我的优惠券"
         ctx.log(ctx.summary)
     except BusinessError as error:
         state["sign_pending_day"] = ""
         ctx.save()
         ctx.summary = f"签到{count}/7，签到未成功：{error.code} {error.message}"
+        if count == 0 and (error.code == "0010" or "火爆" in error.message):
+            ctx.summary += "；请先手动使用安卓手机登录中国电信APP，进入该账号的光耀网龄活动页，再运行脚本签到"
         ctx.log(ctx.summary)
     except (TaskError, requests.RequestException):
         ctx.summary = f"签到{count}/7，提交结果待核验；本日不重复签到"
@@ -639,6 +675,17 @@ def prepare_rush(ctx):
         ctx.save()
         ctx.log("服务端记录本周期其他权益已领取，本周期不再抢实物资格")
         return False
+    light = ctx.client.call("GET", "/nstars/api/active/litUpAgeN")
+    if not isinstance(light, dict) or number(light.get("receiveCount"), 0) < 1:
+        ctx.log("本月随心领资格/次数尚未就绪，请本人到活动页核对，本场不抢")
+        return False
+    limits = ctx.client.call("POST", "/nstars/api/active/limitcoupon", payload={"appCode": ctx.client.channel,
+        "promoId": ACTIVITY_PROMO, "noload": True, "couponIds": ",".join(ALL_COUPONS)})
+    limit = next((r for r in limits if isinstance(r, dict) and str(r.get("spId")) == ctx.coupon), None) if isinstance(limits, list) else None
+    if limit is None or number(limit.get("status")) is None:
+        raise TaskError("11月资格券库存查询缺项，暂停该账户抢券")
+    if number(limit["status"]) != 0:
+        ctx.log("当前资格券库存不足；定点前不据此停抢，等待10/14点补量后提交")
     if ctx.state.get("rush_pending"):
         ctx.log("上次领取结果待核验，资产尚未确认；不重复抢，请本人核对后再解除待核验状态")
         return False
@@ -768,7 +815,7 @@ def notify(logger):
 
 
 def main(argv=None, auth_text=None, state_dir=None, clock=None):
-    ap = argparse.ArgumentParser(description="10月光耀网龄：签到、定时抢资格券；不代兑换")
+    ap = argparse.ArgumentParser(description="11月光耀网龄：签到、定时抢资格券；不代兑换")
     ap.add_argument("--query-only", action="store_true", help="只认证/查询，不签到、不领取")
     ap.add_argument("--no-notify", action="store_true", help="不调用青龙通知，仅打印")
     ap.add_argument("--clear-pending", metavar="备注", help="本人核对未领取后解除指定备注的未知领取锁；本次只查询")
@@ -776,12 +823,12 @@ def main(argv=None, auth_text=None, state_dir=None, clock=None):
     clock = clock or Clock()
     logger = Logger()
     if not START_DAY <= clock.now().strftime("%Y-%m-%d") <= END_DAY:
-        logger.log("不在2026年10月10日至31日活动期，未登录、未签到、未领券")
+        logger.log("不在2026年11月1日至30日活动期，未登录、未签到、未领券")
         return 0
     try:
         accounts = parse_accounts(auth_text if auth_text is not None else os.environ.get("TELEFEN_AUTH", ""))
         logger = Logger(accounts)
-        root = state_dir or os.environ.get("TELEFEN_STATE_DIR") or str(Path(__file__).resolve().parent / ".telefen_iage_202610")
+        root = state_dir or os.environ.get("TELEFEN_STATE_DIR") or str(Path(__file__).resolve().parent / ".telefen_iage_202611")
         store = Store(root)
         if args.clear_pending:
             selected = [a for a in accounts if a.remark == args.clear_pending]
