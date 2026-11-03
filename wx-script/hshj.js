@@ -1,21 +1,106 @@
 // name:红色火箭
 // cron: 26 10,13 * * *
-//  红色火箭（华泰基金指慧家）
-
-//  环境变量：
-//    YYB_SERVER         必填，格式：地址@账号ref，多账号换行
-//    YYB_API_KEY / YYB_PROTOCOL_TOKEN  可选，启用协议鉴权时配置
-//    WX_ID              可选，仅运行指定ref，格式：ref#备注，多账号换行或 & 分隔
-//    WECHAT_SERVER      可选，旧微信协议服务回退地址
-//    2026-10-30 手动领取版：签到、口令兑换、积分与红包记录查询。
-//    获得现金红包后请到小程序手动领取；不包含自动提现、领取或H5授权代码。
-
+// 红色火箭（华泰基金指慧家） 2026.11.02 单文件版
+//
+// 使用：复制本文件到青龙，添加定时任务 task 实际目录/hshj.js。
+// 必填 YYB_SERVER：你自己的已授权 YYB 地址@账号ref，多账号换行；例如 http://127.0.0.1:8000@1
+// 可选 YYB_API_KEY / YYB_PROTOCOL_TOKEN：YYB 启用协议鉴权时填写。
+// 可选 WX_ID：只运行指定 ref，格式 ref#备注，多账号换行或 & 分隔；默认读取 YYB_SERVER 全部账号。
+// Node.js >=18，无需安装 axios、Python、OCR 服务或手工下载模型。
+// 首次运行需联网并允许脚本目录写入，自动下载校验约88MB公开识别资源；以后使用本地缓存。
+// 功能：YYB登录、业务登录缓存、SM4加密、签到、每日活动/ROE口令查询与兑换、
+//       算术图形验证码本地识别、兑换记录独立核验、积分/红包记录查询、青龙账号汇总通知。
+// 现金红包一律提醒到小程序手动领取；不包含自动提现、自动领取及H5授权。
+// 通知自动使用青龙已有的 sendNotify 和通知环境变量，正文只显示账号汇总。
+// 可选 HSJJ_AUTO_CAPTCHA=0：关闭识别，需验证码时提醒手动完成；HSJJ_NOTIFY=0：关闭通知。
+// 可选 HSJJ_OCR_CACHE：识别资源缓存目录；HSJJ_ACTIVITY_PAGE_ID：活动备用页面ID。
+// 可选 WECHAT_SERVER：旧微信协议服务回退地址。无需填写 HSJJ_OCR_SOCKET。
+// 说明：仍需用户自己的有效 YYB 服务及授权；本文件不包含他人的账号、凭据或识别服务。
+// 命令：node hshj.js --help / --check-setup / --prepare-ocr / --test-ocr 图片.png
 
 'use strict';
 
-const axios = require('axios');
+const axios = createBuiltinHttp();
 const fs = require('fs');
 const pathMod = require('path');
+
+// Node 内置网络模块：不需要 npm 安装 axios。仅实现本脚本使用的请求接口。
+function createBuiltinHttp(defaults = {}) {
+    const request = async (config, redirects = 0) => {
+        const c = { ...defaults, ...config, headers: config._redirect ? { ...config.headers } : { ...defaults.headers, ...config.headers } };
+        const url = new URL(c.url, c.baseURL);
+        for (const [key, value] of Object.entries(c.params || {})) {
+            if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+        }
+        if (!['http:', 'https:'].includes(url.protocol)) throw new Error('不支持的请求协议');
+        let body = c.data;
+        if (body !== undefined && !Buffer.isBuffer(body) && typeof body !== 'string') {
+            body = JSON.stringify(body);
+            if (!Object.keys(c.headers).some(k => k.toLowerCase() === 'content-type')) c.headers['Content-Type'] = 'application/json';
+        }
+        if (body !== undefined) c.headers['Content-Length'] = Buffer.byteLength(body);
+        const timeout = c.timeout || 30000, maximum = c.maxContentLength || 4 * 1024 * 1024;
+        return new Promise((resolve, reject) => {
+            let timer;
+            const req = require(url.protocol === 'https:' ? 'https' : 'http').request(url, {
+                method: c.method || 'GET', headers: c.headers, socketPath: c.socketPath,
+            }, res => {
+                if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+                    res.resume(); clearTimeout(timer);
+                    // 只跟随公开下载的重定向；业务 POST 不自动重放、不转发授权。
+                    if (String(c.method || 'GET').toUpperCase() !== 'GET' || redirects >= 5) {
+                        reject(Object.assign(new Error('请求被重定向'), { code: 'EREDIRECT' })); return;
+                    }
+                    const next = new URL(res.headers.location, url);
+                    const headers = { ...c.headers };
+                    if (next.origin !== url.origin) for (const k of Object.keys(headers)) {
+                        if (/^(authorization|cookie|proxy-authorization)$/i.test(k)) delete headers[k];
+                    }
+                    resolve(request({ ...c, url: next.href, params: undefined, headers, _redirect: true }, redirects + 1)); return;
+                }
+                const chunks = []; let size = 0, failed = false;
+                res.on('data', chunk => {
+                    size += chunk.length;
+                    if (size > maximum) {
+                        failed = true; clearTimeout(timer);
+                        const error = Object.assign(new Error('响应过大'), { code: 'ETOOBIG' });
+                        reject(error); req.destroy(error);
+                    }
+                    else chunks.push(chunk);
+                });
+                res.on('error', reject);
+                res.on('aborted', () => { clearTimeout(timer); reject(Object.assign(new Error('响应连接中断'), { code: 'ECONNRESET' })); });
+                res.on('end', () => {
+                    clearTimeout(timer);
+                    if (failed) return;
+                    let bytes = Buffer.concat(chunks), data;
+                    try {
+                        const compression = res.headers['content-encoding'];
+                        if (compression === 'gzip') bytes = require('zlib').gunzipSync(bytes, { maxOutputLength: maximum });
+                        else if (compression === 'deflate') bytes = require('zlib').inflateSync(bytes, { maxOutputLength: maximum });
+                        else if (compression === 'br') bytes = require('zlib').brotliDecompressSync(bytes, { maxOutputLength: maximum });
+                        if (c.responseType === 'arraybuffer') data = bytes;
+                        else { data = bytes.toString('utf8'); try { data = JSON.parse(data); } catch {} }
+                    } catch (error) { reject(error); return; }
+                    const response = { status: res.statusCode, data, headers: res.headers };
+                    const valid = c.validateStatus || (status => status >= 200 && status < 300);
+                    if (valid(res.statusCode)) resolve(response);
+                    else reject(Object.assign(new Error('HTTP ' + res.statusCode), { code: 'EHTTP', response }));
+                });
+            });
+            req.on('error', error => { clearTimeout(timer); reject(error); });
+            timer = setTimeout(() => req.destroy(Object.assign(new Error('请求超时'), { code: 'ETIMEDOUT' })), timeout);
+            if (body !== undefined) req.write(body);
+            req.end();
+        });
+    };
+    const client = config => request(config);
+    client.get = (url, config = {}) => request({ ...config, method: 'GET', url });
+    client.post = (url, data, config = {}) => request({ ...config, method: 'POST', url, data });
+    client.create = config => createBuiltinHttp({ ...defaults, ...config });
+    return client;
+}
+
 
 // ==================== 内置 YYB-Go-Enhanced 适配 ====================
 function getYybEntries() {
@@ -139,7 +224,8 @@ function formatAccountSummary(account) {
     return '当前账号: ' + display + ' 当前积分: ' + currentPoint
         + ' 后端红包记录累计:' + formatMoney(historyAmount) + '元'
         + ' 需手动领取红包: ' + formatMoney(pendingAmount) + '元'
-        + (account.ok === false ? '（部分任务未完成）' : '');
+        + (account.roeOutcome ? ' 答题: ' + account.roeOutcome : '')
+        + (account.ok === false ? '（' + (account.taskIssues?.length ? account.taskIssues.join('；') : '部分任务未完成') + '）' : '');
 }
 
 async function push_notification(summaryLines = []) {
@@ -660,6 +746,386 @@ async function getEncryptKey(wxid) {
     return key;
 }
 
+// 商家图形验证和微信加密密钥都可能返回7005，提交前分别检查。
+function addTaskIssue(session, message) {
+    session.taskIssues = session.taskIssues || [];
+    if (!session.taskIssues.includes(message)) session.taskIssues.push(message);
+    log('  📲 ' + message);
+}
+
+// 严格计算算术表达式；不执行验证码文本。
+function calculateCaptcha(expression) {
+    const text = String(expression || '').normalize('NFKC').replace(/\s/g, '')
+        .replace(/[×xX]/g, '*').replace(/÷/g, '/').replace(/[−–]/g, '-');
+    const match = text.match(/^(\d{1,2})([+*/-])(\d{1,2})$/);
+    if (!match) return null;
+    const a = Number(match[1]), b = Number(match[3]);
+    let answer;
+    if (match[2] === '+') answer = a + b;
+    else if (match[2] === '-') answer = a - b;
+    else if (match[2] === '*') answer = a * b;
+    else if (b && a % b === 0) answer = a / b;
+    else return null;
+    return { expression: a + match[2] + b, answer: String(answer) };
+}
+
+// 内置本地 OCR：ONNX Runtime Web 1.23.2 (Microsoft, MIT) + ddddocr 1.6.1 (sml2h3, MIT)。
+// 上游：https://github.com/microsoft/onnxruntime / https://github.com/sml2h3/ddddocr
+// 首次运行只下载固定版本的公开资源；图片、账号和登录状态不会发送到识别平台。
+/* Third-party MIT notices: Copyright (c) Microsoft Corporation. All rights reserved.
+ * ddddocr: Copyright © 2022 <copyright holders>.
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of
+ * this software and associated documentation files (the "Software"), to deal in
+ * the Software without restriction, including without limitation the rights to
+ * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ * the Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions: The above copyright notice and this
+ * permission notice shall be included in all copies or substantial portions of
+ * the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+ * EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES
+ * OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ */
+const OCR_RESOURCES = {
+    'ort.wasm.min.js': 'c6bc9f8e1d0ecc3983a57910e6a30b2230a512bcd2e0207cd64306459c3de7b4',
+    'ort-wasm-simd-threaded.mjs': '90a557d15c02bac4504d95b67f431d8594635ed2a0a62a7f2cd83d090ff91d3e',
+    'ort-wasm-simd-threaded.wasm': '45eaee27761ad883742a8d4b8fce1538d60ce43b51adf1726fafccc59b8c1a15',
+    'common_old.onnx': 'b8f2ad9cbc1f2e3922a6cb9459e30824e7e2467f3fb4fd61420640e34ea0bf68',
+    'common.onnx': '33b5cd351ee94e73a6bf8fa18c415ed8b819b3ffd342e267c30d8ad8334e34e8',
+};
+const OCR_CHARSETS = {"default":{"78":"2","409":"7","462":"-","2382":"–","2879":"9","3766":"？","4410":"1","4450":"/","4569":"*","5225":"X","5260":"=","5378":"×","5806":"4","5807":"?","5961":"6","6178":"+","6736":"x","6749":"0","6977":"5","6979":"8","6995":"÷","7721":"3"},"beta":{"13":"6","235":"=","309":"3","521":"X","689":"x","770":"？","772":"/","1581":"?","2851":"2","3332":"-","3606":"4","4018":"1","4494":"–","4640":"÷","4725":"9","4733":"0","4919":"8","5223":"5","6470":"+","6732":"×","6794":"7","7502":"*"}};
+const OCR_CACHE = process.env.HSJJ_OCR_CACHE || pathMod.join(__dirname, '.cache', 'hshj-ocr-v1');
+let ocrPreparing, ocrRuntime, ocrSetupError;
+const ocrSessions = new Map();
+function ocrHash(bytes) { return require('crypto').createHash('sha256').update(bytes).digest('hex'); }
+function ocrFileValid(name) {
+    try { return ocrHash(fs.readFileSync(pathMod.join(OCR_CACHE, name))) === OCR_RESOURCES[name]; }
+    catch { return false; }
+}
+function ocrSave(name, bytes) {
+    if (ocrHash(bytes) !== OCR_RESOURCES[name]) throw new Error('识别资源校验失败：' + name);
+    const dest = pathMod.join(OCR_CACHE, name), tmp = dest + '.' + process.pid + '.tmp';
+    try { fs.writeFileSync(tmp, bytes, { mode: 0o600 }); fs.renameSync(tmp, dest); }
+    finally { try { fs.unlinkSync(tmp); } catch {} }
+}
+async function ocrDownload(urls, hash, maximum) {
+    let last;
+    for (const url of urls) {
+        try {
+            const response = await axios.get(url, { timeout: 180000, maxContentLength: maximum,
+                responseType: 'arraybuffer', headers: { 'User-Agent': 'hshj-single-file/2026.11.02', 'Accept-Encoding': 'identity' } });
+            const bytes = Buffer.from(response.data);
+            if (ocrHash(bytes) !== hash) throw new Error('公开资源校验不一致');
+            return bytes;
+        } catch (error) { last = error; }
+    }
+    throw Object.assign(new Error('识别资源下载失败，请检查首次运行的联网条件'), { code: last?.code || 'EOCRDOWNLOAD' });
+}
+function ocrZipEntry(zip, name) {
+    // 只读取校验过的 wheel 中两个固定模型，绝不解压任意目录。
+    let end = -1;
+    for (let i = zip.length - 22; i >= Math.max(0, zip.length - 65557); i--) {
+        if (zip.readUInt32LE(i) === 0x06054b50) { end = i; break; }
+    }
+    if (end < 0) throw new Error('模型压缩包不完整');
+    let offset = zip.readUInt32LE(end + 16);
+    for (let i = 0; i < zip.readUInt16LE(end + 10); i++) {
+        if (zip.readUInt32LE(offset) !== 0x02014b50) throw new Error('模型目录格式错误');
+        const length = zip.readUInt16LE(offset + 28), extra = zip.readUInt16LE(offset + 30), comment = zip.readUInt16LE(offset + 32);
+        if (zip.subarray(offset + 46, offset + 46 + length).toString() === name) {
+            const size = zip.readUInt32LE(offset + 20), outputSize = zip.readUInt32LE(offset + 24), at = zip.readUInt32LE(offset + 42);
+            if (outputSize > 60 * 1024 * 1024 || zip.readUInt32LE(at) !== 0x04034b50) throw new Error('模型大小或格式错误');
+            const start = at + 30 + zip.readUInt16LE(at + 26) + zip.readUInt16LE(at + 28);
+            const packed = zip.subarray(start, start + size), method = zip.readUInt16LE(offset + 10);
+            const bytes = method === 0 ? packed : method === 8 ? require('zlib').inflateRawSync(packed, { maxOutputLength: outputSize }) : null;
+            if (!bytes || bytes.length !== outputSize) throw new Error('模型解压失败');
+            return bytes;
+        }
+        offset += 46 + length + extra + comment;
+    }
+    throw new Error('模型压缩包缺少所需文件');
+}
+async function prepareLocalOcr() {
+    if (ocrPreparing) return ocrPreparing;
+    ocrPreparing = (async () => {
+        if (Number(process.versions.node.split('.')[0]) < 18) throw new Error('本脚本需要 Node.js 18 或更新版本');
+        fs.mkdirSync(OCR_CACHE, { recursive: true, mode: 0o700 });
+        const names = Object.keys(OCR_RESOURCES);
+        if (names.every(ocrFileValid)) return;
+        const lock = pathMod.join(OCR_CACHE, 'prepare.lock'); let locked = false;
+        for (let n = 0; n < 180; n++) {
+            try { fs.mkdirSync(lock); locked = true; break; }
+            catch (error) {
+                if (error.code !== 'EEXIST') throw error;
+                // 被中断的初始化在半小时后允许恢复；正常初始化始终持锁。
+                if (Date.now() - fs.statSync(lock).mtimeMs > 30 * 60000) { try { fs.rmdirSync(lock); } catch {} }
+                else if (names.every(ocrFileValid)) return;
+                else await sleep(1000);
+            }
+        }
+        if (!locked) throw new Error('另一进程仍在准备识别资源，请稍后重试');
+        try {
+            log('📦 首次运行或资源缺失：自动准备本地识别资源（约88MB下载，缓存后不再下载）');
+            for (const name of names.filter(n => !n.endsWith('.onnx'))) {
+                if (ocrFileValid(name)) continue;
+                const suffix = '/onnxruntime-web@1.23.2/dist/' + name;
+                const bytes = await ocrDownload(['https://cdn.jsdelivr.net/npm' + suffix, 'https://unpkg.com' + suffix], OCR_RESOURCES[name], 16 * 1024 * 1024);
+                ocrSave(name, bytes);
+            }
+            if (!ocrFileValid('common.onnx') || !ocrFileValid('common_old.onnx')) {
+                const suffix = '/packages/0e/48/cbaed3981b8d8d51141b9b4779b811f4728e65d952a1e3e2e5e929539183/ddddocr-1.6.1-py3-none-any.whl';
+                const wheel = await ocrDownload(['https://mirrors.huaweicloud.com/repository/pypi' + suffix,
+                    'https://files.pythonhosted.org' + suffix], 'c7c70f4ae2d0335440ae8b272eea48c9f6888ecef46785fe2311f0c97a133935', 80 * 1024 * 1024);
+                for (const name of ['common_old.onnx', 'common.onnx']) if (!ocrFileValid(name)) ocrSave(name, ocrZipEntry(wheel, 'ddddocr/' + name));
+            }
+            if (!names.every(ocrFileValid)) throw new Error('识别资源尚未准备完整');
+            log('✅ 本地识别资源已准备并通过完整性校验');
+        } finally { try { fs.rmdirSync(lock); } catch {} }
+    })();
+    try { await ocrPreparing; } catch (error) { ocrPreparing = undefined; throw error; }
+}
+async function getOcrSession(beta) {
+    if (ocrSetupError) throw ocrSetupError;
+    await prepareLocalOcr();
+    if (!ocrRuntime) {
+        ocrRuntime = require(pathMod.resolve(OCR_CACHE, 'ort.wasm.min.js'));
+        ocrRuntime.env.wasm.numThreads = 1;
+        ocrRuntime.env.wasm.wasmPaths = require('url').pathToFileURL(pathMod.resolve(OCR_CACHE) + pathMod.sep).href;
+        ocrRuntime.env.logLevel = 'error';
+    }
+    if (!ocrSessions.has(beta)) {
+        const model = fs.readFileSync(pathMod.join(OCR_CACHE, beta ? 'common.onnx' : 'common_old.onnx'));
+        const promise = ocrRuntime.InferenceSession.create(new Uint8Array(model), {
+            executionProviders: ['wasm'], graphOptimizationLevel: 'all', logSeverityLevel: 3,
+        });
+        ocrSessions.set(beta, promise);
+        try { await promise; } catch (error) { ocrSessions.delete(beta); throw error; }
+    }
+    return ocrSessions.get(beta);
+}
+async function closeLocalOcr() {
+    for (const promise of ocrSessions.values()) { try { await (await promise).release(); } catch {} }
+    ocrSessions.clear();
+}
+
+function decodeOcrPng(raw) {
+    if (raw.length > 131072 || raw.length < 33 || raw.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a') throw new Error('验证码不是受支持的PNG');
+    let w, h, type, channels, palette, end = false; const parts = [];
+    for (let p = 8; p + 12 <= raw.length;) {
+        const size = raw.readUInt32BE(p), name = raw.subarray(p + 4, p + 8).toString();
+        if (p + 12 + size > raw.length) throw new Error('PNG数据不完整');
+        const data = raw.subarray(p + 8, p + 8 + size);
+        if (name === 'IHDR') {
+            w = data.readUInt32BE(0); h = data.readUInt32BE(4); type = data[9]; channels = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 }[type];
+            if (w < 10 || h < 10 || w > 1024 || h > 256 || data[8] !== 8 || !channels || data[10] || data[11] || data[12]) throw new Error('验证码图片尺寸或格式不支持');
+        } else if (name === 'PLTE') palette = data;
+        else if (name === 'IDAT') parts.push(data);
+        else if (name === 'IEND') { end = true; break; }
+        p += size + 12;
+    }
+    if (!end || !channels || !parts.length || type === 3 && !palette) throw new Error('验证码PNG缺失数据');
+    const stride = w * channels, packed = require('zlib').inflateSync(Buffer.concat(parts), { maxOutputLength: (stride + 1) * h });
+    if (packed.length !== (stride + 1) * h) throw new Error('验证码PNG解压长度异常');
+    const pixels = new Uint8Array(stride * h), rgb = new Uint8Array(w * h * 3);
+    const paeth = (a, b, c) => { const p = a + b - c, da = Math.abs(p - a), db = Math.abs(p - b), dc = Math.abs(p - c); return da <= db && da <= dc ? a : db <= dc ? b : c; };
+    for (let y = 0; y < h; y++) {
+        const filter = packed[y * (stride + 1)];
+        if (filter > 4) throw new Error('未知PNG过滤方式');
+        for (let x = 0; x < stride; x++) {
+            const i = y * stride + x, a = x >= channels ? pixels[i - channels] : 0, b = y ? pixels[i - stride] : 0, c = y && x >= channels ? pixels[i - stride - channels] : 0;
+            pixels[i] = (packed[y * (stride + 1) + 1 + x] + [0, a, b, (a + b) >> 1, paeth(a, b, c)][filter]) & 255;
+        }
+    }
+    for (let i = 0; i < w * h; i++) {
+        if (type === 3) {
+            const at = pixels[i] * 3;
+            if (at + 2 >= palette.length) throw new Error('PNG调色板索引无效');
+            rgb.set(palette.subarray(at, at + 3), i * 3);
+        } else if (type === 0 || type === 4) rgb.fill(pixels[i * channels], i * 3, i * 3 + 3);
+        else rgb.set(pixels.subarray(i * channels, i * channels + 3), i * 3);
+    }
+    return { w, h, channels: 3, data: rgb };
+}
+function grayOcrImage(image, contrast = false) {
+    const data = new Uint8Array(image.w * image.h); let lo = 255, hi = 0;
+    for (let i = 0; i < data.length; i++) {
+        const p = i * 3; const value = image.channels === 1 ? image.data[i] : (19595 * image.data[p] + 38470 * image.data[p + 1] + 7471 * image.data[p + 2] + 32768) >> 16;
+        data[i] = value; lo = Math.min(lo, value); hi = Math.max(hi, value);
+    }
+    if (contrast && hi > lo) for (let i = 0; i < data.length; i++) data[i] = Math.max(0, Math.min(255, Math.floor((data[i] - lo) * 255 / (hi - lo))));
+    return { w: image.w, h: image.h, channels: 1, data };
+}
+function cropOcrImage(image) {
+    const w = Math.floor(image.w * .65), data = new Uint8Array(w * image.h * image.channels);
+    for (let y = 0; y < image.h; y++) data.set(image.data.subarray(y * image.w * image.channels, (y * image.w + w) * image.channels), y * w * image.channels);
+    return { w, h: image.h, channels: image.channels, data };
+}
+function resizeOcrImage(image, w, h) {
+    const sinc = v => Math.abs(v) < 1e-10 ? 1 : Math.sin(Math.PI * v) / (Math.PI * v);
+    const weights = (from, to) => Array.from({ length: to }, (_, i) => {
+        const scale = Math.max(1, from / to), center = (i + .5) * from / to;
+        const start = Math.max(0, Math.trunc(center - 3 * scale + .5)), end = Math.min(from, Math.trunc(center + 3 * scale + .5));
+        let sum = 0; const values = [];
+        for (let j = start; j < end; j++) { const x = (j - center + .5) / scale; const v = Math.abs(x) < 3 ? sinc(x) * sinc(x / 3) : 0; values.push(v); sum += v; }
+        return { start, values: values.map(v => v / sum) };
+    });
+    const xs = weights(image.w, w), ys = weights(image.h, h), c = image.channels;
+    const tmp = new Uint8Array(w * image.h * c), data = new Uint8Array(w * h * c);
+    const clip = v => Math.max(0, Math.min(255, Math.floor(v + .5)));
+    for (let y = 0; y < image.h; y++) for (let x = 0; x < w; x++) for (let k = 0; k < c; k++) {
+        const a = xs[x]; let v = 0;
+        for (let j = 0; j < a.values.length; j++) v += image.data[(y * image.w + a.start + j) * c + k] * a.values[j];
+        tmp[(y * w + x) * c + k] = clip(v);
+    }
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) for (let k = 0; k < c; k++) {
+        const a = ys[y]; let v = 0;
+        for (let j = 0; j < a.values.length; j++) v += tmp[((a.start + j) * w + x) * c + k] * a.values[j];
+        data[(y * w + x) * c + k] = clip(v);
+    }
+    return { w, h, channels: c, data };
+}
+function visibleOcrMinus(image) {
+    const left = Math.floor(image.w * .23), right = Math.floor(image.w * .44), w = right - left, h = image.h;
+    const hue = new Uint8Array(w * h), sat = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        const p = (y * image.w + left + x) * 3, r = image.data[p], g = image.data[p + 1], b = image.data[p + 2];
+        const max = Math.max(r, g, b), min = Math.min(r, g, b), delta = max - min;
+        let angle = !delta ? 0 : max === r ? 60 * ((g - b) / delta % 6) : max === g ? 60 * ((b - r) / delta + 2) : 60 * ((r - g) / delta + 4);
+        hue[y * w + x] = Math.round(((angle + 360) % 360) / 2) % 180;
+        sat[y * w + x] = max ? Math.round(delta * 255 / max) : 0;
+    }
+    for (let center = 0; center < 180; center += 15) {
+        const mask = new Uint8Array(w * h);
+        for (let i = 0; i < mask.length; i++) { const d = Math.abs(hue[i] - center); mask[i] = Math.min(d, 180 - d) <= 10 && sat[i] >= 80 ? 1 : 0; }
+        for (let i = 0; i < mask.length; i++) if (mask[i]) {
+            const queue = [i]; mask[i] = 0; let minX = w, maxX = 0, minY = h, maxY = 0;
+            for (let at = 0; at < queue.length; at++) {
+                const p = queue[at], x = p % w, y = Math.floor(p / w);
+                minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+                for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+                    const nx = x + dx, ny = y + dy, n = ny * w + nx;
+                    if (nx >= 0 && nx < w && ny >= 0 && ny < h && mask[n]) { mask[n] = 0; queue.push(n); }
+                }
+            }
+            const width = maxX - minX + 1, height = maxY - minY + 1;
+            if (queue.length >= 12 && width >= image.w * .12 && width / height >= 2.2 && height <= image.h * .25) return true;
+        }
+    }
+    return false;
+}
+async function recognizeCaptcha(encoded) {
+    if (typeof encoded !== 'string' || encoded.length > 180000) return null;
+    const base64 = encoded.replace(/^data:image\/png;base64,/, '');
+    if (!/^[A-Za-z0-9+/\s]*={0,2}$/.test(base64)) return null;
+    const image = decodeOcrPng(Buffer.from(base64, 'base64')), prefix = cropOcrImage(image);
+    const variants = [image, grayOcrImage(image, true), prefix, grayOcrImage(prefix, true)], minus = visibleOcrMinus(image);
+    const votes = new Map();
+    for (const beta of [false, true]) {
+        const session = await getOcrSession(beta), charset = OCR_CHARSETS[beta ? 'beta' : 'default'];
+        for (let i = 0; i < variants.length; i++) {
+            const variant = variants[i], w = Math.floor(variant.w * 64 / variant.h);
+            const normalized = grayOcrImage(resizeOcrImage(variant, w, 64));
+            const input = Float32Array.from(normalized.data, v => v / 255);
+            const result = await session.run({ input1: new ocrRuntime.Tensor('float32', input, [1, 1, 64, w]) });
+            const output = Object.values(result)[0], classes = output.dims[output.dims.length - 1];
+            if (output.dims.length !== 3 || classes !== 8210 || output.data.length > 2000000) throw new Error('识别模型输出格式异常');
+            let text = '', previous = -1;
+            for (let p = 0; p < output.data.length; p += classes) {
+                let index = 0;
+                for (let j = 1; j < classes; j++) if (output.data[p + j] > output.data[p + index]) index = j;
+                if (index && index !== previous) text += charset[index] ?? '?';
+                previous = index;
+            }
+            text = text.normalize('NFKC').replace(/\s/g, '').split('=')[0];
+            let parsed = calculateCaptcha(text);
+            if (!parsed && minus && i >= 2) {
+                const m = text.match(/^(\d{1,2})[^\d](\d{1,2})$/);
+                if (m) parsed = calculateCaptcha(m[1] + '-' + m[2]);
+            }
+            if (parsed) {
+                const count = (votes.get(parsed.expression) || 0) + 1; votes.set(parsed.expression, count);
+                if (count >= 2) return parsed;
+            }
+        }
+    }
+    return null;
+}
+
+
+async function checkTaskVerification(session, verificationCodeType, label) {
+    session.verificationAttempts = session.verificationAttempts || {};
+    const type = String(verificationCodeType);
+    while ((session.verificationAttempts[type] || 0) < 3) {
+        const response = await apiRequest('GET', '/fundex-activity/redPacket/getVerificationCode',
+            { verificationCodeType: type }, session.token, '', session.openId, session.userId, '', 0);
+        if (String(response?.code) !== '200' || typeof response?.data?.verifyCodeSwitch !== 'boolean') {
+            addTaskIssue(session, label + '验证状态查询失败，保留登录状态，稍后重试');
+            return { ok: false };
+        }
+        if (!response.data.verifyCodeSwitch) return { ok: true, required: false };
+        session.verificationAttempts[type] = (session.verificationAttempts[type] || 0) + 1;
+        if (process.env.HSJJ_AUTO_CAPTCHA === '0') {
+            addTaskIssue(session, label + '需图形验证码（自动识别已关闭），请在小程序手动完成');
+            return { ok: false };
+        }
+        if (!response.data.requestId || typeof response.data.verifyCodeBase64 !== 'string') {
+            addTaskIssue(session, label + '验证码响应不完整，请在小程序手动完成');
+            return { ok: false };
+        }
+        try {
+            const result = await recognizeCaptcha(response.data.verifyCodeBase64);
+            if (result) {
+                log('  🔎 ' + label + '验证码本地识别: ' + result.expression + '=' + result.answer);
+                return { ok: true, required: true, submitCode: result.answer, requestId: response.data.requestId };
+            }
+            log('  ⚠️ ' + label + '验证码识别不确定，准备获取新图（最多3张）');
+        } catch (error) {
+            addTaskIssue(session, label + '本地验证码识别组件不可用，请在小程序手动完成');
+            return { ok: false };
+        }
+        if (session.verificationAttempts[type] < 3) await sleep(2000);
+    }
+    addTaskIssue(session, label + '图形验证未完成（已达3次上限），请在小程序手动完成');
+    return { ok: false };
+}
+
+async function retryRejectedCaptcha(response, verification, session, type, label) {
+    const message = String(response?.msg || response?.message || '');
+    if (!verification.required || !/验证码/.test(message)) return false;
+    if ((session.verificationAttempts?.[type] || 0) < 3) {
+        log('  ⚠️ ' + label + '验证码被拒绝或过期，获取新图后重试');
+        await sleep(2000);
+        return true;
+    }
+    addTaskIssue(session, label + '验证码仍被拒绝，请在小程序手动完成');
+    return false;
+}
+
+async function readTodayExchange(session, activityId) {
+    const response = await apiRequest('GET', '/fundex-activity/watchWordCustom/getExchangeRequest',
+        { activityId, openId: session.openId }, session.token, '', session.openId, session.userId);
+    const today = new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
+    if (String(response?.code) !== '200' || !Array.isArray(response.data)) return null;
+    return response.data.find(item => String(item.activityId) === String(activityId)
+        && String(item.exchangeTime || '').startsWith(today)) || null;
+}
+
+async function exchangedToday(session, activityId) {
+    return Boolean(await readTodayExchange(session, activityId));
+}
+
+async function confirmExchange(session, activityId) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+        const record = await readTodayExchange(session, activityId);
+        if (record) return record;
+        if (attempt < 2) await sleep(1200);
+    }
+    return null;
+}
+
 // 签到
 async function doSign(session, wxid, cache, cacheKey) {
     const token = session.token;
@@ -681,6 +1147,8 @@ async function doSign(session, wxid, cache, cacheKey) {
             return true;
         }
     }
+    const verification = await checkTaskVerification(session, '2', '签到');
+    if (!verification.ok) return false;
     let encryptKeyData = { encryptKey: '', version: '' };
     try {
         encryptKeyData = await getEncryptKey(wxid);
@@ -692,7 +1160,7 @@ async function doSign(session, wxid, cache, cacheKey) {
         encryptKeyData = getEncryptKeyCache(cache, cacheKey);
     }
     // 2026-10-28：服务端已把 userSignIn 纳入 SM4 加密名单，明文 body 会返回 7005/7006(02)。
-    let signPayload = { submitCode: '', requestId: '' };
+    let signPayload = { submitCode: verification.submitCode || '', requestId: verification.requestId || '' };
     if (encryptKeyData.encryptKey) {
         try {
             const kb = hexToBytes(Buffer.from(encryptKeyData.encryptKey, 'base64').toString('hex'));
@@ -708,7 +1176,11 @@ async function doSign(session, wxid, cache, cacheKey) {
     }
     if (!signPayload.msg) { log('  ⚠️ 无有效小程序密钥，停止签到写入'); return false; }
     const resp = await apiRequest('POST', '/fundex-activity/point/sign/userSignIn', signPayload,
-        token, encryptKeyData.version || '', openId, userId, encryptKeyData.encryptKey || '');
+        token, encryptKeyData.version || '', openId, userId, encryptKeyData.encryptKey || '', 0);
+    if (verification.required && /验证码/.test(String(resp?.msg || resp?.message || ''))) {
+        if (await retryRejectedCaptcha(resp, verification, session, '2', '签到')) return await doSign(session, wxid, cache, cacheKey);
+        return false;
+    }
     if ((resp?.code === '429' || /访问过于频繁|请稍后再试/.test(resp?.msg || resp?.message || '')) && (session._sign429RetryCount || 0) < 3) {
         session._sign429RetryCount = (session._sign429RetryCount || 0) + 1;
         const waitMs = 5000 + randomInt(0, 2000) + (session._sign429RetryCount - 1) * 3000;
@@ -777,6 +1249,14 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
         return { success: true, skipped: true, status: activityStatus };
     }
     log('  📋 活动: ' + activity.title + ` | status=${activityStatus || '-'}`);
+    const currentActivityId = activity?.activitystatusResponseVo?.activityId || activity.id;
+    if (await exchangedToday(session, currentActivityId)) {
+        log('  ✅ 今日口令已兑换（已核对兑换记录）');
+        return { success: true, alreadyDone: true };
+    }
+    const verification = await checkTaskVerification(session, '1', '答题');
+    if (!verification.ok) return { success: false };
+
     // 提交加密接口前必须尽量使用最新 encryptKey/version。
     // 0624 抓包中手动提交为 key_version=9，而旧缓存 version=7 会触发 7005。
     // 因此这里先刷新，刷新失败才兜底使用缓存。
@@ -823,8 +1303,9 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
         watchword: roeAnswer,
         openId: openId,
         activityId: exchangeActivityId,
-        activityTemplateId: Number(activity && activity.activityTemplateId ? activity.activityTemplateId : 0),
+        activityTemplateId: Number(activity.activityTemplateId || activity.id || pageActivityId),
         registerChannel: registerChannel,
+        ...(verification.required ? { submitCode: verification.submitCode, requestId: verification.requestId } : {}),
     };
     log('  🎯 兑换活动ID: ' + exchangeActivityId);
 
@@ -860,9 +1341,22 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
         openId,
         loginData.userId,
         encryptKeyData.encryptKey,
-        3,
+        0,
         { registerChannel }
     );
+    if (!resp) {
+        const record = await confirmExchange(session, exchangeActivityId);
+        if (record) {
+            log('  ✅ 提交响应未收到，但已独立确认当天兑换记录；不重复提交');
+            return { success: true, alreadyDone: true, recoveredFromRecord: true, outcome: String(record.rewardType) === '4' ? '已完成，未中奖' : '已完成，已核对兑换记录' };
+        }
+        addTaskIssue(session, '答题提交结果未知，尚未查到兑换记录，请稍后复核');
+        return { success: false };
+    }
+    if (verification.required && /验证码/.test(String(resp.msg || resp.message || ''))) {
+        if (await retryRejectedCaptcha(resp, verification, session, '1', '答题')) return await doRoeReward(session, wxid, cache, cacheKey, activityEntry);
+        return { success: false };
+    }
     if ((resp?.code === '429' || /访问过于频繁|请稍后再试/.test(resp?.msg || resp?.message || '')) && (session._roe429RetryCount || 0) < 3) {
         session._roe429RetryCount = (session._roe429RetryCount || 0) + 1;
         const waitMs = 5000 + randomInt(0, 2000) + (session._roe429RetryCount - 1) * 3000;
@@ -882,8 +1376,18 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
             if (fresh) { Object.assign(session, fresh); return await doRoeReward(session, wxid, cache, cacheKey, activityEntry); }
         } catch (e) { log('  ⚠️ 小程序会话同步失败：' + e.message); }
     }
-    if (resp?.code === '200') {
+    if (String(resp?.code) === '200') {
         const data = resp.data;
+        const record = await confirmExchange(session, exchangeActivityId);
+        if (!record) {
+            addTaskIssue(session, '答题接口返回成功，但兑换记录尚待核验，请稍后复核');
+            return { success: false };
+        }
+        log('  ✅ 已独立确认当天新增兑换记录');
+        if (String(data?.rewardType) === '4') {
+            log('  ✅ 本次答题完成，未中奖（非执行失败）');
+            return { success: true, type: 'none', amount: 0, data, activity, outcome: '已完成，未中奖' };
+        }
         if (data?.rewardAmount) {
             // rewardType=2 对应微信红包，rewardAmount 是元；不是积分。
             const isRedPacket = String(data.rewardType || '') === '2' || data.link || data.tickCode;
@@ -892,18 +1396,20 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
 
 
                 return {
-                    success: true, type: 'redPacket', amount: Number(data.rewardAmount) || 0, data,
+                    success: true, type: 'redPacket', outcome: '已完成，现金奖励' + formatMoney(data.rewardAmount) + '元（手动领取）', amount: Number(data.rewardAmount) || 0, data,
                     activity,
                 };
             }
             log('  🎉 兑换成功! 标题: ' + (data.title || roeAnswer) + ' 积分: ' + data.rewardAmount);
-            return { success: true, type: 'point', amount: Number(data.rewardAmount) || 0, data, activity };
+            return { success: true, type: 'point', outcome: '已完成，获得' + data.rewardAmount + '积分', amount: Number(data.rewardAmount) || 0, data, activity };
         }
         log('  ⚠️ ' + (data?.content || JSON.stringify(data)));
         return { success: false };
     }
     if (String(resp?.code) === '9001' && /超过单人限兑|已参与|已兑换/.test(resp?.msg || resp?.message || '')) {
-        log('  ✅ 今日口令已兑换'); return { success: true, alreadyDone: true };
+        if (await confirmExchange(session, exchangeActivityId)) { log('  ✅ 今日口令已兑换（已核对兑换记录）'); return { success: true, alreadyDone: true }; }
+        addTaskIssue(session, '服务端提示已参与，但兑换记录尚待核验');
+        return { success: false };
     }
     log('  ⚠️ 提交失败: ' + (resp?.message || resp?.msg || ('code=' + resp?.code)));
     return { success: false };
@@ -1098,7 +1604,7 @@ async function runTask(accountInfo) {
         }
 
 
-        return { success: Boolean(signOk && roeResult?.success && currentPoint !== null), currentPoint, roeReward, redPacketAmount, historyRedPacketAmount, pendingRedPacketAmount };
+        return { success: Boolean(signOk && roeResult?.success && currentPoint !== null), currentPoint, roeReward, redPacketAmount, historyRedPacketAmount, pendingRedPacketAmount, taskIssues: session.taskIssues || [], roeOutcome: roeResult?.outcome || (roeResult?.alreadyDone ? '今日已完成' : '') };
 
     } catch (e) {
         log('❌ 异常: ' + e.message);
@@ -1113,7 +1619,7 @@ async function main() {
     log('📲 手动领取版：现金红包需在小程序中自行领取');
 
     if (!taskVar.trim()) {
-        log('环境变量未设置: ' + ckName);
+        log('请配置自己的 YYB_SERVER（YYB地址@账号ref，多账号换行），账号须先在 YYB 中授权。');
         await push_notification();
         process.exit(0);
     }
@@ -1131,6 +1637,10 @@ async function main() {
     }
 
     log('📋 账号数: ' + accounts.length);
+    if (process.env.HSJJ_AUTO_CAPTCHA !== '0') {
+        try { await prepareLocalOcr(); }
+        catch (error) { ocrSetupError = error; log('⚠️ ' + error.message + '；其余功能继续，需验证码的任务会提醒手动完成'); }
+    }
 
     let successCount = 0;
     for (let i = 0; i < accounts.length; i++) {
@@ -1140,6 +1650,8 @@ async function main() {
                 if (result.success) successCount++;
                 accounts[i].completed = true;
                 accounts[i].ok = result.success;
+                accounts[i].taskIssues = result.taskIssues || [];
+                accounts[i].roeOutcome = result.roeOutcome || '';
                 accounts[i].currentPoint = result.currentPoint;
                 accounts[i].roeReward = result.roeReward || 0;
                 accounts[i].redPacketAmount = result.redPacketAmount || 0;
@@ -1166,7 +1678,39 @@ async function main() {
     await push_notification(summaryLines);
 }
 
-if (require.main === module) main().catch(e => { log('❌ 脚本异常: ' + e.message); process.exitCode = 1; });
+async function runCli() {
+    const args = process.argv.slice(2);
+    if (args.includes('--help')) {
+        log('红色火箭单文件版：Node.js >=18，青龙或直接 node hshj.js 运行。');
+        log('必填 YYB_SERVER=你自己的YYB地址@已授权账号ref，多账号换行；如开启鉴权，再填 YYB_API_KEY。');
+        log('首次运行自动准备本地识别资源（需联网和约90MB磁盘空间），不用安装其他依赖。');
+        log('现金红包请在小程序手动领取；青龙通知只包含账号汇总。');
+        log('--check-setup 检查配置；--prepare-ocr 只准备识别资源；--test-ocr 图片.png 只测试本地图片。');
+        return;
+    }
+    if (args.includes('--check-setup')) {
+        log('Node.js: ' + process.versions.node + '（要求>=18）');
+        log('YYB 配置账号: ' + YYB_ENTRIES.length + '（不在检查模式中请求或展示凭据）');
+        log('识别资源: ' + (Object.keys(OCR_RESOURCES).every(ocrFileValid) ? '完整且校验通过' : '首次运行将自动准备'));
+        log('青龙通知: ' + (loadQinglongNotifier() ? '可用' : '未找到，汇总仍输出到日志'));
+        return;
+    }
+    try {
+        if (args.includes('--prepare-ocr')) { await prepareLocalOcr(); await getOcrSession(false); log('✅ 单文件识别组件可用'); return; }
+        if (args[0] === '--test-ocr') {
+            if (args.length < 2) throw new Error('请提供本地PNG图片路径');
+            for (const filename of args.slice(1)) {
+                const result = await recognizeCaptcha(fs.readFileSync(filename).toString('base64'));
+                log(pathMod.basename(filename) + ': ' + (result ? result.expression + '=' + result.answer : '无法可靠识别'));
+                if (!result) process.exitCode = 1;
+            }
+            return;
+        }
+        await main();
+    } finally { await closeLocalOcr(); }
+}
+if (require.main === module) runCli().catch(e => { log('❌ 脚本异常: ' + e.message); process.exitCode = 1; });
 module.exports = { main, apiRequest, checkCachedLogin, getWxCode, getOpenIdAndUnionId, getEncryptKey,
     loadCache, discoverActivityEntry, doRoeReward, extractFanActivityFromHome, todayMMdd, runTask,
-    sm4Encrypt, buildHeaders, summarizeManualRedPackets, formatAccountSummary, push_notification };
+    sm4Encrypt, buildHeaders, summarizeManualRedPackets, formatAccountSummary, push_notification,
+    prepareLocalOcr, recognizeCaptcha, closeLocalOcr };
