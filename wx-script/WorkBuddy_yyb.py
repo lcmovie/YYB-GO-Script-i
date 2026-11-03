@@ -433,6 +433,8 @@ def want(*codes):
 # ============================================================================ #
 # YYB 账号配置与凭据缓存
 # ============================================================================ #
+YYB_KEY = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
+
 class SafeError(Exception):
     """Messages contain only stage names and numeric response codes."""
 
@@ -626,9 +628,14 @@ class Client:
 
     def yyb_code(self, route, extra=None):
         payload = {"ref": self.account.ref, "app_id": APP_ID}
+        headers = {
+            "Content-Type": "application/json"
+        }
+        if YYB_KEY:
+            headers["Authorization"] = YYB_KEY if " " in YYB_KEY else "Bearer " + YYB_KEY
         if extra:
             payload.update(extra)
-        reply = self.request("POST", self.account.server + route, payload)
+        reply = self.request("POST", self.account.server + route, payload, headers)
         result = reply.data.get("result", {})
         code = result.get("code") if isinstance(result, dict) else None
         if not reply.ok or not isinstance(code, str) or len(code) < 8:
@@ -653,13 +660,18 @@ class Client:
     def login(self):
         payload = {"login_method": "weixin", "platform": "workbuddy_mp",
                    "code": self.yyb_code("/wxapp/getCode")}
-        reply = self.request("POST", LOGIN_URL, payload)
+        headers = {
+            "Content-Type": "application/json"
+        }
+        if YYB_KEY:
+            headers["Authorization"] = YYB_KEY if " " in YYB_KEY else "Bearer " + YYB_KEY
+        reply = self.request("POST", LOGIN_URL, payload, headers)
         if reply.code == 14713:
             for attempt in range(2):
                 phone_code = self.yyb_code("/wxapp/getPhoneNumber")
                 payload = {"login_method": "weixin", "platform": "workbuddy_mp",
                            "code": self.yyb_code("/wxapp/getCode"), "phone_code": phone_code}
-                reply = self.request("POST", LOGIN_URL, payload)
+                reply = self.request("POST", LOGIN_URL, payload, headers)
                 if reply.code != 14714 or attempt == 1:
                     break
         if not reply.ok:
