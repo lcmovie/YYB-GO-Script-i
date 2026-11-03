@@ -2,7 +2,7 @@
 # cron: 0 58 9,13 * * *
 # name: 电信光耀网龄
 """
-电信光耀网龄 v2026.11.02.1（2026.11.1-30）：签到、10/14点领取实物资格、通知。
+电信光耀网龄 v2026.11.03.1（2026.11.1-30）：签到、10/14点领取实物资格、通知。
 活动网址：https://apps.telefen.com/nstars/iage?promoid=63db914eb803c94c&channel=SWX
 环境变量：
 必填 TELEFEN_AUTH：备注#手机号#服务密码#clientType#androidId
@@ -11,6 +11,7 @@
 默认真实签到；仅09:58~10:00、13:58~14:00进入定点抢券。
 首签100积分商城优惠券；7日签到奖励按网龄分为生活好物3选1/音视频月卡7选1资格券。
 11月状态独立保存，只复用10月认证缓存；签到奖励不占随心领抢购停抢状态。
+默认保存签到响应及异常的脱敏诊断记录至状态目录/diagnostics；TELEFEN_DIAGNOSTICS=0可关闭。
 脚本不兑换、不支付、不提交地址。
 """
 from __future__ import annotations
@@ -331,6 +332,8 @@ class Client:
         self.account, self.store, self.clock, self.logger = account, store, clock, logger
         self.deadline, self.session = deadline, requests.Session()
         self.channel, self.info = "HGOKHD", None
+        self.diagnostic_trace = []
+        self.diagnostics_enabled = os.environ.get("TELEFEN_DIAGNOSTICS", "1").lower() not in ("0", "false", "off")
         self.cache = store.read(account, "auth")
         # Reuse authentication only. October's completed/claimed state stays untouched.
         legacy_root = store.root.parent / ".telefen_iage_202610"
@@ -360,9 +363,110 @@ class Client:
         else:
             kwargs.setdefault("timeout", (5, 20))
         start = time.time()
-        response = self.session.request(method, url, allow_redirects=False, **kwargs)
+        try:
+            response = self.session.request(method, url, allow_redirects=False, **kwargs)
+        except requests.RequestException as error:
+            self.observe_diagnostic(method, url, kwargs, error=error)
+            raise
         self.clock.observe(response, start, time.time())
+        self.observe_diagnostic(method, url, kwargs, response=response)
         return response
+
+    def diagnostic_clean(self, value):
+        text = str(value or "")
+        login = self.cache.get("app_login") or {}
+        private = [self.cache.get("cookie"), login.get("token"), login.get("userId")]
+        private.extend(cookie.value for cookie in self.session.cookies)
+        for secret in private:
+            if secret:
+                text = text.replace(str(secret), "[凭据隐藏]")
+        text = re.sub(r"(?i)(token|cookie|ticket|password|authorization)\s*[:=]\s*[^\s,;]+", r"\1=[隐藏]", text)
+        return self.logger.clean(text)
+
+    def observe_diagnostic(self, method, url, kwargs, response=None, error=None):
+        if not self.diagnostics_enabled:
+            return
+        try:
+            uri = urlsplit(url)
+            if uri.hostname != "apps.telefen.com":
+                return  # Never inspect the login site's password/token or ticket XML bodies.
+            record = {"at": self.clock.now().isoformat(), "method": method, "host": uri.hostname, "path": uri.path}
+            payload = kwargs.get("json")
+            params = kwargs.get("params")
+            record["query_keys"] = sorted(str(k) for k in params) if isinstance(params, dict) else sorted(parse_qs(uri.query))
+            record["payload_keys"] = sorted(str(k) for k in payload) if isinstance(payload, dict) else []
+            public = ("appId", "activeId", "activeIdWeb", "seckillId", "commoditys", "appCode")
+            record["public_payload"] = {k: str(payload[k])[:128] for k in public if isinstance(payload, dict) and k in payload and re.fullmatch(r"[A-Za-z0-9_,.-]{1,128}", str(payload[k]))}
+            reason = "transport_error" if error else None
+            if error:
+                record["error_type"] = type(error).__name__
+            else:
+                headers = response.headers
+                prepared = getattr(response, "request", None)
+                request_headers = getattr(prepared, "headers", {}) or {}
+                record["request_header_names"] = sorted(str(k).lower() for k in request_headers)
+                record["request_headers"] = {k: self.diagnostic_clean(request_headers.get(k)) for k in ("Content-Type", "Accept", "Origin", "appCode", "X-Requested-With") if request_headers.get(k)}
+                if request_headers.get("Referer"):
+                    referer = urlsplit(request_headers["Referer"])
+                    record["referer"] = {"host": referer.hostname, "path": referer.path}
+                ua = str(request_headers.get("User-Agent", "")).split(";")
+                record["client_profile"] = {k: v for k, v in zip(("family", "version", "platform", "os_version"), ua[:4]) if re.fullmatch(r"[A-Za-z0-9 ._-]{1,32}", v)} if ua[0] == "CtClient" else {"family": "browser_or_other"}
+                record["request_cookie_names"] = sorted({part.strip().split("=", 1)[0] for part in request_headers.get("Cookie", "").split(";") if "=" in part})
+                record["http"] = response.status_code
+                record["response_header_names"] = sorted(str(k).lower() for k in headers)
+                record["response_headers"] = {k: self.diagnostic_clean(headers.get(k)) for k in ("Content-Type", "Date", "Server", "Request-Id") if headers.get(k)}
+                lines = response.raw.headers.getlist("Set-Cookie") if getattr(getattr(response, "raw", None), "headers", None) is not None and hasattr(response.raw.headers, "getlist") else [headers.get("Set-Cookie", "")]
+                record["set_cookie_names"] = sorted({line.split("=", 1)[0].strip() for line in lines if line})
+                if headers.get("Location"):
+                    location = urlsplit(urljoin(url, headers["Location"]))
+                    record["redirect"] = {"host": location.hostname, "path": location.path}
+                record["body_bytes"] = len(response.content)
+                record["body_sha256"] = hashlib.sha256(response.content).hexdigest()
+                try:
+                    body = response.json()
+                except ValueError:
+                    body = None
+                if isinstance(body, dict):
+                    record["json_keys"] = sorted(str(k) for k in body)
+                    record["business_code"] = self.diagnostic_clean(body.get("errCode"))
+                    record["business_message"] = self.diagnostic_clean(body.get("errMsg"))
+                    data = body.get("data")
+                    if isinstance(data, dict):
+                        record["data_keys"] = sorted(str(k) for k in data)
+                        record["sign_status"] = {k: number(data[k]) for k in ("totalCount", "canSignIn") if k in data}
+                        record["reward_order_present"] = bool(data.get("outOrderId"))
+                    if str(body.get("errCode", "0000")) != "0000":
+                        reason = "business_error"
+                elif uri.path.startswith("/nstars/api/") or uri.path.startswith("/nstars/activenew/api/"):
+                    reason = "non_json_api_response"
+                if response.status_code >= 400:
+                    reason = "http_error"
+                text = response.text
+                record["html"] = bool(re.search(r"<(?:!doctype|html|script)\b", text, re.I))
+                if record["html"]:
+                    record["challenge_markers"] = [x for x in ("$_ts", "reese84", "Incapsula", "riversecurity", "FSSBB", "acw_sc__", "captcha") if x.lower() in text.lower()]
+                    record["script_paths"] = [{"host": urlsplit(urljoin(url, src)).hostname, "path": urlsplit(urljoin(url, src)).path} for src in re.findall(r'<script[^>]+src=["\x27]([^"\x27]+)', text, re.I)[:12]]
+                if uri.path.endswith("/active/signInN"):
+                    reason = reason or "sign_response"
+            self.diagnostic_trace.append(record)
+            self.diagnostic_trace[:] = self.diagnostic_trace[-12:]
+            if reason:
+                self.save_diagnostic(reason)
+        except Exception:
+            self.logger.log(f"[{self.account.label}] 诊断信息采集未完成，原任务流程继续")
+
+    def save_diagnostic(self, reason):
+        try:
+            directory = self.store.root / "diagnostics" / self.clock.now().strftime("%Y-%m-%d")
+            directory.mkdir(parents=True, exist_ok=True)
+            if os.name != "nt":
+                os.chmod(directory.parent, 0o700)
+                os.chmod(directory, 0o700)
+            path = directory / (self.store.key(self.account)[:16] + "-" + self.clock.now().strftime("%H%M%S") + "-" + secrets.token_hex(4) + ".json")
+            atomic_json(path, {"schema": 1, "reason": reason, "account": self.diagnostic_clean(self.account.label), "trace": self.diagnostic_trace})
+            self.logger.log(f"[{self.account.label}] 已保存脱敏诊断：{path}")
+        except Exception:
+            self.logger.log(f"[{self.account.label}] 脱敏诊断保存失败，原任务流程继续")
 
     def call(self, method, path, params=None, payload=None):
         if not path.startswith("/nstars/") or "?" in path:
@@ -518,7 +622,7 @@ def sign_reward_status(ctx):
     age = number((ctx.client.info.get("prodInfo") or {}).get("ageYear"), 0)
     coupon = SIGN_COUPONS[int(age >= 15)]
     reward = "音视频会员月卡7选1" if age >= 15 else "生活好物3选1"
-    android_tip = "请手动使用安卓手机登录中国电信APP，进入该账号的光耀网龄活动页，查看并领取/兑换签到奖励"
+    manual_tip = "请手动使用中国电信APP登录该账号，进入光耀网龄活动页，查看并领取/兑换签到奖励"
     try:
         rows = ctx.client.call("GET", "/nstars/api/coupon/usedcoupon", params={"couponIds": coupon, "noload": "true"})
         row = next((r for r in rows if isinstance(r, dict) and r.get("couponId") == coupon), None) if isinstance(rows, list) else None
@@ -528,10 +632,10 @@ def sign_reward_status(ctx):
         ctx.state["sign_reward_confirmed"] = received
         ctx.save()
         if received:
-            return f"已确认{reward}资格券；{android_tip}，兑换需支付1积分，有效期以券面为准"
-        return f"{reward}资格券尚未确认到账；签到完成不代表获奖，名额有限；{android_tip}，实际到账以我的优惠券/订单为准"
+            return f"已确认{reward}资格券；{manual_tip}，兑换需支付1积分，有效期以券面为准"
+        return f"{reward}资格券尚未确认到账；签到完成不代表获奖，名额有限；{manual_tip}，实际到账以我的优惠券/订单为准"
     except (TaskError, requests.RequestException):
-        return f"{reward}资格券查询未完成；{android_tip}，以我的优惠券/订单实际到账为准"
+        return f"{reward}资格券查询未完成；{manual_tip}，以我的优惠券/订单实际到账为准"
 
 
 def sign_progress(ctx):
@@ -610,7 +714,7 @@ def sign_progress(ctx):
         ctx.save()
         ctx.summary = f"签到{count}/7，签到未成功：{error.code} {error.message}"
         if count == 0 and (error.code == "0010" or "火爆" in error.message):
-            ctx.summary += "；请先手动使用安卓手机登录中国电信APP，进入该账号的光耀网龄活动页，再运行脚本签到"
+            ctx.summary += "；可尝试手动使用中国电信APP登录该账号并进入光耀网龄活动页后再运行；仍失败请保留诊断记录，原因尚待核验"
         ctx.log(ctx.summary)
     except (TaskError, requests.RequestException):
         ctx.summary = f"签到{count}/7，提交结果待核验；本日不重复签到"
