@@ -113,6 +113,14 @@ another_account@example.com#your_password#YOUR_TOTP_SECRET
 task lcmovie_YYB-GO-Script-i_main/idp-script/microsoft_rewards.js -- --check-config
 ```
 
+## 红色火箭配置
+
+`wx-script/hshj.js` 为单文件版，需要 Node.js 18 或更新版本。配置自己的 `YYB_SERVER`，格式为 `YYB地址@已授权账号ref`，多账号换行；若 YYB 启用协议鉴权，再配置 `YYB_API_KEY` 或 `YYB_PROTOCOL_TOKEN`。账号须先在自己的 YYB 服务中授权。`WX_ID` 可不填，默认运行全部配置账号，也可用 `ref#备注` 指定账号。
+
+脚本包含签到、每日活动发现、ROE口令查询与兑换、算术图形验证码本地识别、兑换记录核验、积分与红包记录查询。无需安装 axios、Python 或额外部署识别服务。首次运行需联网并允许缓存目录写入，自动下载并校验约88MB固定版本识别资源，缓存需约90MB空间，后续复用本地缓存。识别不确定时最多换三张图，仍不能识别则提示手动完成，不保证所有验证码都能自动识别。
+
+现金红包均需在小程序手动领取，不包含自动领取、提现或 H5 授权。通知沿用青龙已有 `sendNotify` 模块与渠道设置，正文只含账号汇总；没有可用通知模块时保留日志汇总。`HSJJ_AUTO_CAPTCHA=0` 关闭验证码识别，`HSJJ_NOTIFY=0` 关闭通知，`HSJJ_OCR_CACHE` 可指定识别资源目录。用 `node hshj.js --help` 查看说明，`--check-setup` 检查配置，`--prepare-ocr` 只初始化识别资源。
+
 ## 注意事项
 
 - 微信登录 code 通常只能使用一次，多个微信任务请错开运行时间。
