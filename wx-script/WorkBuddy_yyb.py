@@ -607,11 +607,11 @@ class Client:
         self.reauthenticated = False
         self.report = {}
 
-    def request(self, method, url, payload=None, headers=None):
+    def request(self, method, url, payload=None, headers=None, *, verify=None):
         try:
             response = self.session.request(
                 method, url, json=payload, headers=headers or HEADERS,
-                timeout=(10, 25), allow_redirects=False,
+                timeout=(10, 25), allow_redirects=False, verify=verify,
             )
         except requests.RequestException:
             raise SafeError("网络请求失败或超时") from None
@@ -628,7 +628,20 @@ class Client:
         payload = {"ref": self.account.ref, "app_id": APP_ID}
         if extra:
             payload.update(extra)
-        reply = self.request("POST", self.account.server + route, payload)
+        credential = (os.getenv("YYB_API_KEY", "").strip()
+                      or os.getenv("YYB_PROTOCOL_TOKEN", "").strip())
+        headers = None
+        verify = None
+        if credential:
+            match = re.fullmatch(r"(?:Bearer +)?([!-~]+)", credential, re.IGNORECASE)
+            if not match:
+                raise SafeError("YYB 协议令牌格式错误，请检查 YYB_API_KEY 或 YYB_PROTOCOL_TOKEN")
+            headers = dict(HEADERS, Authorization="Bearer " + match[1])
+            if urlsplit(self.account.server).scheme == "https":
+                verify = True
+        reply = self.request("POST", self.account.server + route, payload, headers, verify=verify)
+        if reply.status == 401:
+            raise SafeError("YYB 协议鉴权失败（HTTP 401），请检查 YYB_API_KEY 或 YYB_PROTOCOL_TOKEN")
         result = reply.data.get("result", {})
         code = result.get("code") if isinstance(result, dict) else None
         if not reply.ok or not isinstance(code, str) or len(code) < 8:
