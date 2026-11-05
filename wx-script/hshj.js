@@ -501,9 +501,13 @@ async function apiRequest(method, url, data, token, encryptVer, openId, userId, 
                 return await apiRequest(method, url, data, token, encryptVer, openId, userId, appSecret, retries - 1, options);
             }
         }
-        if (retries > 0 && method === 'GET') {
-            await sleep(1500);
-            log('  请求失败，重试... ' + (e.code || '网络错误'));
+        // 2026-11-05：网络类错误（ETIMEDOUT/ECONNRESET 等）退避重试，
+        // 避免单次抖动丢掉整个账号（账号3曾因一次 ETIMEDOUT 直接判失败、余额未验证）。
+        if (retries > 0 && (method === 'GET'
+            || /^(ETIMEDOUT|ECONNRESET|EPIPE|ECONNABORTED|EAI_AGAIN|ENOTFOUND|socket hang up)$/i.test(String(e.code || '')))) {
+            const waitMs = 1500 * Math.pow(2, Math.max(0, 3 - retries)) + randomInt(0, 600);
+            log('  请求失败，' + Math.round(waitMs / 1000) + '秒后重试(剩余' + retries + '次)... ' + (e.code || '网络错误'));
+            await sleep(waitMs);
             return await apiRequest(method, url, data, token, encryptVer, openId, userId, appSecret, retries - 1, options);
         }
         log('  请求失败: ' + url + ' - ' + (e.code || ('HTTP ' + status)));
@@ -666,7 +670,8 @@ async function getOpenIdAndUnionId(code) {
 // 校验缓存登录态：能正常访问轻量接口就认为 token/openId/userId 可用。
 async function checkCachedLogin(cached) {
     if (!cached?.token || !cached?.openId || !cached?.userId) return false;
-    const resp = await apiRequest('GET', '/fundex-activity/point/sign/getRecordList', {}, cached.token, '', cached.openId, cached.userId, '', 0);
+    // 2026-11-05：原为 0 重试，一次 ETIMEDOUT 即返回 null 导致整账号失败，改为 2 次退避重试。
+    const resp = await apiRequest('GET', '/fundex-activity/point/sign/getRecordList', {}, cached.token, '', cached.openId, cached.userId, '', 2);
     if (!resp) return null;
     if (String(resp.code) === '200') return true;
     if (/^(401|403|407)$/.test(String(resp.code))) return false;
@@ -1094,14 +1099,27 @@ async function checkTaskVerification(session, verificationCodeType, label) {
 
 async function retryRejectedCaptcha(response, verification, session, type, label) {
     const message = String(response?.msg || response?.message || '');
-    if (!verification.required || !/验证码/.test(message)) return false;
-    if ((session.verificationAttempts?.[type] || 0) < 3) {
-        log('  ⚠️ ' + label + '验证码被拒绝或过期，获取新图后重试');
-        await sleep(2000);
-        return true;
+    const code = String(response?.code || '');
+    // 2026-11-05：服务端对「验证码失效」返回的是 code=7005 + msg="验证码已失效, 请重新获取"，
+    // 原实现只看 verification.required，而 getVerificationCode 的 verifyCodeSwitch 是间歇性的：
+    // 本次取到 switch=false 未带 submitCode 提交，服务端却要求验证码 → 7005。
+    // 此时 required 为 false，原判定直接 return false，把「验证码失效」误判成「加密/会话失效」，
+    // 于是走 refreshProtocolSession 空转，三次机会全废。
+    const captchaRejected = /验证码/.test(message)
+        || (code === '7005' && /失效|过期|重新获取|不正确|错误/.test(message))
+        || (code === '7005' && verification?.required);
+    if (!captchaRejected) return false;
+
+    session.captchaRetryCount = (session.captchaRetryCount || 0) + 1;
+    if (session.captchaRetryCount > 3) {
+        addTaskIssue(session, label + '验证码连续失效3次，请在小程序手动完成');
+        return false;
     }
-    addTaskIssue(session, label + '验证码仍被拒绝，请在小程序手动完成');
-    return false;
+    // 重置该类型的取图计数，确保下一轮能重新拉取新图（否则会被 3 次上限挡住）。
+    if (session.verificationAttempts) session.verificationAttempts[type] = 0;
+    log('  🔁 ' + label + '验证码失效/被拒，重新取图后立即重试（第' + session.captchaRetryCount + '次）');
+    await sleep(600);
+    return true;
 }
 
 async function readTodayExchange(session, activityId) {
@@ -1254,8 +1272,9 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
         log('  ✅ 今日口令已兑换（已核对兑换记录）');
         return { success: true, alreadyDone: true };
     }
-    const verification = await checkTaskVerification(session, '1', '答题');
-    if (!verification.ok) return { success: false };
+    // 2026-11-05：验证码改到「提交前最后一步」获取，此处不再取图。
+    // 原顺序为 取图 → 取encryptKey → 查ROE → 提交，中间两次网络往返使验证码 TTL 过期，
+    // 实测取图后 1 秒内提交才有效。
 
     // 提交加密接口前必须尽量使用最新 encryptKey/version。
     // 0624 抓包中手动提交为 key_version=9，而旧缓存 version=7 会触发 7005。
@@ -1299,6 +1318,10 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
     const exchangeActivityId = activity?.activitystatusResponseVo?.activityId || activity.id;
     // 2026-10-28：doExchange 必填 activityTemplateId / registerChannel，缺失即 400 参数异常。
     const registerChannel = String((activityEntry && activityEntry.registerChannel) || buildDailyRegisterChannel()).replace(/^&/, '');
+    // 2026-11-05：取图与提交紧邻，中间不再插入任何网络请求，规避验证码 TTL 过期。
+    const verification = await checkTaskVerification(session, '1', '答题');
+    if (!verification.ok) return { success: false };
+
     let payload = {
         watchword: roeAnswer,
         openId: openId,
@@ -1363,6 +1386,12 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
         log(`  ⚠️ 兑换频率限制(${session._roe429RetryCount}/3)，等待 ${Math.round(waitMs / 1000)} 秒后重试`);
         await sleep(waitMs);
         return await doRoeReward(session, wxid, cache, cacheKey, activityEntry);
+    }
+    if (String(resp?.code) === '7005' && /验证码/.test(String(resp.msg || resp.message || ''))) {
+        // 2026-11-05：服务端 7005 的实际语义是「验证码已失效」，不能当加密/会话问题处理。
+        // 此分支必须先于下面的加密重试与会话同步，否则会空转并耗尽验证码机会。
+        if (await retryRejectedCaptcha(resp, verification, session, '1', '答题')) return await doRoeReward(session, wxid, cache, cacheKey, activityEntry);
+        return { success: false };
     }
     if (resp?.code === '7005' && !session._roeCryptoRetry) {
         session._roeCryptoRetry = true;
