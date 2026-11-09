@@ -10,7 +10,7 @@
 // 首次运行需联网并允许脚本目录写入，自动下载校验约88MB公开识别资源；以后使用本地缓存。
 // 功能：YYB登录、业务登录缓存、SM4加密、签到、每日活动/ROE口令查询与兑换、
 //       算术图形验证码本地识别、兑换记录独立核验、积分/红包记录查询、青龙账号汇总通知。
-// 现金红包一律提醒到小程序手动领取；不包含自动提现、自动领取及H5授权。
+// 默认手动领取。HSJJ_H5_CLAIM_REFS 可指定启用 YYB H5 自动领取的主账号 ref，每账号每次最多一笔。
 // 通知自动使用青龙已有的 sendNotify 和通知环境变量，正文只显示账号汇总。
 // 可选 HSJJ_AUTO_CAPTCHA=0：关闭识别，需验证码时提醒手动完成；HSJJ_NOTIFY=0：关闭通知。
 // 可选 HSJJ_OCR_CACHE：识别资源缓存目录；HSJJ_ACTIVITY_PAGE_ID：活动备用页面ID。
@@ -223,7 +223,7 @@ function formatAccountSummary(account) {
     const pendingAmount = account.pendingRedPacketAmount || 0;
     return '当前账号: ' + display + ' 当前积分: ' + currentPoint
         + ' 后端红包记录累计:' + formatMoney(historyAmount) + '元'
-        + ' 需手动领取红包: ' + formatMoney(pendingAmount) + '元'
+        + ' 本次查询待领取红包: ' + formatMoney(pendingAmount) + '元'
         + (account.roeOutcome ? ' 答题: ' + account.roeOutcome : '')
         + (account.ok === false ? '（' + (account.taskIssues?.length ? account.taskIssues.join('；') : '部分任务未完成') + '）' : '');
 }
@@ -1421,11 +1421,11 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
             // rewardType=2 对应微信红包，rewardAmount 是元；不是积分。
             const isRedPacket = String(data.rewardType || '') === '2' || data.link || data.tickCode;
             if (isRedPacket) {
-                log('  🎉 兑换成功! 标题: ' + (data.title || roeAnswer) + ' 红包: ' + data.rewardAmount + '元，请到小程序手动领取');
+                log('  🎉 兑换成功! 标题: ' + (data.title || roeAnswer) + ' 红包: ' + data.rewardAmount + '元');
 
 
                 return {
-                    success: true, type: 'redPacket', outcome: '已完成，现金奖励' + formatMoney(data.rewardAmount) + '元（手动领取）', amount: Number(data.rewardAmount) || 0, data,
+                    success: true, type: 'redPacket', outcome: '已完成，现金奖励' + formatMoney(data.rewardAmount) + '元', amount: Number(data.rewardAmount) || 0, data,
                     activity,
                 };
             }
@@ -1503,6 +1503,104 @@ function summarizeManualRedPackets(roeResult, unclaimedList, requestPage) {
         historyRedPacketAmount: Math.round(requestPage.reduce((sum, item) => sum + (Number(item.amount) || 0), 0) * 100) / 100,
         historyCount: requestPage.length,
     };
+}
+
+async function claimCashPacket(session, ref, pending) {
+    const h5AppId = 'wx80226ec03be5ab6c';
+    const origin = 'https://www.mktzb.com';
+    const pagePath = '/mktadmin/wcode/baseWxAuth/cfyh';
+    if (!(process.env.HSJJ_H5_CLAIM_REFS || '').split(/[&,\s]+/).includes(ref)) return '';
+    const item = findYybEntry(ref);
+    if (!item) throw Error('未配置该账号的 YYB 主账号引用');
+    const business = (method, endpoint, body) => apiRequest(method,
+        '/fundex-activity/redPacket/' + endpoint, body,
+        session.token, '', session.openId, session.userId, '', 0);
+    const ledger = pathMod.join(CACHE_DIR, 'h5-claim-attempts');
+    const markerFor = packet => pathMod.join(ledger, require('crypto').createHash('sha256')
+        .update(JSON.stringify([session.openId, String(packet.requestId), packet.ticketCode])).digest('hex'));
+    const packet = pending.find(row => row.requestId && row.ticketCode && row.link && !fs.existsSync(markerFor(row)));
+    if (!packet) return pending.length ? '待手动核对' : '';
+    const page = new URL(packet.link);
+    if (page.origin !== origin || page.pathname !== pagePath || page.username || page.password) throw Error('packet_route');
+    page.search = new URLSearchParams({ prjCode: packet.ticketCode });
+    const userAgent = 'Mozilla/5.0 MicroMessenger/8.0.70';
+    const request = (url, options) => fetch(url, {
+        ...options, redirect: 'manual', signal: AbortSignal.timeout(20000),
+    });
+    const landing = await request(page, { headers: { 'User-Agent': userAgent } });
+    const location = landing.headers.get('location');
+    await landing.body?.cancel();
+    if (landing.status !== 302 || !location) throw Error('oauth_redirect_missing');
+    const oauth = new URL(location, page);
+    if (oauth.origin !== 'https://open.weixin.qq.com' || oauth.pathname !== '/connect/oauth2/authorize'
+        || oauth.searchParams.get('appid') !== h5AppId) throw Error('oauth_route');
+    const redirectUri = oauth.searchParams.get('redirect_uri');
+    const callback = new URL(redirectUri);
+    if (callback.origin !== origin || callback.pathname !== pagePath || callback.username || callback.password
+        || callback.searchParams.has('code') || callback.searchParams.has('state')) throw Error('callback_route');
+    const scope = oauth.searchParams.get('scope');
+    const state = oauth.searchParams.get('state');
+    if (!['snsapi_base', 'snsapi_userinfo'].includes(scope) || state !== packet.ticketCode) throw Error('oauth_parameters');
+    const h5 = await axios.post(item.server + '/wx/h5code', {
+        ref, app_id: h5AppId, payload: { redirect_uri: redirectUri, scope, state },
+    }, { headers: _yybAuthHeaders(), timeout: 30000, validateStatus: () => true });
+    const result = h5.data?.result ?? h5.data?.data?.result;
+    const message = String(h5.data?.error || h5.data?.msg || h5.data?.message || '');
+    const upstreamCode = message.match(/(?:code|ret|retcode)\s*[=:]\s*(-\d+)/i)?.[1];
+    if (h5.status !== 200 || !result?.code || result.state !== state) {
+        throw Error('YYB H5 取码失败（HTTP ' + h5.status + (upstreamCode ? '，上游 ' + upstreamCode : '') + '）');
+    }
+    callback.searchParams.set('code', result.code);
+    callback.searchParams.set('state', state);
+    const response = await request(callback, { headers: { 'User-Agent': userAgent, Referer: page.href } });
+    const html = await response.text();
+    const attrs = [...html.matchAll(/<input\b[^>]*>/gi)].map(([input]) =>
+        Object.fromEntries([...input.matchAll(/([\w-]+)\s*=\s*(["'])(.*?)\2/g)].map(m => [m[1].toLowerCase(), m[3]])));
+    const openId = response.headers.get('set-cookie')?.match(/(?:^|[,;]\s*)cfyh=([^;,]+)/)?.[1]
+        || attrs.find(a => a.id === 'openid')?.value;
+    if (response.status !== 200) throw Error('红包网页授权回调失败');
+    if (!/^o[A-Za-z0-9_-]{20,}$/.test(openId || '')) throw Error('h5_identity_missing');
+    const form = new URLSearchParams({ prj_code: packet.ticketCode, prj_urltag: 'cfyh', openid: openId });
+    const platform = async endpoint => {
+        const result = await request(origin + '/mktadmin/wcode/' + endpoint, {
+            method: 'POST', body: form,
+            headers: { 'User-Agent': userAgent, Referer: page.href, 'X-Requested-With': 'XMLHttpRequest', Cookie: 'cfyh=' + openId },
+        });
+        if (!result.ok) throw Error('platform_http_' + result.status);
+        return result.json();
+    };
+    const query = () => platform('getCodeBaseInfo');
+    const preflight = await query();
+    const info = preflight?.value?.activityPrjCode;
+    const status = String(info?.if_used);
+    const amount = Number(info?.user_bonus);
+    if (preflight?.success !== true || !['1', '-1'].includes(status) || String(info.if_del) === '1'
+        || (info.openid && info.openid !== openId) || (info.prj_code && info.prj_code !== packet.ticketCode)
+        || !Number.isSafeInteger(amount) || amount <= 0) return '平台未确认可领，需手动核对';
+    const listedAmount = packet.amount ?? packet.rewardAmount;
+    if (listedAmount != null && Math.round(Number(listedAmount) * 100) !== amount) throw Error('红包金额核验失败');
+    // 在任何写请求之前保留提交凭据。异常退出后也不重放这笔红包。
+    fs.mkdirSync(ledger, { recursive: true, mode: 0o700 });
+    try { fs.writeFileSync(markerFor(packet), '', { flag: 'wx', mode: 0o600 }); }
+    catch (error) {
+        if (error.code === 'EEXIST') return '已有领取尝试，需核对';
+        throw error;
+    }
+    const marked = await business('POST', 'updateGetStatus', {
+        requestId: packet.requestId, activityId: packet.activityId, activityType: packet.activityType,
+    });
+    if (String(marked?.code) !== '200') return '领取状态更新未确认，需核对';
+    let accepted = false;
+    try { accepted = (await platform('checkCodeBatchRepeatNew'))?.success === true; }
+    catch { /* 响应不明时只查状态。 */ }
+    for (let attempt = 0; attempt < 3; attempt++) {
+        if (attempt) await sleep(1000);
+        const verified = await query().catch(() => null);
+        const state = String(verified?.value?.activityPrjCode?.if_used);
+        if (verified?.success === true && state === '3') return formatMoney(amount / 100) + '元平台已发放';
+        if (verified?.success === true && state === '2') accepted = true;
+    }
+    return accepted ? formatMoney(amount / 100) + '元发放中' : '领取结果待核对';
 }
 
 // ==================== 单账号执行 ====================
@@ -1600,23 +1698,30 @@ async function runTask(accountInfo) {
         const activityEntry = await discoverActivityEntry(session.token, session.openId, session.userId);
         const roeResult = await doRoeReward(session, wxid, cache, cacheKey, activityEntry);
 
-        // 8. 红包只查询和提示手动领取，所有账号采用相同逻辑。
+        // 8. 查询红包，并为显式启用的账号尝试领取。
         await sleep(randomInt(1000, 2000));
         let redPacketAmount = 0, roeReward = 0;
         const activities = await getActivityList(session.token, session.openId, session.userId);
         log('  📋 红包活动列表: ' + activities.length + '个');
         const unclaimedList = await getUnclaimedList(session.token, session.openId, session.userId);
+        let cashClaim = '';
+        try { cashClaim = await claimCashPacket(session, wxid, unclaimedList); }
+        catch (error) {
+            cashClaim = '自动领取未完成，需核对';
+            log('  ⚠️ ' + (/^YYB H5 取码失败（HTTP \d+(，上游 -\d+)?）$/.test(error.message) ? error.message : cashClaim));
+        }
+        if (cashClaim) log('  🧧 ' + cashClaim);
         const requestPage = await getRequestPage(session.token, session.openId, session.userId);
         const manual = summarizeManualRedPackets(roeResult, unclaimedList, requestPage);
         const pendingRedPacketAmount = manual.pendingRedPacketAmount;
         const historyRedPacketAmount = manual.historyRedPacketAmount;
         log('  📊 历史已标记领取记录: ' + manual.historyCount + '笔，累计' + formatMoney(historyRedPacketAmount) + '元（非本次收益）');
         if (manual.pendingRedPacketCount > 0) {
-            log('  🎁 需手动领取红包: ' + manual.pendingRedPacketCount + '笔，合计' + formatMoney(pendingRedPacketAmount) + '元');
+            log('  🎁 本次查询待领取红包: ' + manual.pendingRedPacketCount + '笔，合计' + formatMoney(pendingRedPacketAmount) + '元');
         } else {
             log('  ℹ️ 后台未返回新的待领红包');
         }
-        log('  📲 红包请打开红色火箭小程序，在活动中心/红包记录中手动领取。');
+        if (!cashClaim || /手动|核对/.test(cashClaim)) log('  📲 可在红色火箭小程序的红包记录中核对或手动领取。');
 
 
         // 汇总里展示账号当前积分余额，避免把"本次积分奖励"误当成总积分。
@@ -1633,7 +1738,7 @@ async function runTask(accountInfo) {
         }
 
 
-        return { success: Boolean(signOk && roeResult?.success && currentPoint !== null), currentPoint, roeReward, redPacketAmount, historyRedPacketAmount, pendingRedPacketAmount, taskIssues: session.taskIssues || [], roeOutcome: roeResult?.outcome || (roeResult?.alreadyDone ? '今日已完成' : '') };
+        return { success: Boolean(signOk && roeResult?.success && currentPoint !== null), currentPoint, roeReward, redPacketAmount, historyRedPacketAmount, pendingRedPacketAmount, taskIssues: session.taskIssues || [], roeOutcome: [roeResult?.outcome || (roeResult?.alreadyDone ? '今日已完成' : ''), cashClaim].filter(Boolean).join('，') };
 
     } catch (e) {
         log('❌ 异常: ' + e.message);
@@ -1645,7 +1750,7 @@ async function runTask(accountInfo) {
 // ==================== 主逻辑 ====================
 async function main() {
     log('🚀 红色火箭脚本启动');
-    log('📲 手动领取版：现金红包需在小程序中自行领取');
+    log('📲 现金红包默认手动领取，自动领取仅适用于显式配置的账号');
 
     if (!taskVar.trim()) {
         log('请配置自己的 YYB_SERVER（YYB地址@账号ref，多账号换行），账号须先在 YYB 中授权。');
@@ -1698,7 +1803,7 @@ async function main() {
 
     // 汇总输出
     log('\n' + '='.repeat(50));
-    log('📊 基础任务执行完毕, 成功 ' + successCount + '/' + accounts.length + '（红包需手动领取）');
+    log('📊 基础任务执行完毕, 成功 ' + successCount + '/' + accounts.length + '');
 
     // 详细执行日志只输出到控制台；通知单独使用下列汇总。
     log('\n📋 账号汇总:');
@@ -1713,7 +1818,7 @@ async function runCli() {
         log('红色火箭单文件版：Node.js >=18，青龙或直接 node hshj.js 运行。');
         log('必填 YYB_SERVER=你自己的YYB地址@已授权账号ref，多账号换行；如开启鉴权，再填 YYB_API_KEY。');
         log('首次运行自动准备本地识别资源（需联网和约90MB磁盘空间），不用安装其他依赖。');
-        log('现金红包请在小程序手动领取；青龙通知只包含账号汇总。');
+        log('现金红包默认手动领取。HSJJ_H5_CLAIM_REFS 指定启用 H5 自动领取的主账号 ref。');
         log('--check-setup 检查配置；--prepare-ocr 只准备识别资源；--test-ocr 图片.png 只测试本地图片。');
         return;
     }
