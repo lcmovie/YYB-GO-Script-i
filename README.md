@@ -119,7 +119,9 @@ task lcmovie_YYB-GO-Script-i_main/idp-script/microsoft_rewards.js -- --check-con
 
 脚本包含签到、每日活动发现、ROE口令查询与兑换、算术图形验证码本地识别、兑换记录核验、积分与红包记录查询。无需安装 axios、Python 或额外部署识别服务。首次运行需联网并允许缓存目录写入，自动下载并校验约88MB固定版本识别资源，缓存需约90MB空间，后续复用本地缓存。识别不确定时最多换三张图，仍不能识别则提示手动完成，不保证所有验证码都能自动识别。
 
-现金红包均需在小程序手动领取，不包含自动领取、提现或 H5 授权。通知沿用青龙已有 `sendNotify` 模块与渠道设置，正文只含账号汇总；没有可用通知模块时保留日志汇总。`HSJJ_AUTO_CAPTCHA=0` 关闭验证码识别，`HSJJ_NOTIFY=0` 关闭通知，`HSJJ_OCR_CACHE` 可指定识别资源目录。用 `node hshj.js --help` 查看说明，`--check-setup` 检查配置，`--prepare-ocr` 只初始化识别资源。
+默认在小程序手动领取现金红包。需要自动领取时，配置 `HSJJ_H5_CLAIM_REFS`（主账号 ref，以逗号分隔），并使用支持 `POST /wx/h5code` 的 YYB-Go-Enhanced。每个指定账号每次运行最多尝试一笔待领取红包，授权失败时请手动处理。平台发放状态与微信零钱到账分别核对。缓存目录会保留领取尝试记录，响应不明时防止重复提交。
+
+通知沿用青龙已有 `sendNotify` 模块与渠道设置，正文只含账号汇总；没有可用通知模块时保留日志汇总。`HSJJ_AUTO_CAPTCHA=0` 关闭验证码识别，`HSJJ_NOTIFY=0` 关闭通知，`HSJJ_OCR_CACHE` 可指定识别资源目录。用 `node hshj.js --help` 查看说明，`--check-setup` 检查配置，`--prepare-ocr` 只初始化识别资源。
 
 ## 注意事项
 
