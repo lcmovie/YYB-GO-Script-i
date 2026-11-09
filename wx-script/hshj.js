@@ -1456,15 +1456,20 @@ async function getActivityList(token, openId, userId) {
 // 查询未领取红包列表
 // 抓包显示 getUnclaimedList 返回空，实际未领取记录通过 getRequestPage(receiveStatus=0) 查询
 async function getUnclaimedList(token, openId, userId) {
-    const resp = await apiRequest('GET', '/fundex-activity/redPacket/getRequestPage', {
-        receiveStatus: 0,
-        pageNo: 1,
-        pageSize: 100
-    }, token, '', openId, userId);
-    if (resp?.code === '200' && resp?.data?.dataList) {
-        return resp.data.dataList;
+    const packets = [];
+    for (let pageNum = 1; ; pageNum++) {
+        const resp = await apiRequest('GET', '/fundex-activity/redPacket/getRequestPage', {
+            openId, receiveStatus: 0, pageNum, pageNo: pageNum, pageSize: 100,
+        }, token, '', openId, userId);
+        const page = resp?.data;
+        if (String(resp?.code) !== '200' || !Array.isArray(page?.dataList)) throw Error('未领红包查询失败');
+        if (page.pageNum != null && Number(page.pageNum) !== pageNum) throw Error('待领红包分页异常');
+        packets.push(...page.dataList);
+        const totalPages = Number(page.totalPage);
+        if (!Number.isSafeInteger(totalPages) || totalPages < 0) throw Error('待领红包缺少有效分页信息');
+        if (pageNum >= totalPages) return packets;
+        if (!page.dataList.length) throw Error('待领红包分页为空');
     }
-    throw new Error('未领红包查询失败');
 }
 
 // 查询红包领取历史
@@ -1506,22 +1511,46 @@ function summarizeManualRedPackets(roeResult, unclaimedList, requestPage) {
 }
 
 async function claimCashPacket(session, ref, pending) {
-    const h5AppId = 'wx80226ec03be5ab6c';
-    const origin = 'https://www.mktzb.com';
-    const pagePath = '/mktadmin/wcode/baseWxAuth/cfyh';
     const claimRefs = (process.env.HSJJ_H5_CLAIM_REFS || '').trim();
     if (claimRefs === '0' || (claimRefs && !claimRefs.split(/[&,\s]+/).includes(ref))) return '';
     if (!pending.length) return '';
+    const ledger = pathMod.join(CACHE_DIR, 'h5-claim-attempts');
+    const summaries = new Map();
+    const record = outcome => summaries.set(outcome, (summaries.get(outcome) || 0) + 1);
+    for (const packet of pending) {
+        if (!packet.requestId || !packet.ticketCode || !packet.link) {
+            record('缺少领取信息，需手动核对');
+            continue;
+        }
+        const marker = pathMod.join(ledger, require('crypto').createHash('sha256')
+            .update(JSON.stringify([session.openId, String(packet.requestId), packet.ticketCode])).digest('hex'));
+        if (fs.existsSync(marker)) {
+            record('已有领取尝试，需核对');
+            continue;
+        }
+        try {
+            const outcome = await claimSingleCashPacket(session, ref, packet, ledger, marker);
+            record(outcome);
+            if (outcome === '领取状态更新未确认，需核对' || outcome === '领取结果待核对') break;
+        } catch (error) {
+            log('  ⚠️ ' + (/^YYB H5 取码失败（HTTP \d+(，上游 -\d+)?）$/.test(error.message)
+                ? error.message : '自动领取中断，剩余红包需核对'));
+            record('自动领取中断，剩余红包需核对');
+            break;
+        }
+    }
+    return [...summaries].map(([outcome, count]) => count + '笔' + outcome).join('，');
+}
+
+async function claimSingleCashPacket(session, ref, packet, ledger, marker) {
     const item = findYybEntry(ref);
     if (!item) throw Error('未配置该账号的 YYB 主账号引用');
     const business = (method, endpoint, body) => apiRequest(method,
         '/fundex-activity/redPacket/' + endpoint, body,
         session.token, '', session.openId, session.userId, '', 0);
-    const ledger = pathMod.join(CACHE_DIR, 'h5-claim-attempts');
-    const markerFor = packet => pathMod.join(ledger, require('crypto').createHash('sha256')
-        .update(JSON.stringify([session.openId, String(packet.requestId), packet.ticketCode])).digest('hex'));
-    const packet = pending.find(row => row.requestId && row.ticketCode && row.link && !fs.existsSync(markerFor(row)));
-    if (!packet) return pending.length ? '待手动核对' : '';
+    const h5AppId = 'wx80226ec03be5ab6c';
+    const origin = 'https://www.mktzb.com';
+    const pagePath = '/mktadmin/wcode/baseWxAuth/cfyh';
     const page = new URL(packet.link);
     if (page.origin !== origin || page.pathname !== pagePath || page.username || page.password) throw Error('packet_route');
     page.search = new URLSearchParams({ prjCode: packet.ticketCode });
@@ -1583,7 +1612,7 @@ async function claimCashPacket(session, ref, pending) {
     if (listedAmount != null && Math.round(Number(listedAmount) * 100) !== amount) throw Error('红包金额核验失败');
     // 在任何写请求之前保留提交凭据。异常退出后也不重放这笔红包。
     fs.mkdirSync(ledger, { recursive: true, mode: 0o700 });
-    try { fs.writeFileSync(markerFor(packet), '', { flag: 'wx', mode: 0o600 }); }
+    try { fs.writeFileSync(marker, '', { flag: 'wx', mode: 0o600 }); }
     catch (error) {
         if (error.code === 'EEXIST') return '已有领取尝试，需核对';
         throw error;
@@ -1752,7 +1781,7 @@ async function runTask(accountInfo) {
 // ==================== 主逻辑 ====================
 async function main() {
     log('🚀 红色火箭脚本启动');
-    log('📲 现金红包默认自动领取本次运行账号的红包，每账号每次最多一笔');
+    log('📲 现金红包默认尝试领取本次运行账号的全部待领红包');
 
     if (!taskVar.trim()) {
         log('请配置自己的 YYB_SERVER（YYB地址@账号ref，多账号换行），账号须先在 YYB 中授权。');
