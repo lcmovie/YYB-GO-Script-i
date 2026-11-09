@@ -10,7 +10,7 @@
 // 首次运行需联网并允许脚本目录写入，自动下载校验约88MB公开识别资源；以后使用本地缓存。
 // 功能：YYB登录、业务登录缓存、SM4加密、签到、每日活动/ROE口令查询与兑换、
 //       算术图形验证码本地识别、兑换记录独立核验、积分/红包记录查询、青龙账号汇总通知。
-// 默认使用 YYB H5 自动领取本次运行账号的红包，每账号每次最多一笔。可选 HSJJ_H5_CLAIM_REFS 限定主账号 ref，设为 0 则关闭。
+// 默认手动领取。HSJJ_H5_CLAIM_REFS 可指定启用 YYB H5 自动领取的主账号 ref，每账号每次最多一笔。
 // 通知自动使用青龙已有的 sendNotify 和通知环境变量，正文只显示账号汇总。
 // 可选 HSJJ_AUTO_CAPTCHA=0：关闭识别，需验证码时提醒手动完成；HSJJ_NOTIFY=0：关闭通知。
 // 可选 HSJJ_OCR_CACHE：识别资源缓存目录；HSJJ_ACTIVITY_PAGE_ID：活动备用页面ID。
@@ -1820,7 +1820,7 @@ async function runCli() {
         log('红色火箭单文件版：Node.js >=18，青龙或直接 node hshj.js 运行。');
         log('必填 YYB_SERVER=你自己的YYB地址@已授权账号ref，多账号换行；如开启鉴权，再填 YYB_API_KEY。');
         log('首次运行自动准备本地识别资源（需联网和约90MB磁盘空间），不用安装其他依赖。');
-        log('现金红包默认自动领取。HSJJ_H5_CLAIM_REFS 可限定主账号 ref，设为 0 关闭。');
+        log('现金红包默认手动领取。HSJJ_H5_CLAIM_REFS 指定启用 H5 自动领取的主账号 ref。');
         log('--check-setup 检查配置；--prepare-ocr 只准备识别资源；--test-ocr 图片.png 只测试本地图片。');
         return;
     }
