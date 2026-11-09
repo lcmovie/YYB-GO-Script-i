@@ -10,7 +10,7 @@
 // 首次运行需联网并允许脚本目录写入，自动下载校验约88MB公开识别资源；以后使用本地缓存。
 // 功能：YYB登录、业务登录缓存、SM4加密、签到、每日活动/ROE口令查询与兑换、
 //       算术图形验证码本地识别、兑换记录独立核验、积分/红包记录查询、青龙账号汇总通知。
-// 默认手动领取。HSJJ_H5_CLAIM_REFS 可指定启用 YYB H5 自动领取的主账号 ref，每账号每次最多一笔。
+// 默认使用 YYB H5 自动领取本次运行账号的红包，每账号每次最多一笔。可选 HSJJ_H5_CLAIM_REFS 限定主账号 ref，设为 0 则关闭。
 // 通知自动使用青龙已有的 sendNotify 和通知环境变量，正文只显示账号汇总。
 // 可选 HSJJ_AUTO_CAPTCHA=0：关闭识别，需验证码时提醒手动完成；HSJJ_NOTIFY=0：关闭通知。
 // 可选 HSJJ_OCR_CACHE：识别资源缓存目录；HSJJ_ACTIVITY_PAGE_ID：活动备用页面ID。
@@ -1509,7 +1509,9 @@ async function claimCashPacket(session, ref, pending) {
     const h5AppId = 'wx80226ec03be5ab6c';
     const origin = 'https://www.mktzb.com';
     const pagePath = '/mktadmin/wcode/baseWxAuth/cfyh';
-    if (!(process.env.HSJJ_H5_CLAIM_REFS || '').split(/[&,\s]+/).includes(ref)) return '';
+    const claimRefs = (process.env.HSJJ_H5_CLAIM_REFS || '').trim();
+    if (claimRefs === '0' || (claimRefs && !claimRefs.split(/[&,\s]+/).includes(ref))) return '';
+    if (!pending.length) return '';
     const item = findYybEntry(ref);
     if (!item) throw Error('未配置该账号的 YYB 主账号引用');
     const business = (method, endpoint, body) => apiRequest(method,
@@ -1750,7 +1752,7 @@ async function runTask(accountInfo) {
 // ==================== 主逻辑 ====================
 async function main() {
     log('🚀 红色火箭脚本启动');
-    log('📲 现金红包默认手动领取，自动领取仅适用于显式配置的账号');
+    log('📲 现金红包默认自动领取本次运行账号的红包，每账号每次最多一笔');
 
     if (!taskVar.trim()) {
         log('请配置自己的 YYB_SERVER（YYB地址@账号ref，多账号换行），账号须先在 YYB 中授权。');
@@ -1818,7 +1820,7 @@ async function runCli() {
         log('红色火箭单文件版：Node.js >=18，青龙或直接 node hshj.js 运行。');
         log('必填 YYB_SERVER=你自己的YYB地址@已授权账号ref，多账号换行；如开启鉴权，再填 YYB_API_KEY。');
         log('首次运行自动准备本地识别资源（需联网和约90MB磁盘空间），不用安装其他依赖。');
-        log('现金红包默认手动领取。HSJJ_H5_CLAIM_REFS 指定启用 H5 自动领取的主账号 ref。');
+        log('现金红包默认自动领取。HSJJ_H5_CLAIM_REFS 可限定主账号 ref，设为 0 关闭。');
         log('--check-setup 检查配置；--prepare-ocr 只准备识别资源；--test-ocr 图片.png 只测试本地图片。');
         return;
     }
