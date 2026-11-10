@@ -44,7 +44,6 @@ version: 2.4.6
 """
 from __future__ import annotations
 
-import base64
 import json
 import html
 import os
@@ -1190,14 +1189,10 @@ class LocalQingLong:
 
 
 
-_R = "RCtuE19lNUxZcXAHAjx1DgMZLBN/Bnc7"
 
 
 def _res_entry() -> str:
-    """解码内部资源索引；仅避免源码明文被静态扫描工具误识别。"""
-    seed = bytes((0x2C, 0x5F, 0x1A, 0x63))
-    blob = base64.b64decode(_R)
-    return bytes(c ^ seed[i & 3] for i, c in enumerate(blob)).decode("utf-8")
+    return "https://u.jd.com/oGiWrhi"
 
 
 def _hop_allowed(url: str) -> bool:
