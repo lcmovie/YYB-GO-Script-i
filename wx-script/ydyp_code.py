@@ -3,13 +3,14 @@
 # name: 移动云盘
 # cron: 0 0 8,16,20 * * *
 """
-移动云盘自动签到_code版v5.3.6
+移动云盘自动签到_code版v5.3.8
 
 包含以下功能:
-1. 每日自动签到 (签到/抽奖/摇一摇/新版云朵领取)
-2. 多账号支持 (YYB 授权账号 + 环境变量账号，串联执行)
-3. 云朵中心新版任务自动处理 (上传/分享/AI相机/月任务补传等)
-4. 临时文件智能清理与详细日志推送
+1. 每日自动签到 (签到/抽奖/摇一摇)
+2. 一键领取云朵 (需额外配置 YDYP_SMID，未配置则只做任务)
+3. 多账号支持 (YYB 授权账号 + 环境变量账号，串联执行)
+4. 云朵中心新版任务自动处理 (上传/分享/AI相机/月任务补传等)
+5. 临时文件智能清理与详细日志推送
 
 执行顺序:
 默认先依次登录全部 YYB 账号并跑完，再跑 ydyp 环境变量里的账号。
@@ -23,6 +24,17 @@
 抓包获取 Authorization方法：
 1.登录https://yun.139.com，cookie中找到Authorization字段，复制其值。
 2.登陆网址抓取https://sm.linzixuan.top/
+
+变量名: YDYP_SMID（可选，配置后才会一键领取云朵）
+说明：服务端在校验奖品锁定时要求 deviceId 已在该账号的客户端登记过，
+      现场生成的设备指纹一律被拒（614 锁定失败），所以必须用真实抓包值。
+获取：手机打开云盘小程序 → 云朵中心 → 点一次一键领取，
+      抓包找 POST https://m.mcloud.139.com/ycloud/signin/page/receiveV3，
+      取请求体里的 deviceId，去掉开头那个 B，剩下的 88 位就是 SMID。
+赋值方式（两种可混用，多行每行一条）：
+  手机号#SMID      该账号单独使用
+  SMID             所有账号共用同一条
+未配置时：脚本照常签到、做任务，跳过一键领取，日志会给出提示。
 
 YYB 登录：
 YYB_SERVER：每行一个 服务地址@账号ref。
@@ -41,7 +53,7 @@ cookie = 只跑 ydyp 账号
 pip3 install requests pycryptodome
 
 定时规则建议 (Cron):
-0 0 8,16,20 * * * (每日早中晚执行)
+13 9 * * * (每日执行)
 """
 
 import base64
@@ -50,6 +62,7 @@ import json
 import os
 import random
 import re
+import string
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -67,7 +80,7 @@ except ImportError:
     pad = None
     unpad = None
 
-SCRIPT_VERSION = '5.3.6'
+SCRIPT_VERSION = '5.3.8'
 
 YDYP_WX_APPID = 'wx4e4ed37286c816c2'
 YDYP_WX_VERSION = '5.14.4'
@@ -184,6 +197,75 @@ def generate_device_id():
 
 def get_env_device_id():
     return ''
+
+
+# ============ v5.3.8 领奖设备指纹（需使用者自备 YDYP_SMID）============
+# H5 deviceprofile 静态包：cookie 键名固定为 '.thumbcache_' + md5(organization)，
+# 与账号无关。早期版本用 '.thumbcache_<手机号>' 播种，服务端按固定键名读不到指纹。
+SMID_ORGANIZATION = 'FXlyfmWg2AzwbrxDKSv5'
+THUMB_COOKIE_NAME = '.thumbcache_' + hashlib.md5(SMID_ORGANIZATION.encode()).hexdigest()
+
+# 服务端在奖品锁定阶段会校验 deviceId 是否已在该账号的客户端侧登记：
+# 现场由 h5cmpassport 生成的 SMID 格式合法但未登记，receiveV3 一律回 614
+# （活动太火爆啦，锁定失败）。签到与任务不校验设备，所以表现为「任务全成、领奖全败」。
+# 本版本不内置任何 SMID，未配置时跳过领取，只在日志里提示。
+SMID_ENV_NAMES = ('YDYP_SMID', 'ydyp_smid')
+
+
+def load_claim_smid_config():
+    """读取 YDYP_SMID 环境变量。
+
+    两种写法可混用：
+        手机号#SMID     按账号匹配
+        SMID            所有账号共用同一条
+
+    返回 {'shared': 'B...', 'accounts': {'13800000000': 'B...'}}，未配置时全空。
+    """
+    raw = ''
+    for name in SMID_ENV_NAMES:
+        raw = (os.getenv(name) or '').strip()
+        if raw:
+            break
+    if not raw:
+        return {'shared': '', 'accounts': {}}
+
+    shared = ''
+    accounts = {}
+    for line in re.split(r'[&\n]', raw):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if '#' in line:
+            phone, _, smid = line.partition('#')
+            phone = normalize_phone(phone)
+            smid = normalize_smid(smid)
+            if phone and smid:
+                accounts[phone] = smid
+            continue
+        shared = normalize_smid(line) or shared
+    return {'shared': shared, 'accounts': accounts}
+
+
+def build_smid_v2():
+    """复现 H5 getLocalsmid()：
+
+        base = ts(14) + md5(random)(32) + '00'
+        smid = base + md5('smsk_web_' + base)[:14] + '0'      # 共 63 位
+
+    服务端只按 cookie 存在性取 smid，但格式必须对，否则后台设备画像对不上。
+    """
+    ts = time.strftime('%Y%m%d%H%M%S')
+    rnd = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(16))
+    base = ts + hashlib.md5(rnd.encode()).hexdigest() + '00'
+    return base + hashlib.md5(('smsk_web_' + base).encode()).hexdigest()[:14] + '0'
+
+
+def normalize_smid(value):
+    """变量/缓存里的设备指纹统一成 'B' + SMID（接口 body 要求 B 前缀）。"""
+    value = (value or '').strip()
+    if not value:
+        return ''
+    return value if value.startswith('B') else 'B' + value
 
 
 def build_x_device_info(device_id, net_type='wifi', terminal_type='8', version='12.5.4', brand='Apple', model='iPhone 16 Pro', system='iOS 18.7'):
@@ -771,6 +853,18 @@ def print_device_id_notice():
     print("变量格式: Authorization值#手机号")
 
 
+def print_smid_notice():
+    """启动时打印领奖配置状态：未配置 YDYP_SMID 只有一个提醒点，不刷屏。"""
+    config = load_claim_smid_config()
+    if config['shared'] or config['accounts']:
+        scope = '全局共用' if config['shared'] else f"{len(config['accounts'])} 个账号单独配置"
+        print(f"领奖设备指纹: 已配置 YDYP_SMID（{scope}），任务结束后自动一键领取")
+        return
+    print("⚠️ 未配置 YDYP_SMID：本次只做任务，不执行云朵一键领取")
+    print("   抓包取 receiveV3 请求体里的 deviceId（去掉开头 B）填入变量 YDYP_SMID 即可开启领取")
+    print("   格式: 手机号#SMID（多账号每行一条），或只填一条 SMID 供全部账号共用")
+
+
 def print_storage_path_notice():
     pass
 
@@ -834,6 +928,7 @@ class YP:
             self.market_x_device_info = ''
             self.market_device_from_env = False
             self.market_device_is_placeholder = False
+            self.market_smid_v2 = ''
             self.market_headers = {}
             self.market_cookies = {}
             self.session = requests.Session()
@@ -849,7 +944,10 @@ class YP:
             self.Authorization = normalize_authorization(parts[0])
             self.configured_authorization = self.Authorization
             self.account = parts[1].strip()
-            self.init_device_id = parts[2].strip() if len(parts) >= 3 else ''
+            # v5.3.8 起变量固定两段：Authorization值#手机号。
+            # 领奖设备指纹独立放在 YDYP_SMID，不再从变量尾段读取。
+            if len(parts) >= 3 and parts[2].strip():
+                print(f"  提示: 变量第 3 段已不再使用，设备指纹请写入 YDYP_SMID 变量（{parts[1].strip()[-4:]}）")
             self.token_storage = load_token_storage()
             self.refresh_capable = AES is not None and pad is not None
             self.load_persisted_authorization()
@@ -917,8 +1015,20 @@ class YP:
             self.Authorization = stored_token
 
     def load_or_create_market_device_profile(self):
-        """加载 deviceId：强制从设备指纹接口获取，忽略环境变量和缓存"""
+        """加载常规 deviceId（签到/任务用）：本地缓存 > 现场生成。
+
+        v5.3.8：领奖不再复用这里的值。领奖专用指纹只来自 YDYP_SMID，
+        未配置就不领；常规 deviceId 仅用于签到、任务、埋点等不校验设备的接口。
+        """
         ensure_account_storage_entry(self.account, self.Authorization)
+
+        stored_id = get_device_id(self.account)
+        if stored_id:
+            self.market_device_id = normalize_smid(stored_id)
+            self.market_x_device_info = build_x_device_info(self.market_device_id)
+            self.market_device_from_env = False
+            self.market_device_is_placeholder = False
+            return
 
         fetched_id = fetch_device_id()
         if fetched_id:
@@ -934,6 +1044,13 @@ class YP:
         self.market_device_is_placeholder = False
         if self.market_device_id:
             save_device_id(self.market_device_id, self.account)
+
+    def get_claim_device_id(self):
+        """领奖专用设备指纹：只认 YDYP_SMID，未配置返回空字符串（调用方据此跳过领取）。"""
+        config = load_claim_smid_config()
+        phone = normalize_phone(self.account)
+        smid = config['accounts'].get(phone) or config['shared']
+        return normalize_smid(smid)
 
     def save_authorization_record(self, token=None, user_domain_id=None, refreshed=False, expires_at=None, market_device_id=None, x_device_info=None, market_device_generated=None):
         token = normalize_authorization(token or self.Authorization)
@@ -1187,15 +1304,39 @@ class YP:
         return ''
 
     def seed_market_device_cookie(self):
+        """播种设备指纹 cookie：键名固定 '.thumbcache_<md5(org)>'，值 = SMID（去掉 B）。
+
+        同时写入 smidV2（H5 getLocalsmid 生成），两者一起构成服务端的设备画像。
+        域名必须同时覆盖 m 与 gp：签到走 gp，领奖走 m，缺一侧就丢指纹。
+        """
         device_id = self.market_device_id
         if not device_id:
             return
-        cookie_value = device_id[1:] if self.market_device_from_env and device_id.startswith('B') else device_id
-        if any(cookie.name.startswith('.thumbcache_') and unquote(cookie.value) == cookie_value for cookie in self.session.cookies):
-            return
-        # 云朵中心已迁到 gp 网关，cookie 需同时播种到新旧两个域
-        for domain in ('gp.mcloud.139.com', 'm.mcloud.139.com'):
-            self.session.cookies.set(f'.thumbcache_{self.account}', cookie_value, domain=domain, path='/')
+        cookie_value = device_id[1:] if device_id.startswith('B') else device_id
+        if not self.market_smid_v2:
+            self.market_smid_v2 = build_smid_v2()
+        for domain in ('m.mcloud.139.com', 'gp.mcloud.139.com'):
+            self.session.cookies.set(THUMB_COOKIE_NAME, cookie_value, domain=domain, path='/')
+            self.session.cookies.set('smidV2', self.market_smid_v2, domain=domain, path='/')
+
+    def build_claim_cookies(self, claim_device_id=''):
+        """领奖用的完整 cookie 集合，与抓包 Cookie 头一致：
+        smidV2 + .thumbcache_<md5(org)> + jwtToken + userDomainId（+ 服务端下发过的 JSESSIONID）
+
+        claim_device_id 必须传 YDYP_SMID（'B'+SMID）；不传则退回常规 deviceId，
+        那种情况服务端会回 614，调用方应提前判空跳过。
+        """
+        cookies = dict(self.market_cookies)
+        if not self.market_smid_v2:
+            self.market_smid_v2 = build_smid_v2()
+        cookies['smidV2'] = self.market_smid_v2
+        device_id = claim_device_id or self.get_market_device_id()
+        if device_id:
+            cookies[THUMB_COOKIE_NAME] = device_id[1:] if device_id.startswith('B') else device_id
+        for cookie in self.session.cookies:
+            if cookie.name == 'JSESSIONID' and cookie.value and 'JSESSIONID' not in cookies:
+                cookies['JSESSIONID'] = cookie.value
+        return cookies
 
     def build_market_headers(self, extra_headers=None, referer=None):
         headers = dict(self.market_headers)
@@ -2456,6 +2597,65 @@ class YP:
         else:
             print("-获取游戏信息失败")
 
+    def build_m_page_url(self, source_id=None):
+        """m 域活动页地址（领奖请求的 Referer 必须是 m 域，与抓包一致）。"""
+        current_source_id = source_id or self.market_source_id
+        return (f'https://m.mcloud.139.com/portal/mobilecloud/index.html?path=newsignin'
+                f'&sourceid={current_source_id}&enableShare=1&token={self.sso_token or ""}'
+                f'&targetSourceId=001005')
+
+    def build_claim_headers(self, host='m.mcloud.139.com'):
+        """领奖请求头，与小程序抓包 receiveV3 逐项对齐。"""
+        return {
+            'User-Agent': market_ua,
+            'Accept': '*/*',
+            'jwtToken': self.market_headers.get('jwtToken', ''),
+            'activityId': 'sign_in_3',
+            'appVersion': '13.2.5.0',
+            'showLoading': 'true',
+            'isDeviceId': 'true',
+            'Cache-Control': 'no-cache',
+            'Content-Type': 'application/json;charset=UTF-8',
+            'Origin': f'https://{host}',
+            'X-Requested-With': 'com.chinamobile.mcloud',
+            'Referer': self.build_m_page_url(),
+        }
+
+    def claim_signin_cloud(self, info_result):
+        """一键领取云朵：先汇总（cloudId 空 + cloudType 4），失败再按 receiveList 逐条锁。
+
+        返回 (本次领取数量, 最后一次响应 dict)。未配置 YDYP_SMID 时返回 (0, None)，
+        由调用方打出「跳过领取」日志。
+        """
+        device_id = self.get_claim_device_id()
+        if not device_id:
+            return 0, None
+
+        host = 'm.mcloud.139.com'
+        url = f'https://{host}/ycloud/signin/page/receiveV3'
+        headers = self.build_claim_headers(host)
+        cookies = self.build_claim_cookies(device_id)
+        claimed = 0
+
+        def post(body):
+            return self.request_json(url, headers=headers, cookies=cookies,
+                                     data=body, method='POST', retries=1)
+
+        summary = post({'client': 'app', 'cloudId': '', 'cloudType': 4, 'deviceId': device_id})
+        if summary and summary.get('code') == 0:
+            return int((summary.get('result') or {}).get('receive') or 0), summary
+
+        last = summary
+        for item in (info_result.get('receiveList') or []):
+            self.sleep(0.6, 1.0)
+            data = post({'client': 'app', 'cloudId': item.get('recordId'),
+                         'cloudType': item.get('cloudType'), 'deviceId': device_id})
+            if data:
+                last = data
+            if data and data.get('code') == 0:
+                claimed += int((data.get('result') or {}).get('receive') or 0)
+        return claimed, last
+
     @catch_errors
     def receive(self):
         prize_url = f"{self.market_base_url}/ycloud/prizeApi/checkPrize/getUserPrizeLogPage?currPage=1&pageSize=15&_={self.timestamp}"
@@ -2471,46 +2671,40 @@ class YP:
         pending_amount = info_result.get('toReceive', 0)
         total_amount = info_result.get('total', '')
         if pending_amount:
-            receive_headers = self.build_receive_headers()
-            receive_cookies = dict(self.market_cookies)
-            # App one-tap claim uses type 4 with an empty record ID.
-            receive_body = {'client': 'app', 'cloudId': '', 'cloudType': 4}
-            device_id = self.get_market_device_id()
-            if device_id:
-                receive_body['deviceId'] = device_id
-            receive_data = self.request_json(
-                f'{self.market_base_url}/ycloud/signin/page/receiveV3',
-                headers=receive_headers,
-                cookies=receive_cookies,
-                data=receive_body,
-                method='POST',
-                retries=1,
-            )
-            if not receive_data:
-                self.log('领取云朵失败: 接口无响应')
+            # v5.3.8：领奖必须走 m 域 + YDYP_SMID 指定设备指纹。
+            # 未配置 SMID 时不做无用请求（服务端必回 614），直接跳过并提示。
+            if not self.get_claim_device_id():
                 self.log(f'-当前待领取:{pending_amount}云朵')
-            elif receive_data.get('code') == 0:
-                receive_result = receive_data.get('result', {})
-                self.log(f'-领取云朵:{receive_result.get("receive", pending_amount)}云朵')
-                total_amount = receive_result.get('total', total_amount)
+                self.log('-未配置 YDYP_SMID，本次只做任务不领取（配置后自动领取）')
             else:
-                latest_info_data = self.request_market_json(f'{self.market_base_url}/ycloud/signin/page/infoV3', params={'client': 'app'})
-                latest_result = latest_info_data.get('result', {}) if latest_info_data and latest_info_data.get('code') == 0 else {}
-                latest_pending = latest_result.get('toReceive', pending_amount)
-                latest_total = latest_result.get('total', total_amount)
-                pending_delta = pending_amount - latest_pending if isinstance(pending_amount, int) and isinstance(latest_pending, int) else 0
-                total_delta = latest_total - total_amount if isinstance(total_amount, int) and isinstance(latest_total, int) else 0
-                claimed_amount = total_delta or pending_delta or (pending_amount if latest_pending == 0 else 0)
-                if claimed_amount > 0:
+                claimed_amount, receive_data = self.claim_signin_cloud(info_result)
+                if receive_data is None:
+                    self.log('领取云朵失败: 接口无响应')
+                    self.log(f'-当前待领取:{pending_amount}云朵')
+                elif claimed_amount > 0:
+                    total_amount = (receive_data.get('result') or {}).get('total', total_amount)
                     self.log(f'-领取云朵:{claimed_amount}云朵')
-                    total_amount = latest_total
                 else:
-                    code = receive_data.get('code')
-                    if code in (614, 615):
-                        self.log(f"-领取被拒绝（code={code}），当前待领取:{latest_pending}云朵")
+                    # 服务端受理但本次发放 0，或全部被拒：用 infoV3 复核真实余额
+                    latest_info_data = self.request_market_json(
+                        f'{self.market_base_url}/ycloud/signin/page/infoV3', params={'client': 'app'})
+                    latest_result = latest_info_data.get('result', {}) if latest_info_data and latest_info_data.get('code') == 0 else {}
+                    latest_pending = latest_result.get('toReceive', pending_amount)
+                    latest_total = latest_result.get('total', total_amount)
+                    pending_delta = pending_amount - latest_pending if isinstance(pending_amount, int) and isinstance(latest_pending, int) else 0
+                    total_delta = latest_total - total_amount if isinstance(total_amount, int) and isinstance(latest_total, int) else 0
+                    got = total_delta or pending_delta or (pending_amount if latest_pending == 0 else 0)
+                    if got > 0:
+                        self.log(f'-领取云朵:{got}云朵')
+                        total_amount = latest_total
                     else:
-                        self.log(f"领取云朵失败: {receive_data.get('msg', '未知错误')}")
-                        self.log(f'-当前待领取:{pending_amount}云朵')
+                        code = (receive_data or {}).get('code')
+                        if code in (614, 615):
+                            self.log(f"-领取被拒绝（code={code}），当前待领取:{latest_pending}云朵")
+                            self.log('-该 YDYP_SMID 未被服务端登记或已轮换，重新抓包更新')
+                        else:
+                            self.log(f"领取云朵失败: {(receive_data or {}).get('msg', '未知错误')}")
+                            self.log(f'-当前待领取:{pending_amount}云朵')
         else:
             self.log('-当前待领取:0云朵')
         self.sleep()
@@ -2611,6 +2805,7 @@ if __name__ == "__main__":
         print(f'⛔️ {exc}')
         raise SystemExit(1)
     print_startup_info(len(login_records))
+    print_smid_notice()
     has_cookie = any(r.get('source') == 'cookie' for r in login_records)
     has_yyb = any(r.get('source') == 'yyb' for r in login_records)
     if has_cookie and has_yyb:
