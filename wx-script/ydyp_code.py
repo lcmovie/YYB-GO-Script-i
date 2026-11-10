@@ -3,7 +3,7 @@
 # name: 移动云盘
 # cron: 0 0 8,16,20 * * *
 """
-移动云盘自动签到_code版v5.3.3
+移动云盘自动签到_code版v5.3.6
 
 包含以下功能:
 1. 每日自动签到 (签到/抽奖/摇一摇/新版云朵领取)
@@ -67,7 +67,7 @@ except ImportError:
     pad = None
     unpad = None
 
-SCRIPT_VERSION = '5.3.3'
+SCRIPT_VERSION = '5.3.6'
 
 YDYP_WX_APPID = 'wx4e4ed37286c816c2'
 YDYP_WX_VERSION = '5.14.4'
@@ -89,6 +89,7 @@ DEVICE_ID_STORAGE_FILENAME = ''
 #   md5(secret + requestId + timestamp + nonce + "" + secret)  小写 hex
 # secret 由 H5 代码 String.fromCodePoint 数组还原，属客户端协议常量。
 YDYP_GATEWAY_HOST = 'https://gp.mcloud.139.com'
+YDYP_MARKET_HOST = 'https://m.mcloud.139.com'
 YDYP_SIGN_SECRET = 'sekaMdYYLIZfbCfm'
 YDYP_MARKET_NAME = 'sign_in_3'
 YDYP_AUTH_PATH = '/ycloud/auth-service/auth/tyrzLogin'
@@ -825,7 +826,7 @@ class YP:
             self.click_num = 15
             self.draw = 1
             self.client_version = '12.5.4'
-            self.market_base_url = YDYP_GATEWAY_HOST
+            self.market_base_url = YDYP_MARKET_HOST
             self.market_source_id = '1097'
             self.sso_token = None
             self.user_domain_id = ''
@@ -1212,7 +1213,10 @@ class YP:
         return self.build_market_headers(
             {
                 'showLoading': 'true',
-                'appVersion': f'{self.client_version}.0',
+                'isDeviceId': 'true',
+                'Origin': self.market_base_url,
+                'Content-Type': 'application/json;charset=UTF-8',
+                'appVersion': '13.2.5.0',
                 'activityId': 'sign_in_3',
             },
             referer=self.build_market_page_url(source_id),
@@ -2083,10 +2087,11 @@ class YP:
             'token': sso_token,
             'openAccount': 0,
             'marketName': YDYP_MARKET_NAME,
+            'sourceId': self.market_source_id,
         }
         extra = {
-            'User-Agent': ua or DEFAULT_MOBILE_UA,
-            'Origin': YDYP_GATEWAY_HOST,
+            'User-Agent': market_ua or DEFAULT_MOBILE_UA,
+            'Origin': self.market_base_url,
             'Referer': self.build_market_page_url(),
         }
         last_err = ''
@@ -2094,7 +2099,7 @@ class YP:
             # 每次重试重新签名：x-timestamp/x-nonce/x-signature 都需新鲜值
             headers = build_gateway_sign_headers(self.session, extra)
             data = self.request_json(
-                YDYP_GATEWAY_HOST + YDYP_AUTH_PATH,
+                self.market_base_url + YDYP_AUTH_PATH,
                 headers=headers,
                 data=payload,
                 method='POST',
@@ -2468,10 +2473,8 @@ class YP:
         if pending_amount:
             receive_headers = self.build_receive_headers()
             receive_cookies = dict(self.market_cookies)
-            # receiveV3 为 POST + JSON，cloudId/cloudType 为空表示领取签到累积云朵。
-            # H5 的 axios 拦截器对 isDeviceId 接口会把 deviceId 注入 body，
-            # 缺失时服务端返回 614「锁定失败」，必须带上。
-            receive_body = {'client': 'app', 'cloudId': '', 'cloudType': ''}
+            # App one-tap claim uses type 4 with an empty record ID.
+            receive_body = {'client': 'app', 'cloudId': '', 'cloudType': 4}
             device_id = self.get_market_device_id()
             if device_id:
                 receive_body['deviceId'] = device_id
@@ -2481,7 +2484,7 @@ class YP:
                 cookies=receive_cookies,
                 data=receive_body,
                 method='POST',
-                retries=2,
+                retries=1,
             )
             if not receive_data:
                 self.log('领取云朵失败: 接口无响应')
@@ -2502,11 +2505,9 @@ class YP:
                     self.log(f'-领取云朵:{claimed_amount}云朵')
                     total_amount = latest_total
                 else:
-                    # 614/615 在新协议下多为「奖品池已抢空 / 无可领份额」的业务性拒绝，
-                    # 与 deviceId 无关，不再误导性地提示检查 deviceId。
                     code = receive_data.get('code')
                     if code in (614, 615):
-                        self.log(f"-本轮无可领份额（code={code}），保留待领取:{pending_amount}云朵")
+                        self.log(f"-领取被拒绝（code={code}），当前待领取:{latest_pending}云朵")
                     else:
                         self.log(f"领取云朵失败: {receive_data.get('msg', '未知错误')}")
                         self.log(f'-当前待领取:{pending_amount}云朵')
