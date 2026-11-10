@@ -96,33 +96,6 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 
 各脚本所需环境变量、依赖和定时规则请查看对应文件头部说明。
 
-## 微软积分配置
-
-在青龙中新增并启用一条环境变量 `MS_REWARDS_ACCOUNTS`，多账号每行一条：
-
-```text
-your_account@example.com#your_password
-another_account@example.com#your_password#YOUR_TOTP_SECRET
-```
-
-未设置二次验证时省略第三项；第三项填写 TOTP 密钥，不是动态验证码。密码含 `#` 时写成 `\#`，反斜杠可写成 `\\`。地区固定为 `cn`、语言为 `en`、不使用代理。账号信息无需写入脚本，订阅更新不会覆盖环境变量。
-
-仅检查配置、不登录和不执行积分任务：
-
-```bash
-task lcmovie_YYB-GO-Script-i_main/idp-script/microsoft_rewards.js -- --check-config
-```
-
-## 红色火箭配置
-
-`wx-script/hshj.js` 为单文件版，需要 Node.js 18 或更新版本。配置自己的 `YYB_SERVER`，格式为 `YYB地址@已授权账号ref`，多账号换行；若 YYB 启用协议鉴权，再配置 `YYB_API_KEY` 或 `YYB_PROTOCOL_TOKEN`。账号须先在自己的 YYB 服务中授权。`WX_ID` 可不填，默认运行全部配置账号，也可用 `ref#备注` 指定账号。
-
-脚本包含签到、每日活动发现、ROE口令查询与兑换、算术图形验证码本地识别、兑换记录核验、积分与红包记录查询。无需安装 axios、Python 或额外部署识别服务。首次运行需联网并允许缓存目录写入，自动下载并校验约88MB固定版本识别资源，缓存需约90MB空间，后续复用本地缓存。识别不确定时最多换三张图，仍不能识别则提示手动完成，不保证所有验证码都能自动识别。
-
-默认在小程序手动领取现金红包。需要自动领取时，配置 `HSJJ_H5_CLAIM_REFS`（主账号 ref，以逗号分隔），并使用支持 `POST /wx/h5code` 的 YYB-Go-Enhanced。每个指定账号每次运行最多尝试一笔待领取红包，授权失败时请手动处理。平台发放状态与微信零钱到账分别核对。缓存目录会保留领取尝试记录，响应不明时防止重复提交。
-
-通知沿用青龙已有 `sendNotify` 模块与渠道设置，正文只含账号汇总；没有可用通知模块时保留日志汇总。`HSJJ_AUTO_CAPTCHA=0` 关闭验证码识别，`HSJJ_NOTIFY=0` 关闭通知，`HSJJ_OCR_CACHE` 可指定识别资源目录。用 `node hshj.js --help` 查看说明，`--check-setup` 检查配置，`--prepare-ocr` 只初始化识别资源。
-
 ## 注意事项
 
 - 微信登录 code 通常只能使用一次，多个微信任务请错开运行时间。
