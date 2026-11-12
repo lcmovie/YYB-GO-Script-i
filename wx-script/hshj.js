@@ -223,7 +223,7 @@ function formatAccountSummary(account) {
     const pendingAmount = account.pendingRedPacketAmount || 0;
     return '当前账号: ' + display + ' 当前积分: ' + currentPoint
         + ' 后端红包记录累计:' + formatMoney(historyAmount) + '元'
-        + ' 本次查询待领取红包: ' + formatMoney(pendingAmount) + '元'
+        + ' 领取前待领红包: ' + formatMoney(pendingAmount) + '元'
         + (account.roeOutcome ? ' 答题: ' + account.roeOutcome : '')
         + (account.ok === false ? '（' + (account.taskIssues?.length ? account.taskIssues.join('；') : '部分任务未完成') + '）' : '');
 }
@@ -1558,56 +1558,84 @@ async function claimSingleCashPacket(session, ref, packet, ledger, marker) {
     const request = (url, options) => fetch(url, {
         ...options, redirect: 'manual', signal: AbortSignal.timeout(20000),
     });
-    const landing = await request(page, { headers: { 'User-Agent': userAgent } });
-    const location = landing.headers.get('location');
-    await landing.body?.cancel();
-    if (landing.status !== 302 || !location) throw Error('oauth_redirect_missing');
-    const oauth = new URL(location, page);
-    if (oauth.origin !== 'https://open.weixin.qq.com' || oauth.pathname !== '/connect/oauth2/authorize'
-        || oauth.searchParams.get('appid') !== h5AppId) throw Error('oauth_route');
-    const redirectUri = oauth.searchParams.get('redirect_uri');
-    const callback = new URL(redirectUri);
-    if (callback.origin !== origin || callback.pathname !== pagePath || callback.username || callback.password
-        || callback.searchParams.has('code') || callback.searchParams.has('state')) throw Error('callback_route');
-    const scope = oauth.searchParams.get('scope');
-    const state = oauth.searchParams.get('state');
-    if (!['snsapi_base', 'snsapi_userinfo'].includes(scope) || state !== packet.ticketCode) throw Error('oauth_parameters');
-    const h5 = await axios.post(item.server + '/wx/h5code', {
-        ref, app_id: h5AppId, payload: { redirect_uri: redirectUri, scope, state },
-    }, { headers: _yybAuthHeaders(), timeout: 30000, validateStatus: () => true });
-    const result = h5.data?.result ?? h5.data?.data?.result;
-    const message = String(h5.data?.error || h5.data?.msg || h5.data?.message || '');
-    const upstreamCode = message.match(/(?:code|ret|retcode)\s*[=:]\s*(-\d+)/i)?.[1];
-    if (h5.status !== 200 || !result?.code || result.state !== state) {
-        throw Error('YYB H5 取码失败（HTTP ' + h5.status + (upstreamCode ? '，上游 ' + upstreamCode : '') + '）');
+    const authorize = async () => {
+        const landing = await request(page, { headers: { 'User-Agent': userAgent } });
+        const location = landing.headers.get('location');
+        await landing.body?.cancel();
+        if (landing.status !== 302 || !location) throw Error('oauth_redirect_missing');
+        const oauth = new URL(location, page);
+        if (oauth.origin !== 'https://open.weixin.qq.com' || oauth.pathname !== '/connect/oauth2/authorize'
+            || oauth.searchParams.get('appid') !== h5AppId) throw Error('oauth_route');
+        const redirectUri = oauth.searchParams.get('redirect_uri');
+        const callback = new URL(redirectUri);
+        if (callback.origin !== origin || callback.pathname !== pagePath || callback.username || callback.password
+            || callback.searchParams.has('code') || callback.searchParams.has('state')) throw Error('callback_route');
+        const scope = oauth.searchParams.get('scope');
+        const state = oauth.searchParams.get('state');
+        if (!['snsapi_base', 'snsapi_userinfo'].includes(scope) || state !== packet.ticketCode) throw Error('oauth_parameters');
+        const h5 = await axios.post(item.server + '/wx/h5code', {
+            ref, app_id: h5AppId, payload: { redirect_uri: redirectUri, scope, state },
+        }, { headers: _yybAuthHeaders(), timeout: 30000, validateStatus: () => true });
+        const result = h5.data?.result ?? h5.data?.data?.result;
+        const message = String(h5.data?.error || h5.data?.msg || h5.data?.message || '');
+        const upstreamCode = message.match(/(?:code|ret|retcode)\s*[=:]\s*(-\d+)/i)?.[1];
+        if (h5.status !== 200 || !result?.code || result.state !== state) {
+            throw Error('YYB H5 取码失败（HTTP ' + h5.status + (upstreamCode ? '，上游 ' + upstreamCode : '') + '）');
+        }
+        callback.searchParams.set('code', result.code);
+        callback.searchParams.set('state', state);
+        const response = await request(callback, { headers: { 'User-Agent': userAgent, Referer: page.href } });
+        const html = await response.text();
+        const attrs = [...html.matchAll(/<input\b[^>]*>/gi)].map(([input]) =>
+            Object.fromEntries([...input.matchAll(/([\w-]+)\s*=\s*(["'])(.*?)\2/g)].map(m => [m[1].toLowerCase(), m[3]])));
+        const authorizedOpenId = response.headers.get('set-cookie')?.match(/(?:^|[,;]\s*)cfyh=([^;,]+)/)?.[1]
+            || attrs.find(a => a.id === 'openid')?.value;
+        if (response.status !== 200) throw Error('红包网页授权回调失败');
+        if (!/^o[A-Za-z0-9_-]{20,}$/.test(authorizedOpenId || '')) throw Error('h5_identity_missing');
+        return authorizedOpenId;
+    };
+    const identityFile = pathMod.join(CACHE_DIR, 'h5-claim-identities',
+        require('crypto').createHash('sha256').update(ref).digest('hex') + '.json');
+    const ownerMatches = binding => binding?.businessOpenId === session.openId
+        && String(binding.userId) === String(session.userId)
+        && binding.urltag === 'cfyh' && /^o[A-Za-z0-9_-]{20,}$/.test(binding.h5Openid || '');
+    let binding;
+    try { binding = JSON.parse(fs.readFileSync(identityFile, 'utf8')); }
+    catch (error) {
+        if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;
     }
-    callback.searchParams.set('code', result.code);
-    callback.searchParams.set('state', state);
-    const response = await request(callback, { headers: { 'User-Agent': userAgent, Referer: page.href } });
-    const html = await response.text();
-    const attrs = [...html.matchAll(/<input\b[^>]*>/gi)].map(([input]) =>
-        Object.fromEntries([...input.matchAll(/([\w-]+)\s*=\s*(["'])(.*?)\2/g)].map(m => [m[1].toLowerCase(), m[3]])));
-    const openId = response.headers.get('set-cookie')?.match(/(?:^|[,;]\s*)cfyh=([^;,]+)/)?.[1]
-        || attrs.find(a => a.id === 'openid')?.value;
-    if (response.status !== 200) throw Error('红包网页授权回调失败');
-    if (!/^o[A-Za-z0-9_-]{20,}$/.test(openId || '')) throw Error('h5_identity_missing');
-    const form = new URLSearchParams({ prj_code: packet.ticketCode, prj_urltag: 'cfyh', openid: openId });
+    // 兼容此前手动领取留下的归属绑定，禁止跨业务身份使用。
+    if (!ownerMatches(binding)) binding = getCache(loadCache(), ref)?.h5Binding;
+    const reused = ownerMatches(binding);
+    let openId = reused ? binding.h5Openid : await authorize();
+
     const platform = async endpoint => {
         const result = await request(origin + '/mktadmin/wcode/' + endpoint, {
-            method: 'POST', body: form,
+            method: 'POST', body: new URLSearchParams({ prj_code: packet.ticketCode, prj_urltag: 'cfyh', openid: openId }),
             headers: { 'User-Agent': userAgent, Referer: page.href, 'X-Requested-With': 'XMLHttpRequest', Cookie: 'cfyh=' + openId },
         });
         if (!result.ok) throw Error('platform_http_' + result.status);
         return result.json();
     };
     const query = () => platform('getCodeBaseInfo');
-    const preflight = await query();
+    let preflight = await query();
+    if (reused && preflight?.success !== true && String(preflight?.message) === 'c0013') {
+        openId = await authorize();
+        preflight = await query();
+    }
     const info = preflight?.value?.activityPrjCode;
     const status = String(info?.if_used);
     const amount = Number(info?.user_bonus);
     if (preflight?.success !== true || !['1', '-1'].includes(status) || String(info.if_del) === '1'
         || (info.openid && info.openid !== openId) || (info.prj_code && info.prj_code !== packet.ticketCode)
         || !Number.isSafeInteger(amount) || amount <= 0) return '平台未确认可领，需手动核对';
+    fs.mkdirSync(pathMod.dirname(identityFile), { recursive: true, mode: 0o700 });
+    const identityTemp = identityFile + '.' + process.pid + '.' + require('crypto').randomBytes(6).toString('hex');
+    try {
+        fs.writeFileSync(identityTemp, JSON.stringify({ businessOpenId: session.openId,
+            userId: String(session.userId), urltag: 'cfyh', h5Openid: openId }), { flag: 'wx', mode: 0o600 });
+        fs.renameSync(identityTemp, identityFile);
+    } finally { if (fs.existsSync(identityTemp)) fs.unlinkSync(identityTemp); }
     const listedAmount = packet.amount ?? packet.rewardAmount;
     if (listedAmount != null && Math.round(Number(listedAmount) * 100) !== amount) throw Error('红包金额核验失败');
     // 在任何写请求之前保留提交凭据。异常退出后也不重放这笔红包。
@@ -1748,7 +1776,7 @@ async function runTask(accountInfo) {
         const historyRedPacketAmount = manual.historyRedPacketAmount;
         log('  📊 历史已标记领取记录: ' + manual.historyCount + '笔，累计' + formatMoney(historyRedPacketAmount) + '元（非本次收益）');
         if (manual.pendingRedPacketCount > 0) {
-            log('  🎁 本次查询待领取红包: ' + manual.pendingRedPacketCount + '笔，合计' + formatMoney(pendingRedPacketAmount) + '元');
+            log('  🎁 领取前待领红包: ' + manual.pendingRedPacketCount + '笔，合计' + formatMoney(pendingRedPacketAmount) + '元');
         } else {
             log('  ℹ️ 后台未返回新的待领红包');
         }
