@@ -11,7 +11,7 @@ cron: 31 7,12,23 * * *
 修改作者：lcmovie https://github.com/lcmovie/YYB-GO-Script-i
 修改后主要适配：https://github.com/525815266/YYB-Go-Enhanced，实现无感取码，自动打卡 + 全部成长任务！
 ════════════════════════════════════════════════════════════════
-🌱 WorkBuddy Daily - 全能签到脚本 v3.44（YYB 无感取码版）
+🌱 WorkBuddy Daily - 全能签到脚本 v3.47（YYB 无感取码版）
 ════════════════════════════════════════════════════════════════
 
 📌 这是什么
@@ -76,7 +76,7 @@ cron: 31 7,12,23 * * *
    PUSH_PLUS_TOKEN / PLUSPLUS_TOKEN / PUSH_KEY / QYWX_KEY / BARK_PUSH
                         【可选】脚本自带通知通道（青龙 notify.py 未配置时回落）
 
-📦 任务清单（参考上游 v3.44，以下任务以实际下发为准）
+📦 任务清单（参考上游 v3.47，以下任务以实际下发为准）
    ☁️ 已适配成长任务：每日签到 · 设计创意模式 · 探索优秀灵感 · 桌面端对话 ·
       尝鲜热门技能 · 体验资料库 · 腾讯轻量云专家 · 和平精英主题 · 发现应用 ·
       企鹅教师助手 · GLM-5.2模型对话 · 和AI聊天5次 · 夜猫子活动 · 召唤3次专家团 ·
@@ -151,7 +151,7 @@ import uuid
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse, urlsplit
+from urllib.parse import parse_qs, urlencode, urlparse, urlsplit
 
 import requests
 
@@ -161,9 +161,9 @@ try:
 except Exception:
     pass
 
-VERSION = "1.9.4"
-UPSTREAM_VERSION = "3.44"
-UPSTREAM_COMMIT = "029b7309e7cdac9c08b34d9cbf5dcbc55b825b2b"
+VERSION = "1.9.5"
+UPSTREAM_VERSION = "3.47"
+UPSTREAM_COMMIT = "e2eb20c7a80b388d9393e19369cbbf78827d00df"
 APP_ID = "wx907c65e5e107ddcf"                     # WorkBuddy 小程序 AppID
 LOGIN_URL = "https://www.codebuddy.cn/v2/plugin/login/token"
 PROFILE_URL = "https://www.codebuddy.cn/v2/as/wechatmp/user/profile"
@@ -2101,17 +2101,25 @@ def t_accept_all(s, uid, nick, log):
 
 
 def t_team_3(s, uid, nick, log):
+    """召唤3次专家团：真实团队对话+全字段遥测"""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    st, cur, tgt = prog(s, "Expert_team_use_3")
+    if st is None:
+        log("   Expert_team_use_3: 当前任务列表未下发（可能已下线），跳过")
+        return
     teams = get_team_experts(10)
     if not teams:
         return
     for rd in range(3):
         st, cur, tgt = prog(s, "Expert_team_use_3")
+        if st is None:
+            log("   Expert_team_use_3: 当前任务列表未下发（可能已下线），跳过")
+            break
         if st in ("completed", "claimed") or (cur or 0) >= (tgt or 3):
             break
         team = teams[rd % len(teams)]
         prompt = "你好，请简单介绍一下你们团队能帮我做什么，回答OK即可"
-        req_id = str(uuid.uuid4())
-        msg_id = "cmb-" + str(uuid.uuid4())
+        req_id = str(uuid.uuid4()); msg_id = "cmb-" + str(uuid.uuid4())
         ge = [{"eventCode": "ExpertActualUse", "id": team["id"],
                "extra": {"name": team["name"], "expertTitle": team.get("profession", ""),
                          "type": team.get("industryId", "") or "", "expertType": "team",
@@ -2137,6 +2145,7 @@ def t_team_3(s, uid, nick, log):
 
 
 def t_buddy_apps(s, uid, nick, log):
+    """发现应用/企鹅教师助手：desktop_buddy5_sequence + report_desktop_events"""
     for task in ("Buddy_App", "Buddy_App_QQ"):
         st, cur, tgt = prog(s, task)
         if st is None:
@@ -2149,9 +2158,17 @@ def t_buddy_apps(s, uid, nick, log):
         buddy_name = "企鹅教师助手" if "QQ" in task else "发现应用"
         evs = desktop_buddy5_sequence(uid, nick, buddy_id, buddy_name)
         try:
-            report_desktop_events(s, uid, nick, evs)
-            log("   %s: buddyapp 五连 OK" % task)
-            time.sleep(WRITE_GAP)
+            report_status = report_desktop_events(s, uid, nick, evs)
+            if report_status < 200 or report_status >= 300:
+                log("   %s: buddyapp 五连上报失败 HTTP %s" % (
+                    task, report_status))
+                continue
+            time.sleep(4)
+            st2, cur2, tgt2 = prog(s, task)
+            log("   %s: buddyapp 五连已受理，回读 %s %s/%s" % (
+                task, st2, cur2, tgt2))
+            if st2 == "completed":
+                claim(s, task, log)
         except Exception as e:
             log("   %s: buddyapp failed %s" % (task, str(e)[:60]))
     log("   发现应用/企鹅教师助手: %s / %s" % (prog(s, "Buddy_App")[0], prog(s, "Buddy_App_QQ")[0]))
@@ -2202,10 +2219,28 @@ def t_library(s, uid, nick, log):
     if st in ("completed", "claimed"):
         log("   体验资料库: 已 %s" % st)
         return
-    report_web_event(s, uid, nick, "web_element_click", LIB_DOC_URL,
-                     "library_doc_intro_click", "WorkBuddy资料库介绍")
+    response = report_web_event(
+        s, uid, nick, "web_element_click", LIB_DOC_URL,
+        "library_doc_intro_click", "WorkBuddy资料库介绍",
+    )
+    status_code = getattr(response, "status_code", 0)
+    try:
+        payload = response.json() or {}
+    except Exception:
+        payload = {}
+    if status_code < 200 or status_code >= 300 or not _api_code_ok(
+            payload.get("code")):
+        log("   体验资料库: 上报失败 HTTP %s code=%s %s" % (
+            status_code,
+            payload.get("code", "?"),
+            str(payload.get("msg") or "")[:60],
+        ))
+        return
     time.sleep(6)
-    log("   体验资料库: %s" % prog(s, "Library_read")[0])
+    status, current, target = prog(s, "Library_read")
+    log("   体验资料库: %s %s/%s" % (status, current, target))
+    if status == "completed":
+        claim(s, "Library_read", log)
 
 
 def t_chat_n(s, uid, nick, log, code, n, prompts):
@@ -2260,8 +2295,13 @@ def t_black_cat(s, uid, nick, log):
 
 
 def t_expert_5(s, uid, nick, log):
-    experts = get_normal_experts(20)
+    """召唤5次专家：普通专家遥测"""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     st0, cur0, tgt0 = prog(s, "expert_5")
+    if st0 is None:
+        log("   expert_5: 当前任务列表未下发（可能已下线），跳过")
+        return
+    experts = get_normal_experts(20)
     need = max(0, (tgt0 or 5) - (cur0 or 0))
     if st0 in ("completed", "claimed"):
         need = 0
@@ -2270,13 +2310,14 @@ def t_expert_5(s, uid, nick, log):
         if st in ("completed", "claimed") or (cur or 0) >= (tgt or 5):
             break
         e = experts[i % len(experts)] if experts else {"id": "expert-" + str(uuid.uuid4())[:8], "name": "Expert", "profession": ""}
+        rid = _new_message_id()
         report(s, uid, nick, [
             {"eventCode": "expert_summoned", "id": e["id"], "name": e["name"], "type": "agent",
              "expertTitle": e.get("profession", ""), "expertType": "agent"},
             {"eventCode": "expert_actual_use", "id": e["id"], "name": e["name"], "type": e.get("industryId", "") or "",
              "expertType": "agent", "source": "builtin", "version": "", "cost": 0, "characterCount": 12,
-             "conversationId": "conv-" + str(uuid.uuid4()), "requestId": str(uuid.uuid4()),
-             "messageId": "msg-" + str(uuid.uuid4()),
+             "conversationId": _new_conversation_id(), "requestId": rid,
+             "messageId": "msg-" + rid[-8:],
              "requestModelId": "deepseek-v4-flash", "requestModelName": "DeepSeek V4 Flash"}])
         time.sleep(3)
     st, cur, tgt = prog(s, "expert_5")
@@ -2296,12 +2337,25 @@ def _fetch_scenes(s):
 
 
 def t_template_5(s, uid, nick, log):
+    """使用5个模板：真实场景 id（/console/as/support/scenes）+ 事件组上报
+
+    上游实测：一组 agent_task_created_with_template + template_used 计 1/5 进度；
+    template_id 服务端不校验真实性，但用真实场景 id 更稳（旧版写死的 01-ProductDesign
+    形态并不存在于线上场景表）。
+    """
+    initial_state = prog(s, "template_5")
+    if initial_state[0] is None:
+        log("   template_5: 当前任务列表未下发（可能已下线），跳过")
+        return
     scenes = _fetch_scenes(s)[:5]
     for tid, tname in scenes:
         st, cur, tgt = prog(s, "template_5")
+        if st is None:
+            log("   template_5: 当前任务列表未下发（可能已下线），跳过")
+            break
         if st in ("completed", "claimed") or (cur or 0) >= (tgt or 5):
             break
-        rid = "wb2api-tpl-%d-%s" % (int(time.time() * 1000), tid)
+        rid = _new_message_id()
         report(s, uid, nick, [
             {"eventCode": "agent_task_created", "source": "CLOUD", "name": "", "mode": "craft",
              "requestModelId": "default", "action": tid, "has_template": True, "template_id": tid,
@@ -3331,8 +3385,10 @@ def mp_mini_expert_event(uid, nick, expert_id, expert_name):
             "type": "send_message", "characterCount": 12, "expertType": "agent"}
 
 
-def mp_report(s, uid, nick, events):
+def mp_report(s, uid, nick, events, env_extra=None):
     base = mp_base(uid, nick)
+    if env_extra:
+        base.update(env_extra)
     arr = []
     for e in events:
         m = dict(base)
@@ -3913,6 +3969,335 @@ def t_skill_share(s, uid, nick, log):
     log("   分享技能给好友：奖励回执已确认，任务状态尚待刷新")
 
 
+CAMPAIGN_BASE = "https://www.codebuddy.cn"
+
+
+CAMPAIGN_SPECS = [
+    {
+        "code": "campaign_starbucks_2026", "label": "星巴克协作",
+        # 真机埋点每条都带页面上下文（pageURL/pageName），活动判据按页认人
+        "page": {"pageURL": "subpackages/secondary/starbucks-activity-428/index",
+                 "pageName": "starbucks_activity"},
+        "tasks": [
+            {"task": "ai_chat", "label": "与 AI 对话3次", "kind": "chat",
+             "times": 3, "credit": 100},
+            {"task": "expert", "label": "召唤专家并对话", "kind": "expert",
+             "credit": 100},
+            # 需手机端 App 登录后与 AI 对话一次；脚本只负责到账，不伪造事件
+            {"task": "app", "label": "解锁 App 强大能力", "kind": "app",
+             "credit": 100},
+        ],
+    },
+    {
+        "code": "campaign_reporter_2026", "label": "记者节福利活动",
+        "page": {"pageURL": "subpackages/journalist-benefit/index",
+                 "pageName": "journalist_benefit"},
+        "tasks": [
+            {"task": "expert_chat", "label": "体验「媒体工作助理」专家", "kind": "expert",
+             "expert_id": "ex_NaiDbO06Adf3", "expert_name": "媒体工作助理", "credit": 50},
+            {"task": "skill_use", "label": "体验「采访素材整理」技能", "kind": "skill",
+             # 判据按**技能 slug** 认人：skillName/id 传 "采访素材整理" 不计数，
+             # 传 market 里 registry 的 name（interview-material-organizer）才推进度。
+             "skill_id": "skill_2117491159283752960",
+             "skill_name": "interview-material-organizer",
+             "credit": 50},
+            # 活动判据读取桌面灵感事件，id 使用产物目录 cnb-content-calendar。
+            {"task": "desktop_same", "label": "体验「内容发布排期」灵感", "kind": "desktop",
+             "case_id": "content-calendar", "credit": 100},
+        ],
+    },
+]
+
+
+def _campaign_headers(s, uid):
+    """活动页请求头：小程序身份（桌面 AT 直接可用，服务端按账号体系认人）。"""
+    hdr = dict(MP_REPORT_HEADERS)
+    hdr["Authorization"] = s.headers.get("Authorization", "")
+    if uid:
+        hdr["X-User-Id"] = uid
+    return hdr
+
+
+def _campaign_skill_events(skill_id, skill_name):
+    """技能体验判据：skill_info + 带 skillId 的 chat_request_send。"""
+    conv = _new_conversation_id()
+    rid = _new_message_id()
+    info = {"eventCode": "skill_info", "id": skill_name, "skillId": skill_id,
+            "skillName": skill_name, "skillType": "market", "skillSource": "market",
+            "position": 0, "conversationId": conv}
+    chat = {"eventCode": "chat_request_send", "inputLength": 14, "isPlan": False,
+            "isAutoExecuteTerminal": False, "isAutoModify": False, "codebaseEnable": False,
+            "maxToken": 0, "maxSteps": 500, "temperature": 0, "maxRetries": 0,
+            "mentionContexts": [], "knowledgeId": [], "knowledgeName": [],
+            "codebaseId": "", "mentionContextCount": 0, "command": "",
+            "recommendId": "", "skillId": skill_id, "skillCount": 1, "totalCount": 0,
+            "traceId": rid, "rootRequestId": rid,
+            "parentConversationId": conv, "conversationId": conv,
+            "messageId": "msg-" + rid[-8:], "agentName": "mp", "agentType": "main",
+            "codebuddy.session_id": conv,
+            "codebuddy.conversation_request_id": rid}
+    return [info, chat]
+
+
+CAMPAIGN_CASES = {
+    "content-calendar": {
+        # 上报用的 id 是产物目录名（cnb- 前缀），不是注册表里的 slug
+        "event_id": "cnb-content-calendar",
+        "name": "内容发布排期表",
+        "type": "table",
+        "prompt_length": 359,
+    },
+}
+
+
+def _campaign_desktop_events(case):
+    """桌面域 `playbook_prompt_send`：活动判据只认这一条。"""
+    return [{"eventCode": "playbook_prompt_send",
+             "id": case.get("event_id") or "",
+             "name": case.get("name") or "",
+             "type": case.get("type") or "other",
+             "promptLength": case.get("prompt_length") or 0,
+             "isOfficial": 1,
+             "source": "discover",
+             "query": "",
+             "ext1": "discover",
+             "requestId": str(uuid.uuid4()),
+             "conversationId": str(uuid.uuid4())}]
+
+
+def _campaign_desktop_same(s, uid, nick, spec, task, log):
+    """reporter desktop_same：一条 `playbook_prompt_send` 即可点亮。
+
+    判据按 `id` 认案例，且必须是产物目录名 `cnb-content-calendar`
+    （传 `content-calendar` 或中文名都不计数，2026-11-12 实测）。
+    """
+    case_id = task.get("case_id") or "content-calendar"
+    case = CAMPAIGN_CASES.get(case_id) or {}
+    if not case:
+        log("      ⚠️ %s: 未内置案例 %s" % (task["label"], case_id))
+        return False
+    try:
+        return report(s, uid, nick, _campaign_desktop_events(case)) == 200
+    except Exception:
+        return False
+
+
+def _campaign_fire(s, uid, nick, spec, task, log):
+    """按 kind 上报一次判据事件；返回是否已上报。"""
+    kind = task.get("kind")
+    page = spec.get("page") or None
+    if kind == "desktop":
+        return _campaign_desktop_same(s, uid, nick, spec, task, log)
+    if kind == "app":
+        log("      ⚠️ %s: 需手机端 App 登录后与 AI 对话一次，脚本不伪造" % task["label"])
+        return False
+    if kind == "chat":
+        return mp_report(s, uid, nick, [mp_chat_event(uid, nick, _new_conversation_id())],
+                         env_extra=page) == 200
+    if kind == "expert":
+        eid = task.get("expert_id")
+        ename = task.get("expert_name")
+        if not eid:
+            eid, ename = _mp_pick_expert(s)
+        if not eid:
+            log("      ✗ %s: 取不到专家 id，跳过" % task["label"])
+            return False
+        return mp_report(s, uid, nick, mp_expert_use_events(
+            uid, nick, eid, ename, _new_conversation_id()), env_extra=page) == 200
+    if kind == "skill":
+        return mp_report(s, uid, nick, _campaign_skill_events(
+            task.get("skill_id"), task.get("skill_name")), env_extra=page) == 200
+    return False
+
+
+def _campaign_call(s, uid, method, path, body=None):
+    with requests.Session() as session:
+        session.trust_env = False
+        try:
+            response = session.request(method, CAMPAIGN_BASE + path, json=body,
+                                       headers=_campaign_headers(s, uid), timeout=20,
+                                       verify=False, allow_redirects=False)
+            return response.status_code, _json_or_empty(response)
+        except requests.RequestException:
+            return 0, {}
+
+
+def _campaign_ok(status, payload):
+    code = payload.get("code")
+    return status == 200 and not isinstance(code, bool) and code in (0, "0")
+
+
+def _campaign_count(value):
+    number = _credit_decimal(value)
+    if number < 0 or number != number.to_integral_value():
+        raise ValueError()
+    return int(number)
+
+
+def campaign_tasks(s, uid, camp, log):
+    status, payload = _campaign_call(
+        s, uid, "GET", "/portal/activity/tasks?" + urlencode({"activity_code": camp}))
+    data = payload.get("data")
+    if not _campaign_ok(status, payload) or not isinstance(data, dict):
+        log("   ⚠️活动任务读取失败[%s]（HTTP %s）" % (camp, status))
+        return None
+    tasks = data.get("tasks")
+    progress = data.get("progress") or []
+    if (not isinstance(tasks, list) or not isinstance(progress, list)
+            or any(not isinstance(row, dict) for row in tasks + progress)):
+        log("   ⚠️活动任务读取失败[%s]（结构无效）" % camp)
+        return None
+    by_code = {row.get("task_code"): row for row in progress}
+    result = {}
+    for task in tasks:
+        code = task.get("task_code")
+        if not isinstance(code, str) or not code:
+            continue
+        row = by_code.get(code, {})
+        try:
+            target = _campaign_count(task.get("target_count"))
+            current = _campaign_count(row.get("progress", 0))
+            if target == 0:
+                raise ValueError()
+        except (ValueError, ArithmeticError):
+            log("   ⚠️活动任务结构无效[%s/%s]" % (camp, code))
+            continue
+        try:
+            credit = _credit_decimal(task.get("reward_credit"))
+            if credit < 0:
+                raise ValueError()
+        except (ValueError, ArithmeticError):
+            credit = None
+        result[code] = {
+            "target": target, "progress": current, "credit": credit,
+            "completed_at": row.get("completed_at"), "claimed_at": row.get("claimed_at"),
+            "need_view": task.get("need_view", True) is not False,
+        }
+    return result
+
+
+def _campaign_poll(s, uid, camp, code, target, log, *, tries=6, gap=3):
+    for attempt in range(tries):
+        if attempt:
+            time.sleep(gap)
+        rows = campaign_tasks(s, uid, camp, log)
+        if rows is None:
+            return None
+        row = rows.get(code)
+        if row is None:
+            return None
+        if row["claimed_at"] or row["completed_at"] or row["progress"] >= target:
+            return row
+    return row
+
+
+def _campaign_claim(s, uid, camp, code, log):
+    attempts = getattr(s, "_workbuddy_campaign_claims", None)
+    if not isinstance(attempts, set):
+        attempts = s._workbuddy_campaign_claims = set()
+    key = (camp, code)
+    if key in attempts:
+        return None
+    attempts.add(key)
+    path = "/portal/activity/tasks/%s/claim?%s" % (code, urlencode({"activity_code": camp}))
+    status, payload = _campaign_call(s, uid, "POST", path, {})
+    if not _campaign_ok(status, payload):
+        log("   ⚠️活动领奖失败[%s/%s]（HTTP %s）" % (camp, code, status))
+        return None
+    for attempt in range(5):
+        if attempt:
+            time.sleep(4)
+        rows = campaign_tasks(s, uid, camp, log)
+        row = rows.get(code) if rows is not None else None
+        if row and row["claimed_at"]:
+            value = row["credit"]
+            reward = "奖励金额未提供" if value is None else "+%s 积分" % _format_credit(value)
+            log("   🎁活动领奖[%s/%s]: %s（claimed_at 已回读）" % (camp, code, reward))
+            return row
+    log("   ⚠️活动领奖[%s/%s]: 已提交但未确认 claimed_at，留待下轮回读" % (camp, code))
+    return None
+
+
+def _run_campaign(s, uid, nick, spec, log):
+    camp = spec["code"]
+    result = {"label": spec["label"], "new_credit": "0", "confirmed": [],
+              "manual": [], "pending": [], "preclaimed": 0, "loaded": False}
+    rows = campaign_tasks(s, uid, camp, log)
+    if rows is None:
+        return result
+    result["loaded"] = True
+    if not rows:
+        log("   🎪%s：当前未下发活动任务" % spec["label"])
+        return result
+    gained = Decimal(0)
+    unknown_credit = False
+    for task in spec["tasks"]:
+        code = task["task"]
+        row = rows.get(code)
+        if row is None:
+            log("   🎪%s/%s：未下发，跳过" % (spec["label"], task["label"]))
+            continue
+        if row["claimed_at"]:
+            result["preclaimed"] += 1
+            continue
+        target = row["target"]
+        if not row["completed_at"] and row["progress"] < target:
+            if task["kind"] == "app":
+                result["manual"].append(task["label"])
+                log("   🎪%s：需手机 App 登录并对话，完成后再运行可补领" % task["label"])
+                continue
+            if row["need_view"]:
+                status, payload = _campaign_call(s, uid, "POST",
+                    "/portal/activity/tasks/%s/viewed?%s" % (code, urlencode({"activity_code": camp})), {})
+                if not _campaign_ok(status, payload):
+                    log("   ⚠️活动查看登记失败[%s/%s]（HTTP %s）" % (camp, code, status))
+                    result["pending"].append(task["label"])
+                    continue
+            remaining = target - row["progress"]
+            if task["kind"] == "desktop":
+                remaining = min(remaining, 1)
+            for _ in range(remaining):
+                if not _campaign_fire(s, uid, nick, spec, task, log):
+                    log("   ⚠️活动事件上报失败[%s/%s]" % (camp, code))
+                    break
+                row = _campaign_poll(s, uid, camp, code, target, log)
+                if row is None or row["claimed_at"] or row["completed_at"] or row["progress"] >= target:
+                    break
+            if row and not row["claimed_at"] and not row["completed_at"] and row["progress"] < target:
+                row = _campaign_poll(s, uid, camp, code, target, log, tries=6, gap=10)
+            if not row or (not row["claimed_at"] and not row["completed_at"] and row["progress"] < target):
+                result["pending"].append(task["label"])
+                log("   🎪%s：判据延迟未落库，留待下轮回读" % task["label"])
+                continue
+        if row["claimed_at"]:
+            continue
+        confirmed = _campaign_claim(s, uid, camp, code, log)
+        if confirmed:
+            result["confirmed"].append(task["label"])
+            if confirmed["credit"] is not None:
+                gained += confirmed["credit"]
+            else:
+                unknown_credit = True
+        else:
+            result["pending"].append(task["label"])
+    if "invite" in rows:
+        log("   🎪%s：邀请项仅展示状态，沿用现有邀请机制" % spec["label"])
+    result["new_credit"] = None if unknown_credit else _format_credit(gained)
+    return result
+
+
+def t_campaigns(s, uid, nick, log):
+    results = []
+    for spec in CAMPAIGN_SPECS:
+        if not want("campaign", spec["code"]):
+            continue
+        try:
+            results.append(_run_campaign(s, uid, nick, spec, log))
+        except Exception as exc:
+            log("   ⚠️活动处理异常[%s]（%s）" % (spec["code"], type(exc).__name__))
+    return results
+
+
 def t_unknown_tasks(s, uid, nick, log):
     """任务列表体检：动态发现新任务 + 未完成任务的有效期预警
 
@@ -4009,38 +4394,113 @@ SESSION_DIRS = [os.path.join(os.path.expanduser("~"), ".workbuddy-ai", "sessions
                 os.path.join(os.path.expanduser("~"), ".workbuddy", "sessions")]
 
 
+_SWAP_MARK = "_wb_all_swapped"
+
+
 def swap_info(tok):
+    """把 .info 认证换成目标账号（自动备份）。
+
+    返回 False 表示认证文件不存在、不可读或令牌无效，调用方必须跳过换血流程。
+    """
+    if not os.path.exists(INFO_PATH):
+        return False
+    try:
+        pay = tok.split(".")[1]
+        pay += "=" * (4 - len(pay) % 4)
+        j = json.loads(base64.urlsafe_b64decode(pay))
+        expires = _credit_decimal(j.get("exp")) if isinstance(j, dict) else Decimal(0)
+        if (not isinstance(j, dict) or not isinstance(j.get("sub"), str) or not j["sub"]
+                or expires <= time.time()):
+            return False
+    except Exception:
+        return False
     bak = INFO_PATH + ".wb_all_bak"
-    if not os.path.exists(bak):
-        shutil.copy(INFO_PATH, bak)
-    d = json.load(open(INFO_PATH, encoding="utf-8"))
-    j = jwt_payload(tok)
+    try:
+        with open(INFO_PATH, encoding="utf-8") as handle:
+            d = json.load(handle)
+        if not isinstance(d, dict) or not isinstance(d.get("auth"), dict):
+            return False
+    except Exception:
+        return False
+    if d.get(_SWAP_MARK):
+        # 上次运行异常退出留下的换血态：先还原真认证，再建立本轮备份。
+        if not os.path.exists(bak):
+            return False
+        try:
+            shutil.copy2(bak, INFO_PATH)
+            with open(INFO_PATH, encoding="utf-8") as handle:
+                d = json.load(handle)
+            if not isinstance(d, dict) or not isinstance(d.get("auth"), dict):
+                return False
+        except Exception:
+            return False
+    else:
+        # 桌面端已改写文件（通常是用户重新登录），旧备份已经过期。
+        if os.path.exists(bak):
+            try:
+                os.remove(bak)
+            except OSError:
+                return False
+    try:
+        shutil.copy2(INFO_PATH, bak)
+    except OSError:
+        return False
     d["auth"]["accessToken"] = tok
     d["auth"]["refreshToken"] = ""
-    d["auth"]["expiresAt"] = j.get("exp", 0) * 1000
+    d["auth"]["expiresAt"] = int(expires * 1000)
 
     def fix(a, last):
         if isinstance(a, dict):
             a["uid"] = j.get("sub")
             for k in ("nickname", "phoneNumber"):
-                if k in a:
-                    a[k] = "脚本账号"
-            if "lastLogin" in a:
-                a["lastLogin"] = "True" if last else "False"
+                if k in a: a[k] = "脚本账号"
+            if "lastLogin" in a: a["lastLogin"] = "True" if last else "False"
         return a
     fix(d.get("account", {}), True)
     for k in ("accounts", "allAccounts"):
         if isinstance(d.get(k), list):
-            for a in d[k]:
-                fix(a, False)
-    json.dump(d, open(INFO_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+            for a in d[k]: fix(a, False)
+    d[_SWAP_MARK] = True
+    tmp = INFO_PATH + ".wb_all_tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(d, handle, ensure_ascii=False, indent=2)
+        os.replace(tmp, INFO_PATH)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False
+    return True
 
 
 def restore_info():
+    """还原被脚本换过的认证文件，绝不覆盖用户重新登录后的认证。"""
     bak = INFO_PATH + ".wb_all_bak"
-    if os.path.exists(bak):
-        shutil.copy(bak, INFO_PATH)
+    try:
+        with open(INFO_PATH, encoding="utf-8") as handle:
+            d = json.load(handle)
+        if not isinstance(d, dict):
+            return False
+    except Exception:
+        return False
+    if not d.get(_SWAP_MARK):
+        if os.path.exists(bak):
+            try:
+                os.remove(bak)
+            except OSError:
+                pass
+        return True
+    if not os.path.exists(bak):
+        return False
+    try:
+        shutil.copy2(bak, INFO_PATH)
         os.remove(bak)
+    except OSError:
+        return False
+    return True
 
 
 def ensure_local_skill():
@@ -4058,7 +4518,6 @@ def ensure_local_skill():
 
 
 def daemon_chat(prompt, blocks=None, meta_extra=None, deadline=280):
-    import websocket
     import glob as _glob
     s = requests.Session()
     s.trust_env = False
@@ -4182,8 +4641,9 @@ def restart_desktop():
 
 
 def cdp_ui_send(prompt):
-    import websocket
+    """通过 CDP 在桌面端 UI 用 Slate beforeinput 发送聊天（新账号兜底）"""
     try:
+        import websocket
         r = requests.get("http://127.0.0.1:9222/json", timeout=5, proxies={"http": None, "https": None})
         pt = [x for x in r.json() if x.get("type") == "page"][0]
         ws = websocket.create_connection(pt["webSocketDebuggerUrl"], timeout=10, suppress_origin=True)
@@ -4198,8 +4658,7 @@ def cdp_ui_send(prompt):
             t0 = time.time()
             while time.time() - t0 < 10:
                 try:
-                    ws.settimeout(1.0)
-                    raw = ws.recv()
+                    ws.settimeout(1.0); raw = ws.recv()
                 except websocket.WebSocketTimeoutException:
                     continue
                 except Exception:
@@ -4236,8 +4695,11 @@ def cdp_ui_send(prompt):
 
 
 def t_desktop_tasks(s, uid, nick, tok, log, need_rich, need_skill):
+    """桌面端任务：Windows 走真实桌面换血，非 Windows 自动降级为指纹上报。"""
     is_win = sys.platform == "win32"
+
     if is_win:
+        # ===== Windows：真实桌面换血流程 =====
         log("   🖥️ 桌面换血流程启动（结束后自动还原认证并重启桌面端）...")
         if need_skill:
             try:
@@ -4251,38 +4713,45 @@ def t_desktop_tasks(s, uid, nick, tok, log, need_rich, need_skill):
             except Exception:
                 pass
         ensure_local_skill()
-        swap_info(tok)
-        url = restart_desktop()
-        if not url:
-            log("   ⚠️ 桌面端守护进程未就绪，降级为指纹上报...")
-            restore_info()
-            subprocess.Popen(["cmd", "/c", "start", "", r"C:\Program Files\WorkBuddy\WorkBuddy.exe"])
+        if not swap_info(tok):
+            log("   ⚠️ 未找到可用的桌面端认证文件，降级为指纹上报...")
             _desktop_fingerprint_fallback(s, uid, nick, log, need_rich, need_skill)
             return
-        time.sleep(8)
-        if need_rich:
-            txt = daemon_chat("你好，请用一句话介绍你自己")
-            if not txt:
-                log("   守护进程会话未就绪，改用 CDP UI 发送...")
-                cdp_ui_send("你好，请用一句话介绍你自己")
-            log("   桌面对话: %s字" % len(txt))
+        try:
+            url = restart_desktop()
+            if not url:
+                log("   ⚠️ 桌面端守护进程未就绪，降级为指纹上报...")
+                _desktop_fingerprint_fallback(s, uid, nick, log, need_rich, need_skill)
+                return
             time.sleep(8)
-        if need_skill:
-            blocks = [{"type": "resource_link", "uri": "skill://" + SKILL_NAME, "title": SKILL_NAME,
-                       "name": SKILL_NAME, "_meta": {"mentionType": "skill", "skillName": SKILL_NAME}},
-                      {"type": "text", "text": "你必须通过技能系统正式加载（load）该技能，加载成功后回答：技能已加载"}]
-            txt = daemon_chat("", blocks=blocks)
-            if not txt:
-                log("   守护进程不可用，改用 CDP UI 技能调用...")
-                cdp_ui_send("/" + SKILL_NAME + " 请按技能说明回答OK")
-            log("   技能加载: %s" % ("成功" if "加载" in txt else "回复%d字" % len(txt)))
-            time.sleep(8)
-        restore_info()
-        subprocess.run(["taskkill", "/F", "/IM", "WorkBuddy.exe"], capture_output=True)
-        time.sleep(3)
-        subprocess.Popen(["cmd", "/c", "start", "", r"C:\Program Files\WorkBuddy\WorkBuddy.exe"])
-        time.sleep(5)
+            if need_rich:
+                txt = daemon_chat("你好，请用一句话介绍你自己")
+                if not txt:
+                    log("   守护进程会话未就绪，改用 CDP UI 发送...")
+                    cdp_ui_send("你好，请用一句话介绍你自己")
+                log("   桌面对话: %s字" % len(txt))
+                time.sleep(8)
+            if need_skill:
+                blocks = [{"type": "resource_link", "uri": "skill://" + SKILL_NAME, "title": SKILL_NAME,
+                           "name": SKILL_NAME, "_meta": {"mentionType": "skill", "skillName": SKILL_NAME}},
+                          {"type": "text", "text": "你必须通过技能系统正式加载（load）该技能，加载成功后回答：技能已加载"}]
+                txt = daemon_chat("", blocks=blocks)
+                if not txt:
+                    log("   守护进程不可用，改用 CDP UI 技能调用...")
+                    cdp_ui_send("/" + SKILL_NAME + " 请按技能说明回答OK")
+                log("   技能加载: %s" % ("成功" if "加载" in txt else "回复%d字" % len(txt)))
+                time.sleep(8)
+        finally:
+            # 认证还原必须覆盖异常与超时路径，不能把桌面端留在脚本账号。
+            if restore_info():
+                subprocess.run(["taskkill", "/F", "/IM", "WorkBuddy.exe"], capture_output=True)
+                time.sleep(3)
+                subprocess.Popen(["cmd", "/c", "start", "", r"C:\Program Files\WorkBuddy\WorkBuddy.exe"])
+                time.sleep(5)
+            else:
+                log("   ❌ 桌面认证还原失败，保留当前桌面进程并停止自动重启")
     else:
+        # ===== 非 Windows：指纹上报降级 =====
         log("   🖥️ 非 Windows 环境，使用指纹上报模式...")
         _desktop_fingerprint_fallback(s, uid, nick, log, need_rich, need_skill)
         return
@@ -4361,6 +4830,7 @@ def _desktop_fingerprint_fallback(s, uid, nick, log, need_rich, need_skill):
 
 
 def t_workstation(s, uid, nick, log, tok):
+    """工作台搭建师专家（若任务出现）：优先桌面换血对话，回退遥测"""
     st, cur, tgt = prog(s, "workstation_expert")
     if st in ("completed", "claimed") or st is None:
         return
@@ -4368,19 +4838,29 @@ def t_workstation(s, uid, nick, log, tok):
         log("   工作台搭建师: 非Windows，跳过桌面流程")
         return
     log("   检测到工作台搭建师任务，尝试桌面换血对话...")
-    swap_info(tok)
-    restart_desktop()
-    time.sleep(8)
-    blocks = [{"type": "resource_link", "uri": "expert://WorkspaceBuilder", "title": "工作台搭建师",
-               "name": "工作台搭建师", "_meta": {"mentionType": "expert", "expertId": "WorkspaceBuilder"}},
-              {"type": "text", "text": "你好，请介绍你能帮我搭建什么工作台，回答OK即可"}]
-    txt = daemon_chat("", blocks=blocks)
-    log("   工作台搭建师对话: %s字" % len(txt))
-    restore_info()
-    subprocess.run(["taskkill", "/F", "/IM", "WorkBuddy.exe"], capture_output=True)
-    time.sleep(3)
-    subprocess.Popen(["cmd", "/c", "start", "", r"C:\Program Files\WorkBuddy\WorkBuddy.exe"])
-    time.sleep(5)
+    # 桌面换血对话（复用 desktop 流程）
+    if not swap_info(tok):
+        log("   工作台搭建师: 未找到可用的桌面端认证文件，跳过")
+        return
+    try:
+        url = restart_desktop()
+        if not url:
+            log("   工作台搭建师: 桌面端守护进程未就绪，跳过")
+            return
+        time.sleep(8)
+        blocks = [{"type": "resource_link", "uri": "expert://WorkspaceBuilder", "title": "工作台搭建师",
+                   "name": "工作台搭建师", "_meta": {"mentionType": "expert", "expertId": "WorkspaceBuilder"}},
+                  {"type": "text", "text": "你好，请介绍你能帮我搭建什么工作台，回答OK即可"}]
+        txt = daemon_chat("", blocks=blocks)
+        log("   工作台搭建师对话: %s字" % len(txt))
+    finally:
+        if restore_info():
+            subprocess.run(["taskkill", "/F", "/IM", "WorkBuddy.exe"], capture_output=True)
+            time.sleep(3)
+            subprocess.Popen(["cmd", "/c", "start", "", r"C:\Program Files\WorkBuddy\WorkBuddy.exe"])
+            time.sleep(5)
+        else:
+            log("   工作台搭建师: 桌面认证还原失败，保留当前桌面进程并停止自动重启")
     log("   工作台搭建师: %s %s/%s" % prog(s, "workstation_expert"))
 
 
@@ -4490,7 +4970,7 @@ def desktop_buddy5_sequence(uid, nick, buddy_id, buddy_name):
     mk("buddyapp_discover_click", {})
     mk("buddyapp_show", {"elementId": buddy_id, "elementName": buddy_name, "position": 2})
     mk("buddyapp_enter_click",
-       {"elementId": buddy_id, "elementName": buddy_name, "position": 2, "isFirstPage": "1"})
+       {"elementId": buddy_id, "elementName": buddy_name, "position": 2, "isFirstPage": True})
     mk("buddyapp_auth_confirm_click", {"elementId": buddy_id, "elementName": buddy_name})
     mk("buddyapp_bindaccount_skip_click", {"elementId": buddy_id, "elementName": buddy_name})
     return ev
@@ -4529,11 +5009,7 @@ def report_web_event(s, uid, nick, event_code, page_url, element_id, element_nam
           "os": "Win32", "arch": "", "osVersion": "10.0",
           "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
           "machineId": derive_id(uid, "webmachine"), "userId": uid, "userNickname": nick}
-    return api_retry(s, "POST", BASE + "/v2/report", body={"common": {
-        "userId": uid, "userNickname": nick, "ideName": "web",
-        "ideType": "web", "machineId": derive_id(uid, "webmachine"),
-        "mode": "CLOUD", "userAgent": "Mozilla/5.0", "os": "Win32",
-        "timezone": "Asia/Shanghai"}, "events": [ev]})
+    return api_retry(s, "POST", BASE + "/v2/report", body=[ev])
 
 
 # ============================================================================ #
@@ -4905,6 +5381,7 @@ def run_account(idx, client, account, do_desktop):
             # 「使用类」任务才会给成长中心记活跃（热力墙）。全被过滤掉时明确提醒：
             # 签到只给积分、不点热力墙——别把页面上的「开始使用以点亮今日热力墙」当成签到失败
             _usage = {"chat_5", "model_chat_glm5.2", "desktop", "richmeow_chat", "skill_share", "skill_1", "black_cat",
+                      "campaign", "campaign_starbucks_2026", "campaign_reporter_2026",
                       "expert_5", "expert_team_use_3", "template_5", "create_canvas", "playbook_prompt",
                       "sequential_tasks_1", "sequential_tasks_3", "sequential_tasks_5",
                       "automation_1", "library_read", "hp_appearance", "buddy_app", "buddy_app_qq"}
@@ -4968,6 +5445,7 @@ def run_account(idx, client, account, do_desktop):
         _run("小程序GLM5.2", ["Sequential_Tasks_5"], lambda: t_sequential_tasks_5(s, uid, nick, log), growth=True)
         _run("小程序对话10次", ["Sequential_Tasks_6"], lambda: t_sequential_tasks_6(s, uid, nick, log), growth=True)
         _run("PC灵感功能", ["Sequential_Tasks_7"], lambda: t_sequential_tasks_7(s, uid, nick, log), growth=True)
+        summary["campaigns"] = t_campaigns(s, uid, nick, log)
         _settle_before_play(s, log)
         _run("徽章", ["badges"], lambda: t_badges(s, uid, nick, log))
         _travel_blindbox_cycle(s, uid, nick, log)
@@ -5060,6 +5538,18 @@ def build_summary(summaries):
             icon = "✅" if sm.get("checked_in") else ("ℹ️" if sm.get("query") else "⚠️")
             lines.append("   %s %s" % (icon, checkin))
         lines.extend(_credit_lines(sm))
+        for campaign in sm.get("campaigns") or []:
+            if not campaign["loaded"]:
+                lines.append("   ⚠️ %s：活动读取失败" % campaign["label"])
+                continue
+            reward = ("奖励金额待确认" if campaign["new_credit"] is None
+                      else "+%s 积分" % campaign["new_credit"])
+            lines.append("   🎪 %s：本轮确认领取 %d 项，%s" % (
+                campaign["label"], len(campaign["confirmed"]), reward))
+            if campaign["manual"]:
+                lines.append("      📱需手机端完成：%s" % "、".join(campaign["manual"]))
+            if campaign["pending"]:
+                lines.append("      ⏳待回读：%s" % "、".join(campaign["pending"]))
         lines.append("   📊 %s" % (usage if usage else "暂无数据"))
         lines.append("   🌱 等级%s | 签到连签%s天 | 活跃连签%s天 | 能量%s"
                      % (level, sm.get("checkin_streak", "?"), streak, energy))
