@@ -11,7 +11,7 @@ cron: 31 7,12,23 * * *
 修改作者：lcmovie https://github.com/lcmovie/YYB-GO-Script-i
 修改后主要适配：https://github.com/525815266/YYB-Go-Enhanced，实现无感取码，自动打卡 + 全部成长任务！
 ════════════════════════════════════════════════════════════════
-🌱 WorkBuddy Daily - 全能签到脚本 v3.41（YYB 无感取码版）
+🌱 WorkBuddy Daily - 全能签到脚本 v3.44（YYB 无感取码版）
 ════════════════════════════════════════════════════════════════
 
 📌 这是什么
@@ -76,7 +76,7 @@ cron: 31 7,12,23 * * *
    PUSH_PLUS_TOKEN / PLUSPLUS_TOKEN / PUSH_KEY / QYWX_KEY / BARK_PUSH
                         【可选】脚本自带通知通道（青龙 notify.py 未配置时回落）
 
-📦 任务清单（参考上游 v3.41，以下任务以实际下发为准）
+📦 任务清单（参考上游 v3.44，以下任务以实际下发为准）
    ☁️ 已适配成长任务：每日签到 · 设计创意模式 · 探索优秀灵感 · 桌面端对话 ·
       尝鲜热门技能 · 体验资料库 · 腾讯轻量云专家 · 和平精英主题 · 发现应用 ·
       企鹅教师助手 · GLM-5.2模型对话 · 和AI聊天5次 · 夜猫子活动 · 召唤3次专家团 ·
@@ -161,9 +161,9 @@ try:
 except Exception:
     pass
 
-VERSION = "1.9.3"
-UPSTREAM_VERSION = "3.41"
-UPSTREAM_COMMIT = "db08e48d5bb04bae0079a23a827f1ef34ba3c65b"
+VERSION = "1.9.4"
+UPSTREAM_VERSION = "3.44"
+UPSTREAM_COMMIT = "029b7309e7cdac9c08b34d9cbf5dcbc55b825b2b"
 APP_ID = "wx907c65e5e107ddcf"                     # WorkBuddy 小程序 AppID
 LOGIN_URL = "https://www.codebuddy.cn/v2/plugin/login/token"
 PROFILE_URL = "https://www.codebuddy.cn/v2/as/wechatmp/user/profile"
@@ -224,6 +224,7 @@ TASK_NAME_CN = {
     "first_buddy": "领取Buddy",
     "chat_5": "和AI聊天5次",
     "skill_1": "尝鲜热门技能",
+    "skill_share": "分享技能给好友",
     "expert_5": "召唤5次专家",
     "template_5": "使用5个模板",
     "automation_1": "设置自动化任务",
@@ -437,6 +438,10 @@ class SafeError(Exception):
     """Messages contain only stage names and numeric response codes."""
 
 
+class CheckinStatusError(SafeError):
+    """签到状态接口明确拒绝或回包结构无效。"""
+
+
 @dataclass(frozen=True)
 class Account:
     number: int
@@ -584,6 +589,7 @@ class Reply:
     status: int
     code: object
     data: dict
+    message: str = ""
 
     @property
     def ok(self):
@@ -622,7 +628,9 @@ class Client:
         except ValueError:
             return Reply(response.status_code, None, {})
         data = body.get("data")
-        return Reply(response.status_code, body.get("code"), data if isinstance(data, dict) else {})
+        message = body.get("msg") or body.get("message")
+        return Reply(response.status_code, body.get("code"), data if isinstance(data, dict) else {},
+                     message if isinstance(message, str) else "")
 
     def yyb_code(self, route, extra=None):
         payload = {"ref": self.account.ref, "app_id": APP_ID}
@@ -749,43 +757,213 @@ class Client:
     def status(self):
         reply = self.authed("POST", STATUS_URL, {})
         if not reply.ok:
-            raise reply.error("签到状态查询")
+            raise CheckinStatusError(str(reply.error("签到状态查询")))
         if not isinstance(reply.data.get("today_checked_in"), bool):
-            raise SafeError("签到状态缺少有效字段")
+            raise CheckinStatusError("签到状态缺少有效字段")
         return reply.data
 
     def run_checkin(self):
         """每日签到（回读确认）。返回 (说明文本, 是否成功)。"""
         prepared = self.prepare()
-        before = self.status()
-        if before["today_checked_in"]:
-            return describe(before, "今日已签到，跳过", 0), True
-        if before.get("active") is not True:
-            raise SafeError("签到活动未开放")
-        after = before
-        reply = None
-        for attempt in range(2):
+        return _run_checkin(self, prepared=prepared)
+
+
+class SignRetries:
+    """调用方持有 State 运行锁；队列只包含 UID 哈希与当日调度信息。"""
+    def __init__(self):
+        custom = os.environ.get("WORKBUDDY_SIGN_RETRY", "").strip()
+        self.path = Path(custom) if custom else Path(STATE_DIR) / "workbuddy_sign_retry.json"
+        self.records = {}
+        if not self.path.exists():
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if data.get("version") != 1 or not isinstance(data.get("accounts"), dict):
+                raise ValueError()
+            for key, record in data["accounts"].items():
+                if (not re.fullmatch(r"[a-f0-9]{64}", key) or not isinstance(record, dict)
+                        or type(record.get("round")) is not int or record["round"] not in (0, 1, 2)
+                        or type(record.get("started_at")) is not int
+                        or record["started_at"] <= 0
+                        or record.get("next_at") != self._due_at(record)):
+                    raise ValueError()
+                if record.get("day") == beijing_today().isoformat():
+                    self.records[key] = dict(record)
+            if len(self.records) != len(data["accounts"]):
+                self.save()
+        except (OSError, ValueError, TypeError, AttributeError):
+            raise SafeError("签到重试队列读取失败，请检查状态文件") from None
+
+    @staticmethod
+    def _due_at(record):
+        return None if record["round"] == 2 else record["started_at"] + (600, 2400)[record["round"]]
+
+    @staticmethod
+    def key(uid):
+        return hashlib.sha256(("workbuddy-sign-retry:" + uid).encode()).hexdigest()
+
+    def get(self, uid):
+        return self.records.get(self.key(uid))
+
+    def due(self, uid):
+        record = self.get(uid)
+        return bool(record and record["next_at"] is not None and time.time() >= record["next_at"])
+
+    def save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, temporary = tempfile.mkstemp(prefix=".sign-retry-", dir=self.path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump({"version": 1, "accounts": self.records}, stream, separators=(",", ":"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, self.path)
+        except OSError:
+            raise SafeError("签到重试队列保存失败") from None
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def schedule(self, uid):
+        if self.get(uid):
+            return
+        now = int(time.time())
+        self.records[self.key(uid)] = {
+            "day": beijing_today().isoformat(), "started_at": now, "round": 0, "next_at": now + 600,
+        }
+        self.save()
+
+    def reserve(self, uid):
+        if not self.due(uid):
+            return False
+        record = self.get(uid)
+        record["round"] += 1
+        record["next_at"] = self._due_at(record)
+        self.save()  # 发请求前消费轮次，异常退出也不会每分钟重复提交。
+        return True
+
+    def clear(self, uid):
+        if self.records.pop(self.key(uid), None) is not None:
+            self.save()
+
+    def pending(self, uid):
+        record = self.get(uid)
+        if record and record["round"] == 2:
+            return "签到重试两轮已耗尽，今日结果仍待确认", False
+        minutes = max(0, int((record["next_at"] - time.time() + 59) // 60)) if record else 0
+        return "签到待重试，约 %s 分钟后处理" % minutes, False
+
+
+def _retryable_checkin(reply):
+    return (reply is not None and reply.status == 500 and reply.code in (10001, "10001")
+            and "稍后重试" in reply.message)
+
+
+def _run_checkin(client, *, prepared=True, scheduled=False):
+    retries = SignRetries()
+    uid = client.uid
+    record = retries.get(uid)
+    if record and not scheduled:
+        if record["round"] < 2 and not retries.due(uid):
+            return retries.pending(uid)
+        scheduled = retries.reserve(uid)
+    try:
+        before = client.status()
+    except CheckinStatusError:
+        retries.clear(uid)
+        raise
+    except SafeError:
+        if scheduled:
+            return retries.pending(uid)
+        raise
+    if before["today_checked_in"]:
+        retries.clear(uid)
+        return describe(before, "今日已签到，跳过", 0), True
+    if before.get("active") is not True:
+        retries.clear(uid)
+        raise SafeError("签到活动未开放")
+    if record and record["round"] == 2 and not scheduled:
+        return retries.pending(uid)
+    for attempt in range(1 if scheduled else 2):
+        try:
+            reply = client.authed("POST", CHECKIN_URL, {})
+        except SafeError:
+            reply = None
+        try:
+            after = client.status()
+        except CheckinStatusError:
+            retries.clear(uid)
+            raise
+        except SafeError:
+            if _retryable_checkin(reply):
+                retries.schedule(uid)
+            if scheduled or retries.get(uid):
+                return retries.pending(uid)
+            raise SafeError("签到结果未确认（回读失败），下次运行将先查询状态") from None
+        if after["today_checked_in"]:
+            retries.clear(uid)
+            delta = number(after.get("total_credits")) - number(before.get("total_credits"))
+            receipt = _checkin_reward_text(reply, after, delta)
+            line = describe(after, "签到成功（回读确认）" + receipt, max(0, delta),
+                            pending_credit=receipt == "，积分待入账")
+            return line + ("；准备流程待重试" if not prepared else ""), True
+        if _retryable_checkin(reply):
+            retries.schedule(uid)
+            return retries.pending(uid)
+        retryable = reply is None or reply.status >= 500 or reply.ok
+        if scheduled:
+            if not retryable:
+                retries.clear(uid)
+                raise reply.error("签到")
+            return retries.pending(uid)
+        if not retryable or attempt == 1:
+            if reply and not reply.ok:
+                raise reply.error("签到")
+            raise SafeError("签到未到账，回读仍为未签到")
+        time.sleep(2)
+    raise SafeError("签到未确认")
+
+
+def run_sign_retry_only(accounts):
+    directory = os.getenv("WB_CACHE_DIR") or default_cache_dir()
+    state = State(directory)
+    try:
+        state.__enter__()
+    except SafeError as exc:
+        if str(exc) == "已有同一缓存目录的任务在运行":
+            print("签到重试：主任务正在运行，下次检查", flush=True)
+            return 0
+        raise
+    errors = 0
+    processed = 0
+    try:
+        retries = SignRetries()
+        for account in accounts:
+            entry = state.data["accounts"].get(account.key, {})
+            uid = entry.get("uid")
+            if not isinstance(uid, str) or not retries.due(uid):
+                continue
+            retries.reserve(uid)
+            processed += 1
+            client = Client(account, state)
             try:
-                reply = self.authed("POST", CHECKIN_URL, {})
-            except SafeError:
-                reply = None
-            try:
-                after = self.status()
-            except SafeError:
-                raise SafeError("签到结果未确认（回读失败），下次运行将先查询状态") from None
-            if after["today_checked_in"]:
-                delta = number(after.get("total_credits")) - number(before.get("total_credits"))
-                receipt = _checkin_reward_text(reply, after, delta)
-                line = describe(after, "签到成功（回读确认）" + receipt, max(0, delta),
-                                pending_credit=receipt == "，积分待入账")
-                return line + ("；准备流程待重试" if not prepared else ""), True
-            retryable = reply is None or reply.status >= 500 or reply.ok
-            if not retryable or attempt == 1:
-                if reply and not reply.ok:
-                    raise reply.error("签到")
-                raise SafeError("签到未到账，回读仍为未签到")
-            time.sleep(2)
-        raise SafeError("签到未确认")
+                client.authenticate()
+                if client.uid != uid:
+                    retries.clear(uid)
+                    raise SafeError("签到重试账号身份已变化")
+                line, _checked = _run_checkin(client, scheduled=True)
+                print("账号%d：%s" % (account.number, line), flush=True)
+            except SafeError as exc:
+                errors += 1
+                print("账号%d：%s" % (account.number, exc), flush=True)
+            finally:
+                client.session.close()
+            retries = SignRetries()
+    finally:
+        state.__exit__(None, None, None)
+    print("签到重试检查完成，本轮处理 %d 个账号" % processed, flush=True)
+    return 1 if errors else 0
 
 
 def number(value):
@@ -1076,6 +1254,8 @@ def _task_claimable(task):
         return False
     if task.get("accept_status") == "claimed" or str(task.get("claimed")).lower() == "true":
         return False
+    if (task.get("task_code") or task.get("code")) == "skill_share":
+        return _skill_share_complete(task)
     progress = task.get("progress") or {}
     current, target = _as_int(progress.get("current")), _as_int(progress.get("target"))
     return current >= target if target > 0 else task.get("accept_status") == "completed"
@@ -3510,6 +3690,229 @@ def t_sequential_tasks_7(s, uid, nick, log):
         claim(s, code, log)
     log("   PC灵感功能: %s %s/%s" % (status, current, target))
 
+SKILL_SHARE_CHANNEL_URL = "https://open.workbuddy.cn/api/v2/open-platform/asset-shares/c2c/channels"
+
+
+def _skill_share_market_skill(s):
+    """从一个当前可分享的市场技能中提取官方 createShare 所需字段。"""
+    response = api_retry(
+        s, "POST", CBDOMAIN + "/v2/operation-platform/market/skill/list",
+        body={"page": 1, "page_size": 20},
+    )
+    payload = _json_or_empty(response)
+    if response.status_code < 200 or response.status_code >= 300:
+        return None
+    if isinstance(payload.get("code"), bool) or not _api_code_ok(payload.get("code")):
+        return None
+    data = payload.get("data")
+    skills = data.get("skills") if isinstance(data, dict) else None
+    if not isinstance(skills, list):
+        return None
+    candidates = []
+    for row in skills:
+        if not isinstance(row, dict):
+            continue
+        skill_id = str(row.get("skill_id") or row.get("id") or "").strip()
+        if not skill_id:
+            continue
+        name = str(
+            row.get("display_name_zh")
+            or row.get("name")
+            or row.get("display_name_en")
+            or ""
+        ).strip()
+        if not name:
+            continue
+        candidates.append({
+            "id": skill_id,
+            "name": name,
+            "description": str(
+                row.get("description_zh")
+                or row.get("description")
+                or row.get("description_en")
+                or ""
+            ).strip()[:60],
+        })
+    if not candidates:
+        return None
+    return next(
+        (row for row in candidates if row["id"] == SKILL_FALLBACK[0]),
+        candidates[0],
+    )
+
+
+def _create_skill_share_channel(s, uid, skill):
+    """按 5.9.3 客户端官方请求体创建真实 asset-share 渠道。"""
+    skill_id = str(skill.get("id") or "").strip()
+    if not skill_id:
+        return {"success": False, "message": "市场技能 ID 为空"}
+    body = {
+        "asset_kind": "skill",
+        "asset_source": "market",
+        "asset_ref": json.dumps(
+            {"asset_id": skill_id}, separators=(",", ":")
+        ),
+        "ways": ["link", "wxacode", "wxapath"],
+        "extra": {
+            "name": skill.get("name") or "技能",
+            "description": skill.get("description") or "",
+            "shareKey": skill_id,
+            "marketplaceSource": "builtin-market",
+        },
+    }
+    headers = {
+        "Authorization": s.headers.get("Authorization", ""),
+        "X-User-Id": uid,
+        "X-Domain": "copilot.tencent.com",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": DESKTOP_UA,
+    }
+    response = s.post(
+        SKILL_SHARE_CHANNEL_URL, json=body, headers=headers,
+        timeout=30, verify=False,
+    )
+    payload = _json_or_empty(response)
+    if not payload:
+        return {
+            "success": False,
+            "http": response.status_code,
+            "message": "分享接口返回非 JSON",
+        }
+    if response.status_code < 200 or response.status_code >= 300:
+        return {
+            "success": False,
+            "http": response.status_code,
+            "message": str(payload.get("msg") or "")[:100],
+        }
+    if isinstance(payload.get("code"), bool) or not _api_code_ok(payload.get("code")):
+        return {
+            "success": False,
+            "http": response.status_code,
+            "code": payload.get("code"),
+            "message": str(payload.get("msg") or "")[:100],
+        }
+    data = payload.get("data")
+    data = data if isinstance(data, dict) else {}
+    share_code = data.get("share_code")
+    share_code = share_code.strip() if isinstance(share_code, str) else ""
+    link = ""
+    ways = data.get("ways")
+    for way in ways if isinstance(ways, list) else []:
+        if isinstance(way, dict) and way.get("share_way") == "link":
+            value = way.get("resource_ref")
+            link = value.strip() if isinstance(value, str) else ""
+            break
+    if not share_code or not link:
+        return {
+            "success": False,
+            "http": response.status_code,
+            "message": "分享接口缺少 share_code 或 link",
+        }
+    return {
+        "success": True,
+        "shareCode": share_code,
+        "channelId": str(data.get("channel_id") or ""),
+    }
+
+
+def _skill_share_channel_events(skill_id, skill_name, share_code):
+    common = {
+        "skillId": skill_id,
+        "skillName": skill_name,
+        "skillType": "market",
+    }
+    now = int(time.time() * 1000)
+    return [
+        {
+            "eventCode": "skill_share_channel_action",
+            **common,
+            "action": "link",
+            "panelAction": "click",
+            "panelType": "clipboard",
+            "isSuccessful": True,
+            "cost": 0,
+            "id": share_code,
+            "actionAt": now,
+        },
+        {
+            "eventCode": "skill_share_channel_action",
+            **common,
+            "action": "link",
+            "panelAction": "success",
+            "panelType": "clipboard",
+            "isSuccessful": True,
+            "cost": 0,
+            "id": share_code,
+            "actionAt": now,
+        },
+    ]
+
+
+def _skill_share_complete(row):
+    progress = row.get("progress")
+    if not isinstance(progress, dict):
+        return False
+    try:
+        return ((row.get("accept_status") or row.get("status")) == "completed"
+                and _credit_decimal(progress.get("current")) == _credit_decimal(progress.get("target")) == 1)
+    except (ValueError, ArithmeticError):
+        return False
+
+
+def t_skill_share(s, uid, nick, log):
+    code = "skill_share"
+    row = _growth_task_row(s, code)
+    if row is None:
+        log("   分享技能给好友：当前未下发，跳过")
+        return
+    if row.get("locked") or _row_claimed(row):
+        log("   分享技能给好友：未解锁或已领取，跳过")
+        return
+    if not _skill_share_complete(row):
+        status = row.get("accept_status") or row.get("status")
+        if status in (None, "", "not_accepted") and not _accept_with_verify(s, code, log):
+            log("   分享技能给好友：任务登记失败")
+            return
+        skill = _skill_share_market_skill(s)
+        if skill is None:
+            log("   分享技能给好友：未取得有效市场技能，本轮跳过")
+            return
+        channel = _create_skill_share_channel(s, uid, skill)
+        if not channel.get("success"):
+            log("   分享技能给好友：创建渠道失败（HTTP %s，业务码 %s）" % (
+                channel.get("http", "?"), channel.get("code", "?")))
+            return
+        events = _skill_share_channel_events(skill["id"], skill["name"], channel["shareCode"])
+        report_status = report_desktop_events(s, uid, nick, events)
+        if not 200 <= report_status < 300:
+            log("   分享技能给好友：事件上报失败（HTTP %s）" % report_status)
+            return
+        for attempt in range(5):
+            row = _growth_task_row(s, code)
+            if row and (_row_claimed(row) or _skill_share_complete(row)):
+                break
+            if attempt < 4:
+                time.sleep(3)
+        else:
+            log("   分享技能给好友：渠道已创建，进度未确认，本轮不领奖")
+            return
+    if _row_claimed(row):
+        log("   分享技能给好友：服务端已确认领取")
+        return
+    if not claim(s, code, log):
+        log("   分享技能给好友：领奖未确认")
+        return
+    for attempt in range(3):
+        fresh = _growth_task_row(s, code)
+        if fresh and _row_claimed(fresh):
+            log("   分享技能给好友：已回读 claimed")
+            return
+        if attempt < 2:
+            time.sleep(2)
+    log("   分享技能给好友：奖励回执已确认，任务状态尚待刷新")
+
+
 def t_unknown_tasks(s, uid, nick, log):
     """任务列表体检：动态发现新任务 + 未完成任务的有效期预警
 
@@ -3520,7 +3923,7 @@ def t_unknown_tasks(s, uid, nick, log):
     """
     known = {"create_canvas", "playbook_prompt", "RichMeow_Chat", "Library_read", "Expert_lighthouse",
              "Expert_Philanthropy", "Hp_Appearance", "Buddy_App", "Buddy_App_QQ", "Model_chat_GLM5.2",
-             "black_cat", "Expert_team_use_3", "first_buddy", "chat_5", "skill_1", "expert_5",
+             "black_cat", "Expert_team_use_3", "first_buddy", "chat_5", "skill_share", "skill_1", "expert_5",
              "template_5", "automation_1", "workstation_expert", "WorkBuddy_Valorant",
              "expert_use_maidehao", "expert_use_douyinyin",
              "expert_use_shangjia_xuanchuan", "expert_use_bowangwang",
@@ -4501,7 +4904,7 @@ def run_account(idx, client, account, do_desktop):
                 (("；跳过 " + ",".join(sorted(TASK_SKIP))) if TASK_SKIP else "")))
             # 「使用类」任务才会给成长中心记活跃（热力墙）。全被过滤掉时明确提醒：
             # 签到只给积分、不点热力墙——别把页面上的「开始使用以点亮今日热力墙」当成签到失败
-            _usage = {"chat_5", "model_chat_glm5.2", "desktop", "richmeow_chat", "skill_1", "black_cat",
+            _usage = {"chat_5", "model_chat_glm5.2", "desktop", "richmeow_chat", "skill_share", "skill_1", "black_cat",
                       "expert_5", "expert_team_use_3", "template_5", "create_canvas", "playbook_prompt",
                       "sequential_tasks_1", "sequential_tasks_3", "sequential_tasks_5",
                       "automation_1", "library_read", "hp_appearance", "buddy_app", "buddy_app_qq"}
@@ -4538,6 +4941,7 @@ def run_account(idx, client, account, do_desktop):
         task_snapshot = _build_task_snapshot(s)
         log("   📋任务快照: %d 项%s" % (len(task_snapshot[0]),
                                         "" if task_snapshot[1] else "（部分来源不可用，沿用实时回读）"))
+        _run("分享技能给好友", ["skill_share"], lambda: t_skill_share(s, uid, nick, log), growth=True)
         _run("召唤3次专家团", ["Expert_team_use_3"], lambda: t_team_3(s, uid, nick, log), growth=True)
         _run("发现应用/企鹅教师助手", ["Buddy_App", "Buddy_App_QQ"], lambda: t_buddy_apps(s, uid, nick, log), growth=True)
         _run("和平精英主题", ["Hp_Appearance"], lambda: t_theme(s, uid, nick, log), growth=True)
@@ -4844,6 +5248,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="WorkBuddy YYB 全能签到")
     parser.add_argument("--only", default=os.getenv("WB_ACCOUNT_FILTER", ""), metavar="3,4,5")
     parser.add_argument("--query", action="store_true", help="仅查询积分/用量/签到状态，不执行任务")
+    parser.add_argument("--sign-retry-only", action="store_true", help="仅处理已到点的签到重试队列")
     parser.add_argument("--no-desktop", action="store_true", help="跳过桌面任务")
     parser.add_argument("--no-notify", action="store_true", help="不发送青龙通知")
     parser.add_argument("--gap", type=float, default=1.5, help="写动作间隔秒数")
@@ -4851,6 +5256,8 @@ def main(argv=None):
     parser.add_argument("--tasks", default="", metavar="checkin,travel", help="白名单：只跑列出的子任务")
     parser.add_argument("--skip-tasks", default="", metavar="lottery,redeem", help="黑名单：跳过列出的子任务")
     args = parser.parse_args(argv)
+    if args.query and args.sign_retry_only:
+        parser.error("--query 与 --sign-retry-only 不能同时使用")
 
     global WRITE_GAP, MP_CHAT_GAP, TASK_ONLY, TASK_SKIP
     WRITE_GAP = max(1.0, args.gap)
@@ -4869,7 +5276,8 @@ def main(argv=None):
     started = time.monotonic()
     reports = []
     errors = []
-    print_banner(args.query)
+    if not args.sign_retry_only:
+        print_banner(args.query)
 
     try:
         accounts = select_accounts(accounts_from_env(os.getenv("YYB_SERVER", "")), args.only)
@@ -4877,6 +5285,12 @@ def main(argv=None):
         print("❌ " + str(exc), flush=True)
         return 1
     total = len(accounts)
+    if args.sign_retry_only:
+        try:
+            return run_sign_retry_only(accounts)
+        except SafeError as exc:
+            print(str(exc), flush=True)
+            return 1
     print("👥 账号数: %d" % total, flush=True)
 
     do_desktop = not args.no_desktop
