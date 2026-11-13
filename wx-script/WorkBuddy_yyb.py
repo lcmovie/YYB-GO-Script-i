@@ -11,7 +11,7 @@ cron: 31 7,12,23 * * *
 修改作者：lcmovie https://github.com/lcmovie/YYB-GO-Script-i
 修改后主要适配：https://github.com/525815266/YYB-Go-Enhanced，实现无感取码，自动打卡 + 全部成长任务！
 ════════════════════════════════════════════════════════════════
-🌱 WorkBuddy Daily - 全能签到脚本 v3.47（YYB 无感取码版）
+🌱 WorkBuddy Daily - 全能签到脚本 v3.48（YYB 无感取码版）
 ════════════════════════════════════════════════════════════════
 
 📌 这是什么
@@ -76,7 +76,7 @@ cron: 31 7,12,23 * * *
    PUSH_PLUS_TOKEN / PLUSPLUS_TOKEN / PUSH_KEY / QYWX_KEY / BARK_PUSH
                         【可选】脚本自带通知通道（青龙 notify.py 未配置时回落）
 
-📦 任务清单（参考上游 v3.47，以下任务以实际下发为准）
+📦 任务清单（参考上游 v3.48，以下任务以实际下发为准）
    ☁️ 已适配成长任务：每日签到 · 设计创意模式 · 探索优秀灵感 · 桌面端对话 ·
       尝鲜热门技能 · 体验资料库 · 腾讯轻量云专家 · 和平精英主题 · 发现应用 ·
       企鹅教师助手 · GLM-5.2模型对话 · 和AI聊天5次 · 夜猫子活动 · 召唤3次专家团 ·
@@ -161,9 +161,9 @@ try:
 except Exception:
     pass
 
-VERSION = "1.9.5"
-UPSTREAM_VERSION = "3.47"
-UPSTREAM_COMMIT = "e2eb20c7a80b388d9393e19369cbbf78827d00df"
+VERSION = "1.9.6"
+UPSTREAM_VERSION = "3.48"
+UPSTREAM_COMMIT = "94e7f14832fc02760e97f641ab0fc9fa30871126"
 APP_ID = "wx907c65e5e107ddcf"                     # WorkBuddy 小程序 AppID
 LOGIN_URL = "https://www.codebuddy.cn/v2/plugin/login/token"
 PROFILE_URL = "https://www.codebuddy.cn/v2/as/wechatmp/user/profile"
@@ -2032,14 +2032,30 @@ def t_daily_activity(s, uid, nick, log):
 # ============================================================================ #
 # 各任务配方（全部经过原版实测，移植保持原样）
 # ============================================================================ #
+def _accept_response_settled(status, message=""):
+    """接受回执是否已结算；already completed 以 message 形式出现时同样算完成。"""
+    status = str(status or "").strip().lower()
+    if status in ("accepted", "already_accepted", "completed", "already_completed", "claimed"):
+        return True
+    message = str(message or "").strip().lower()
+    return any(marker in message for marker in (
+        "task already completed",
+        "already completed",
+        "already been completed",
+        "already claimed",
+        "已领取",
+        "已完成",
+    ))
+
 def t_accept_all(s, uid, nick, log):
     try:
         rows = growth_task_rows(s)
     except (SafeError, requests.RequestException):
         log("   📋批量接受读取任务失败，本轮跳过登记")
         return
-    todo = [t.get("task_code") for t in rows
-            if t.get("task_code") and t.get("accept_status") == "not_accepted"]
+    todo = list(dict.fromkeys(t.get("task_code") for t in rows
+            if t.get("task_code") and t.get("accept_status") == "not_accepted"
+            and not t.get("locked") and not _row_claimed(t)))
     if not todo:
         return
     resp = {}
@@ -2047,22 +2063,24 @@ def t_accept_all(s, uid, nick, log):
     try:
         r2 = s.post(BASE + "/v2/activity/growth/tasks/accept",
                     json={"task_codes": todo}, timeout=20, verify=False)
+        if r2.status_code != 200:
+            raise SafeError("HTTP %s" % r2.status_code)
         d2 = r2.json()
         for x in ((d2.get("data") or {}).get("results") or []):
             if isinstance(x, dict) and x.get("task_code"):
                 resp[x["task_code"]] = (x.get("status") or "", x.get("message") or "")
-        ok = [c for c in todo if resp.get(c, ("", ""))[0] == "accepted"]
-        bad = [(c, resp[c][0], resp[c][1]) for c in todo if c in resp and resp[c][0] != "accepted"]
+        ok = [c for c in todo if _accept_response_settled(*resp.get(c, ("", "")))]
+        bad = [(c, resp[c][0], resp[c][1]) for c in todo if c in resp and not _accept_response_settled(*resp[c])]
         nolog = [c for c in todo if c not in resp]
-        log("   📋批量接受 %d 项 → 成功 %d / 未登记 %d%s" % (
+        log("   📋批量接受 %d 项 → 已结算 %d / 待回读 %d%s" % (
             len(todo), len(ok), len(bad) + len(nolog),
             ("（%d 项无返回）" % len(nolog)) if nolog else ""))
         for c, st, m in bad[:6]:
-            log("      ✗ %s: %s %s" % (c, st, m[:70]))
+            log("      … %s 待回读: %s %s" % (c, st, m[:70]))
         if len(bad) > 6:
             log("      ...另 %d 项" % (len(bad) - 6))
     except Exception as e:
-        log("   📋批量接受异常: %s" % str(e)[:60])
+        log("   📋批量接受异常: %s" % type(e).__name__)
     need = {}
     for c, st, m in bad:
         if "prerequisite not met:" in m:
@@ -2077,20 +2095,29 @@ def t_accept_all(s, uid, nick, log):
                 log("      ⚠️ 服务端仍无 Buddy 实例：该账号需先在桌面端/小程序完成一次领养引导，本次 %d 项保持未登记" % len(ptasks))
         else:
             log("      ⚠️ 前置「%s」脚本暂无法自动完成" % pcode)
-    time.sleep(2)
-    try:
-        fresh = {row.get("task_code"): row.get("accept_status") for row in growth_task_rows(s)}
-    except (SafeError, requests.RequestException):
-        pending = [c for c in todo if prog(s, c)[0] in (None, "not_accepted")]
-    else:
-        pending = [c for c in todo if fresh.get(c) in (None, "not_accepted")]
+    pending = list(todo)
+    settled = ("accepted", "already_accepted", "completed", "claimed")
+    for round_index in range(ACCEPT_BATCH_TRIES):
+        time.sleep(ACCEPT_BATCH_SETTLE)
+        try:
+            fresh = {row.get("task_code"): row.get("accept_status") for row in growth_task_rows(s)}
+        except (SafeError, requests.RequestException, ValueError, TypeError):
+            continue
+        pending = [c for c in todo if fresh.get(c) not in settled]
+        if not pending:
+            break
     if not pending:
         log("   ✅ 全部登记生效（%d 项）" % len(todo))
         return
     log("   🔁 %d 项未落账，逐个重试..." % len(pending))
     still = []
     for c in pending:
-        if not _accept_with_verify(s, c, log):
+        try:
+            accepted = _accept_with_verify(s, c, log)
+        except Exception as exc:
+            log("      ⚠️ %s 重试异常: %s" % (c, type(exc).__name__))
+            accepted = False
+        if not accepted:
             still.append(c)
         time.sleep(1.0)
     if still:
@@ -3655,26 +3682,43 @@ def t_sequential_tasks_6(s, uid, nick, log):
 
 
 def _accept_with_verify(s, code, log):
-    """accept 并验证登记生效（读 results[].status + 回读 accept_status）。"""
+    """accept 并验证登记生效（以回读 accept_status 为准）。
+
+    ⚠️ 两个历史坑（线上日志实证）：
+      1) 上游对**已登记**的任务返回 `status="already_accepted"`，这不是失败；
+         旧实现只认 `status == "accepted"`，导致 14 项全部接受成功却被判成
+         「未落账」，随后整轮任务（skill_share / expert_use_* 等）被跳过。
+      2) accept 的落账是异步的：接口立刻回 accepted，任务列表要过几秒才翻状态。
+         所以每轮 post 之后读两次（间隔 1.5s），任一次读到 settled 就算成功。
+    """
+    settled = ("accepted", "completed", "claimed")
+    last_result = "无回执"
     for attempt in (1, 2):
-        r = s.post(BASE + "/v2/activity/growth/tasks/accept", json={"task_codes": [code]},
-                   timeout=20, verify=False)
-        status = ""
         try:
-            d = r.json()
+            r = s.post(BASE + "/v2/activity/growth/tasks/accept",
+                       json={"task_codes": [code]}, timeout=20, verify=False)
+            try:
+                d = r.json()
+            except Exception as exc:
+                last_result = "响应解析异常(%s)" % type(exc).__name__
+                if attempt < 2:
+                    time.sleep(WRITE_GAP)
+                continue
+            d = d if isinstance(d, dict) else {}
             results = (d.get("data") or {}).get("results") or []
             status = (results[0].get("status") or "") if results else (d.get("msg") or "")
-        except Exception:
-            pass
-        t = prog(s, code)
-        ast = t[0] if t else None
-        ok = (r.status_code == 200 and status == "accepted"
-              and ast in ("accepted", "completed", "claimed"))
-        if ok:
-            return True
-        if attempt > 1:
-            log("      ✗ %s: accept %s 回读=%s" % (code, status or "无返回", ast))
-        time.sleep(WRITE_GAP)
+            ast = prog(s, code)[0]
+            if r.status_code == 200 and ast not in settled:
+                time.sleep(ACCEPT_SETTLE_GAP)
+                ast = prog(s, code)[0]
+            if r.status_code == 200 and ast in settled:
+                return True
+            last_result = "accept %s 回读=%s" % (status or "无返回", ast)
+        except Exception as exc:
+            last_result = type(exc).__name__
+        if attempt < 2:
+            time.sleep(WRITE_GAP)
+    log("      ✗ %s: %s" % (code, last_result))
     return False
 
 
@@ -4082,6 +4126,248 @@ def _campaign_desktop_same(s, uid, nick, spec, task, log):
         return False
 
 
+ACCEPT_SETTLE_GAP = 1.5
+ACCEPT_BATCH_SETTLE = 2.0
+ACCEPT_BATCH_TRIES = 3
+CAMPAIGN_APP_HOST = "https://copilot.tencent.com"
+CAMPAIGN_APP_BOOT = 120
+CAMPAIGN_APP_WAIT = 30
+CAMPAIGN_APP_POLL = 5
+CAMPAIGN_APP_PROMPT = '你只需要回复"Hi"'
+CAMPAIGN_APP_BOX_DOMAINS = (
+    "tencent.com",
+    "codebuddy.cn",
+    "workbuddy.cn",
+    "workbuddy.agentos-worker.net",
+)
+CAMPAIGN_APP_SUCCESS_STOP_REASONS = ("end_turn",)
+
+
+def _campaign_app_machine(uid):
+    """按账号派生稳定的伪设备号（8 位十六进制）。
+
+    仓库里不留任何真实设备指纹：同账号每轮稳定，换账号即变，也不可反推设备。
+    """
+    seed = "workbuddy-app-machine:%s" % (uid or "")
+    return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:8]
+
+def _campaign_app_headers(token, uid, accept="application/json"):
+    """App 身份头：服务端按 x-client-product 判来源，缺了会被当成网页/桌面。"""
+    return {"Authorization": "Bearer " + (token or ""), "X-User-Id": uid,
+            "User-Agent": "WorkBuddyApp/2.8.0", "X-Client-Version": "2.8.0",
+            "X-Client-Product": "workbuddy-app", "X-Client-Platform": "android",
+            "Accept": accept}
+
+def _campaign_app_box_url(raw_url):
+    """校验服务端下发的 sandbox URL，避免把 Bearer token 发给任意主机。"""
+    raw_url = str(raw_url or "").strip().rstrip("/")
+    try:
+        parsed = urlparse(raw_url)
+        host = (parsed.hostname or "").rstrip(".").lower()
+        port = parsed.port
+    except (TypeError, ValueError):
+        return ""
+    if (parsed.scheme != "https" or not host or parsed.username or parsed.password
+            or port not in (None, 443) or parsed.query or parsed.fragment
+            or any(ord(c) < 32 or ord(c) == 127 for c in raw_url)):
+        return ""
+    if not any(host == domain or host.endswith("." + domain)
+               for domain in CAMPAIGN_APP_BOX_DOMAINS):
+        return ""
+    return raw_url
+
+def _campaign_app_sse_payload(line):
+    """把 SSE line 解析成 JSON；兼容 requests 返回 str 或 bytes。"""
+    if isinstance(line, bytes):
+        line = line.decode("utf-8", "replace")
+    line = str(line or "").strip()
+    if not line or line.startswith(":"):
+        return None
+    if line.lower().startswith("event:"):
+        return {"_event": line.split(":", 1)[1].strip()}
+    if line.lower().startswith("data:"):
+        line = line.split(":", 1)[1].strip()
+    if not line:
+        return None
+    try:
+        payload = json.loads(line)
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+def _campaign_app_sse_event(event_name, data_lines):
+    """按 SSE 帧语义拼接同一事件的多行 data，再解析成 JSON。"""
+    event_name = str(event_name or "").strip().lower()
+    if event_name == "error":
+        return {"_event": "error"}
+    data = "\n".join(str(line or "") for line in (data_lines or [])).strip()
+    if not data and event_name != "error":
+        return None
+    if data == "[DONE]":
+        data = "{}"
+    if not data:
+        payload = {}
+    else:
+        try:
+            payload = json.loads(data)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(payload, dict):
+        return None
+    if event_name:
+        payload["_event"] = event_name
+    return payload
+
+def _campaign_app_terminal(payload):
+    """返回 (成功 stopReason, 错误标记)；只把结构化 end_turn 当作成功。"""
+    if not isinstance(payload, dict):
+        return None, None
+    event_kind = str(payload.get("_event") or payload.get("event") or "").strip().lower()
+    payload_kind = str(payload.get("type") or "").strip().lower()
+    if event_kind == "error" or payload_kind == "error" or payload.get("error"):
+        return None, "error"
+    if "stopReason" in payload:
+        reason = payload.get("stopReason")
+        if isinstance(reason, str) and reason.strip():
+            reason = reason.strip()
+            if reason in CAMPAIGN_APP_SUCCESS_STOP_REASONS:
+                return reason, None
+            return None, reason
+    for value in payload.values():
+        if isinstance(value, dict):
+            reason, error = _campaign_app_terminal(value)
+            if reason or error:
+                return reason, error
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    reason, error = _campaign_app_terminal(item)
+                    if reason or error:
+                        return reason, error
+    return None, None
+
+def _campaign_app_chat(s, uid, nick, log, prompt=None):
+    """app 任务：建会话 + 一次 ACP bootstrap 真跑完一轮对话（App 走的同一条路）。
+
+    判据是「云端会话真跑完一次对话」，补发埋点、网页会话都不计数。整条链路
+    只要 4 个请求：`POST /v2/as/conversations/` 建会话 → `POST {boxUrl}/acp/bootstrap`
+    把 initialize + session/new + session/prompt 一次带过去 → 读完流 → 外层领奖。
+    bootstrap 的响应头会下发 `Acp-Connection-Id`，所以不必先开 SSE 再握手，
+    也不接受客户端自己造的 id（会 404 connection not found）。
+    """
+    token = (s.headers.get("Authorization") or "").replace("Bearer ", "").strip()
+    if not token:
+        log("      ✗ %s: 缺少 access_token" % "解锁 App 强大能力")
+        return False
+    s2 = requests.Session()
+    s2.trust_env = False
+    stream = None
+    try:
+        r = s2.post(CAMPAIGN_APP_HOST + "/v2/as/conversations/",
+                    json={"name": "开始新对话", "conversationOrigin": "agents"},
+                    headers=_campaign_app_headers(token, uid), timeout=60, verify=True, allow_redirects=False)
+        if r.status_code != 200:
+            log("      ✗ 建会话失败：HTTP %s" % r.status_code)
+            return False
+        payload = r.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        data = data if isinstance(data, dict) else {}
+        sess = data.get("session") or {}
+        box, box_tok = sess.get("boxUrl") or "", sess.get("token") or ""
+        if not isinstance(box, str) or not isinstance(box_tok, str) or not box or not box_tok:
+            log("      ✗ 建会话失败：缺少沙箱连接信息")
+            return False
+        box = _campaign_app_box_url(box)
+        if not box:
+            log("      ✗ 建会话失败：boxUrl 不是受信任的 HTTPS 官方域名")
+            return False
+        info = {"ideType": "WorkBuddy_APP", "ideName": "app_cloud", "ideVersion": "2.8.0",
+                "extName": "WorkBuddy_APP", "extVersion": "2.8.0",
+                "machineId": _campaign_app_machine(uid), "userId": uid, "userNickname": nick}
+        meta = {"codebuddy.ai": {"telemetryClientInfo": info}}
+        span = uuid.uuid4().hex[:16]
+        body = {
+            "initialize": {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                           "params": {"protocolVersion": 1, "clientCapabilities": {},
+                                      "clientInfo": {"name": "WorkBuddyApp", "version": "2.8.0"}}},
+            "sessionNew": {"jsonrpc": "2.0", "id": 2, "method": "session/new",
+                           "params": {"cwd": "/workspace", "mcpServers": [], "_meta": meta}},
+            "prompt": {"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                       "params": {"prompt": [{"type": "text",
+                                              "text": prompt or CAMPAIGN_APP_PROMPT}],
+                                  "_meta": meta}},
+        }
+        hdr = _campaign_app_headers(box_tok, uid, "application/json, text/event-stream")
+        hdr.update({"Content-Type": "application/json", "X-Span-Id": span,
+                    "X-Client-Request-Id": "sse_" + uuid.uuid4().hex[:10],
+                    "Traceparent": "00-%s-%s-01" % (uuid.uuid4().hex, span)})
+        stream = s2.post(box + "/acp/bootstrap?includeUserEcho=true", json=body,
+                         headers=hdr, stream=True, timeout=CAMPAIGN_APP_BOOT, verify=True, allow_redirects=False)
+        if stream.status_code != 200 or not stream.headers.get("Acp-Connection-Id"):
+            log("      ✗ bootstrap 失败：HTTP %s" % stream.status_code)
+            return False
+        deadline = time.monotonic() + CAMPAIGN_APP_BOOT
+        event_name = ""
+        data_lines = []
+
+        def finish_event():
+            nonlocal event_name, data_lines
+            payload = _campaign_app_sse_event(event_name, data_lines)
+            event_name = ""
+            data_lines = []
+            return _campaign_app_terminal(payload)
+
+        for line in stream.iter_lines(decode_unicode=True):
+            if time.monotonic() > deadline:
+                log("      ✗ 对话超时：未收到有效 stopReason")
+                return False
+            if isinstance(line, bytes):
+                line = line.decode("utf-8", "replace")
+            text = str(line or "")
+            if not text.strip():
+                reason, error = finish_event()
+                if error:
+                    log("      ✗ 对话失败：收到错误或非正常终止事件")
+                    return False
+                if reason:
+                    return True
+                continue
+            if text.startswith(":"):
+                continue
+            if text.lower().startswith("event:"):
+                event_name = text.split(":", 1)[1].strip()
+                continue
+            if text.lower().startswith("data:"):
+                data_lines.append(text.split(":", 1)[1].lstrip())
+                continue
+            payload = _campaign_app_sse_payload(text)
+            if payload is None:
+                continue
+            reason, error = _campaign_app_terminal(payload)
+            if error:
+                log("      ✗ 对话失败：收到错误或非正常终止事件")
+                return False
+            if reason:
+                return True
+        reason, error = finish_event()
+        if error:
+            log("      ✗ 对话失败：收到错误或非正常终止事件")
+            return False
+        if reason:
+            return True
+        log("      ✗ 对话失败：流在 stopReason 前提前结束")
+        return False
+    except Exception as exc:  # noqa: BLE001
+        log("      ✗ 对话异常：%s" % type(exc).__name__)
+        return False
+    finally:
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+        s2.close()
+
 def _campaign_fire(s, uid, nick, spec, task, log):
     """按 kind 上报一次判据事件；返回是否已上报。"""
     kind = task.get("kind")
@@ -4089,8 +4375,7 @@ def _campaign_fire(s, uid, nick, spec, task, log):
     if kind == "desktop":
         return _campaign_desktop_same(s, uid, nick, spec, task, log)
     if kind == "app":
-        log("      ⚠️ %s: 需手机端 App 登录后与 AI 对话一次，脚本不伪造" % task["label"])
-        return False
+        return _campaign_app_chat(s, uid, nick, log)
     if kind == "chat":
         return mp_report(s, uid, nick, [mp_chat_event(uid, nick, _new_conversation_id())],
                          env_extra=page) == 200
@@ -4242,10 +4527,6 @@ def _run_campaign(s, uid, nick, spec, log):
             continue
         target = row["target"]
         if not row["completed_at"] and row["progress"] < target:
-            if task["kind"] == "app":
-                result["manual"].append(task["label"])
-                log("   🎪%s：需手机 App 登录并对话，完成后再运行可补领" % task["label"])
-                continue
             if row["need_view"]:
                 status, payload = _campaign_call(s, uid, "POST",
                     "/portal/activity/tasks/%s/viewed?%s" % (code, urlencode({"activity_code": camp})), {})
@@ -4254,7 +4535,7 @@ def _run_campaign(s, uid, nick, spec, log):
                     result["pending"].append(task["label"])
                     continue
             remaining = target - row["progress"]
-            if task["kind"] == "desktop":
+            if task["kind"] in ("desktop", "app"):
                 remaining = min(remaining, 1)
             for _ in range(remaining):
                 if not _campaign_fire(s, uid, nick, spec, task, log):
