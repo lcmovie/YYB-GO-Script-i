@@ -18,9 +18,10 @@ cron: 30 9 * * *
 #   状态  GET  /api/b2c/member/sign/task/list  -> data.signRes.{sign, signNum,
 #            taskSignDtoList[{signTime, signStatus}]}   sign==true / 今日行
 #            signStatus=="sign" 即今日已签 (幂等预检依据)
-#   验证  POST /api/smhd/captcha/get、/api/smhd/captcha/check -> 自动匹配拼图并校验
 #   签到  POST /api/b2c/member/sign/task  body {captchaVerification: 验证结果}
 #            -> code==200, data.signRes.sign==true
+#   累签抽奖：当月累签达标且未领取时自动抽奖，坐标取当前容器出口 IP 定位
+#   日常任务：签到后自动完成浏览品牌资讯、前往玖马送酒，并复查任务完成状态
 #   积分  GET  /api/b2c/member/pointsAndCouponCardNumAndShopCardInfo?unionId=<unionId>
 #            -> data.MemberCouponShopPointsVo.pointsNum   (仅用于上报余额)
 # 环境变量：
@@ -29,8 +30,6 @@ cron: 30 9 * * *
 #   账号直接来自 YYB_SERVER；无需配置 WX_ID / lqpj
 #   YYB_API_KEY / YYB_PROTOCOL_TOKEN       启用协议鉴权时配置，二选一
 
-import base64
-import io
 import json
 import os
 import sys
@@ -285,10 +284,12 @@ def get_cached_session(openid):
     return read_token_cache().get(openid) or {}
 
 
-def save_cached_session(openid, token, union_id):
+def save_cached_session(openid, token, union_id, **identity):
     cache = read_token_cache()
-    cache[openid] = {"token": token, "unionId": union_id,
-                     "updatedAt": int(time.time())}
+    item = dict(cache.get(openid) or {})
+    item.update(identity)
+    item.update({"token": token, "unionId": union_id, "updatedAt": int(time.time())})
+    cache[openid] = item
     write_token_cache(cache)
 
 
@@ -385,6 +386,8 @@ def login(openid):
     union_id = data.get("unionid") or (data.get("wxUserInfo") or {}).get("unionId")
     if not (token and data.get("b2cMemberId")):
         raise RuntimeError("登录响应缺少 token/b2cMemberId, 需在小程序内登录一次后重试")
+    save_cached_session(openid, token, union_id,
+                        wxOpenid=data.get("openid"), b2cMemberId=data.get("b2cMemberId"))
     return token, union_id
 
 
@@ -407,6 +410,12 @@ def obtain_session(openid, index, force=False):
 # ---------------------------------------------------------------------------
 def sign_state(token):
     return api_get("/b2c/member/sign/task/list", token=token)
+
+
+import base64
+import io
+import json
+import time
 
 
 def match_puzzle(original_base64, jigsaw_base64):
@@ -545,7 +554,7 @@ def fmt_num(value):
         return str(value)
 
 
-def run_account(openid, index):
+def run_sign_account(openid, index):
     lines = [f"【账号 {index}】"]
 
     token, union_id = obtain_session(openid, index)
@@ -610,7 +619,240 @@ def run_account(openid, index):
     return "\n".join(lines), True
 
 
+# 当月累签抽奖和任务中心；接口依据小程序 277 版。
+SIGN_LOTTERY_ACTIVITY = "leiqianchoujiang"
+DAILY_BROWSE_NAMES = {"每日浏览品牌资讯", "每日前往玖马送酒"}
+_egress_location_cache = None
+
+
+def emit_stage(lines, index, message):
+    print(f"账号 {index} {message}")
+    lines.append(message)
+
+
+def require_response(response, expected, action):
+    if not isinstance(response, dict) or resp_code(response) != expected:
+        raise RuntimeError(f"{action}失败：{resp_msg(response) or resp_code(response)}")
+    return response.get("data")
+
+
+def egress_ip_location():
+    """无 IP 参数查询本次请求的出口；不使用桌面或手机坐标。"""
+    global _egress_location_cache
+    if _egress_location_cache is not None:
+        return _egress_location_cache
+    import ipaddress
+    import math
+    response = session.get("https://ipwho.is/", params={
+        "fields": "success,message,ip,longitude,latitude,city",
+    }, timeout=15)
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict) or data.get("success") is not True:
+        raise RuntimeError("出口 IP 定位失败")
+    ipaddress.ip_address(data["ip"])
+    longitude, latitude = float(data["longitude"]), float(data["latitude"])
+    if not (math.isfinite(longitude) and math.isfinite(latitude)
+            and -180 <= longitude <= 180 and -90 <= latitude <= 90):
+        raise ValueError("出口 IP 经纬度无效")
+    _egress_location_cache = {
+        "longitude": str(longitude), "latitude": str(latitude),
+        "city": str(data.get("city") or "未知城市"),
+    }
+    return _egress_location_cache
+
+
+def monthly_sign_days(token):
+    today = bj_now().date()
+    response = api_get("/b2c/member/sign/record", token=token, params={
+        "startDate": today.replace(day=1).isoformat(), "endDate": today.isoformat(),
+    })
+    data = require_response(response, 200, "读取当月签到记录")
+    if not isinstance(data, dict) or not isinstance(data.get("signRecordList"), list):
+        raise ValueError("签到记录响应格式变化")
+    dates = set()
+    for row in data["signRecordList"]:
+        try:
+            day = datetime.strptime(str(row.get("signTime", ""))[:10], "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            continue
+        if day.year == today.year and day.month == today.month and day <= today:
+            dates.add(day)
+    return len(dates)
+
+
+def monthly_receive_status(token):
+    response = api_post("/smhd/newBottleCollect/getMonthlyIsReceivePrizeList",
+                        {"activityCode": SIGN_LOTTERY_ACTIVITY}, token=token)
+    rows = require_response(response, 0, "读取累签抽奖状态")
+    if not isinstance(rows, list):
+        raise ValueError("累签抽奖状态格式变化")
+    status = {}
+    for row in rows:
+        num, received = row.get("num"), row.get("isReceive")
+        if isinstance(num, bool) or not str(num).isdigit() or int(num) <= 0:
+            continue
+        if received is True or received is False:
+            status[int(num)] = received
+    return status
+
+
+def draw_prize_text(data):
+    rows = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+    results = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("prizeName")
+        if name:
+            results.append(str(name))
+        else:
+            for prize in row.get("lqPrizeVoList") or []:
+                name = prize.get("prizeName")
+                if name:
+                    count = row.get("prizeNumber")
+                    results.append(str(name) + (f" × {count}" if count is not None else ""))
+        if row.get("claimMode") == "mailClaim":
+            results.append("实物奖品，请在小程序奖励中心填写领取信息")
+    return "；".join(results) or "接口未返回奖品名称，请在小程序奖励中心核对"
+
+
+def run_monthly_raffles(token, index, lines):
+    days = monthly_sign_days(token)
+    status = monthly_receive_status(token)
+    emit_stage(lines, index, f"本月累计签到 {days} 天")
+    location = None
+    for milestone in sorted(status):
+        if status[milestone]:
+            emit_stage(lines, index, f"✅ 累签 {milestone} 天奖励已领取，跳过")
+            continue
+        if days < milestone:
+            emit_stage(lines, index, f"累签 {milestone} 天抽奖未达标（{days}/{milestone}）")
+            continue
+        # 每个里程碑只发送一次；网络异常后复查领取状态，绝不盲目重放抽奖。
+        if location is None:
+            location = egress_ip_location()
+            emit_stage(lines, index, f"抽奖使用本次运行出口 IP 对应坐标（{location['city']}）")
+        try:
+            result = api_post("/smhd/activity/task/doMonthlySignTaskRaffle", {
+                "activityCode": SIGN_LOTTERY_ACTIVITY, "num": milestone,
+                "longitude": location["longitude"], "latitude": location["latitude"],
+            }, token=token)
+            data = require_response(result, 0, f"累签 {milestone} 天抽奖")
+        except Exception as exc:
+            emit_stage(lines, index, f"⚠️ 累签 {milestone} 天抽奖异常：{exc}")
+            try:
+                received = monthly_receive_status(token).get(milestone)
+                if received is True:
+                    emit_stage(lines, index, "已确认奖励已领取，结果请查看小程序；本轮不重复提交")
+            except Exception:
+                emit_stage(lines, index, "领取状态复查失败，本轮不重复提交")
+            continue
+        emit_stage(lines, index, f"🎁 累签 {milestone} 天抽奖结果：{draw_prize_text(data)}")
+        if monthly_receive_status(token).get(milestone) is not True:
+            emit_stage(lines, index, "⚠️ 抽奖返回成功，但领取状态尚未更新；本轮不重复提交")
+
+
+def get_daily_tasks(token):
+    response = api_post("/b2c/member/task/list", {}, token=token)
+    data = require_response(response, 200, "读取日常任务")
+    if not isinstance(data, dict) or not isinstance(data.get("taskResDtoList"), list):
+        raise ValueError("日常任务列表格式变化")
+    return [row for row in data["taskResDtoList"] if row.get("taskType") == "daily_task"]
+
+
+def obtain_task_session(ref, index):
+    token, union_id = obtain_session(ref, index)
+    cached = get_cached_session(ref)
+    if not (cached.get("wxOpenid") and cached.get("b2cMemberId") and union_id):
+        # 旧缓存没有任务系统所需身份字段，正常登录一次补齐；以后直接复用。
+        token, union_id = obtain_session(ref, index, force=True)
+        cached = get_cached_session(ref)
+    if not (cached.get("wxOpenid") and cached.get("b2cMemberId") and union_id):
+        raise RuntimeError("登录响应缺少任务系统身份信息")
+    activity = api_post("/smhd/activityApi/getToken", {
+        "unionId": union_id, "openId": cached["wxOpenid"],
+    }, token=token)
+    activity_token = require_response(activity, 0, "获取任务系统会话")
+    if not isinstance(activity_token, str) or not activity_token:
+        raise ValueError("任务系统会话格式异常")
+    return token, union_id, cached["b2cMemberId"], activity_token
+
+
+def run_daily_tasks(ref, token, index, lines):
+    tasks = get_daily_tasks(token)
+    if not tasks:
+        emit_stage(lines, index, "今日没有日常任务")
+        return
+    pending = []
+    for task in tasks:
+        name = str(task.get("taskMsgName") or "未命名任务")
+        if task.get("finishStatus") == "finish":
+            emit_stage(lines, index, f"✅ 日常任务「{name}」已完成，跳过")
+        elif name in DAILY_BROWSE_NAMES and task.get("taskMsgType") == "common_task":
+            pending.append(task)
+        else:
+            emit_stage(lines, index, f"⚠️ 日常任务「{name}」需在小程序完成，当前脚本不支持该任务类型")
+    if not pending:
+        return
+    token, union_id, member_id, activity_token = obtain_task_session(ref, index)
+    for task in pending:
+        name = str(task["taskMsgName"])
+        try:
+            # 小程序对这两项直接调用完成接口，随后导航到浏览页面。
+            response = api_post("/tas/task/complated", {
+                "unionId": union_id, "memberId": member_id, "taskId": task["id"],
+            }, token=activity_token)
+            if resp_code(response) == SESSION_INVALID_CODE:
+                token, union_id, member_id, activity_token = obtain_task_session(ref, index)
+                response = api_post("/tas/task/complated", {
+                    "unionId": union_id, "memberId": member_id, "taskId": task["id"],
+                }, token=activity_token)
+            require_response(response, 0, f"完成日常任务「{name}」")
+            # 接口 accepted 不等于任务完成，重新读取服务端 finishStatus。
+            confirmed = None
+            for attempt in range(3):
+                current = get_daily_tasks(token)
+                confirmed = next((row for row in current if str(row.get("id")) == str(task["id"])), None)
+                if confirmed and confirmed.get("finishStatus") == "finish":
+                    break
+                if attempt < 2:
+                    time.sleep(1)
+            if confirmed and confirmed.get("finishStatus") == "finish":
+                reward = confirmed.get("rewardNum", task.get("rewardNum"))
+                unit = "生态币" if confirmed.get("giftType") == "points" else "奖励"
+                emit_stage(lines, index, f"✅ 日常任务「{name}」完成（{reward} {unit}）")
+            else:
+                emit_stage(lines, index, f"⚠️ 日常任务「{name}」提交成功，但服务端尚未确认完成")
+        except Exception as exc:
+            emit_stage(lines, index, f"⚠️ 日常任务「{name}」失败：{exc}")
+
+
+def run_account(openid, index):
+    summary, signed = run_sign_account(openid, index)
+    lines = [summary]
+    if not signed:
+        emit_stage(lines, index, "签到未成功，本轮不继续抽奖和日常任务")
+        return "\n".join(lines), False
+    token, union_id = obtain_session(openid, index)
+    for label, action in [
+        ("累签抽奖", lambda: run_monthly_raffles(token, index, lines)),
+        ("日常任务", lambda: run_daily_tasks(openid, token, index, lines)),
+    ]:
+        try:
+            action()
+        except Exception as exc:
+            emit_stage(lines, index, f"⚠️ {label}执行失败：{exc}")
+    token, union_id = obtain_session(openid, index)
+    balance = points_balance(token, union_id)
+    if balance is not None:
+        emit_stage(lines, index, f"本轮结束生态币：{balance}")
+    return "\n".join(lines), True
+
+
 def main():
+    global _egress_location_cache
+    _egress_location_cache = None
     entries = ACCOUNT_REFS
 
     if not entries:
