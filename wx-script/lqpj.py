@@ -18,14 +18,19 @@ cron: 30 9 * * *
 #   状态  GET  /api/b2c/member/sign/task/list  -> data.signRes.{sign, signNum,
 #            taskSignDtoList[{signTime, signStatus}]}   sign==true / 今日行
 #            signStatus=="sign" 即今日已签 (幂等预检依据)
-#   签到  POST /api/b2c/member/sign/task  body {}  -> code==200, data.signRes.sign==true
+#   验证  POST /api/smhd/captcha/get、/api/smhd/captcha/check -> 自动匹配拼图并校验
+#   签到  POST /api/b2c/member/sign/task  body {captchaVerification: 验证结果}
+#            -> code==200, data.signRes.sign==true
 #   积分  GET  /api/b2c/member/pointsAndCouponCardNumAndShopCardInfo?unionId=<unionId>
 #            -> data.MemberCouponShopPointsVo.pointsNum   (仅用于上报余额)
 # 环境变量：
+#   自动完成拼图验证；依赖 requests、Pillow、numpy、pycryptodome（或 cryptography）
 #   YYB_SERVER      YYB-Go-Enhanced 路由，每行：地址@账号标识
 #   账号直接来自 YYB_SERVER；无需配置 WX_ID / lqpj
 #   YYB_API_KEY / YYB_PROTOCOL_TOKEN       启用协议鉴权时配置，二选一
 
+import base64
+import io
 import json
 import os
 import sys
@@ -404,8 +409,98 @@ def sign_state(token):
     return api_get("/b2c/member/sign/task/list", token=token)
 
 
+def match_puzzle(original_base64, jigsaw_base64):
+    import numpy as np
+    from PIL import Image, ImageFilter
+
+    def decode(value):
+        raw = base64.b64decode(value.split(",", 1)[-1], validate=True)
+        if len(raw) > 5_000_000:
+            raise ValueError("验证码图片过大")
+        result = Image.open(io.BytesIO(raw))
+        if not (10 <= result.width <= 1000 and 10 <= result.height <= 1000):
+            raise ValueError("验证码图片尺寸异常")
+        return result
+
+    bg = np.asarray(decode(original_base64).convert("RGB"), dtype=np.float64)
+    piece = decode(jigsaw_base64).convert("RGBA")
+    if piece.height != bg.shape[0] or piece.width >= bg.shape[1]:
+        raise ValueError("验证码图片布局变化，需要更新匹配逻辑")
+    # 消除拼图白色描边后，按各颜色通道去均值，匹配暗化缺口中的原图纹理。
+    mask = np.asarray(piece.getchannel("A").filter(ImageFilter.MinFilter(5))) > 240
+    ys, xs = np.where(mask)
+    if len(xs) < 50:
+        raise ValueError("验证码拼图缺少有效像素")
+    template = np.asarray(piece, dtype=np.float64)[ys, xs, :3]
+    template -= template.mean(axis=0)
+    norm = np.linalg.norm(template)
+    if norm < 1:
+        raise ValueError("验证码拼图纹理不足")
+    scores = []
+    for x in range(5, bg.shape[1] - piece.width + 1):
+        candidate = bg[ys, xs + x].copy()
+        candidate -= candidate.mean(axis=0)
+        score = float(np.sum(template * candidate) / (norm * np.linalg.norm(candidate) + 1e-9))
+        scores.append((score, x))
+    scores.sort(reverse=True)
+    score, x = scores[0]
+    competing = max((s for s, pos in scores if abs(pos - x) > 4), default=-1)
+    if score < 0.45 or score - competing < 0.08:
+        raise ValueError(f"拼图匹配置信度不足 ({score:.3f}/{competing:.3f})")
+    return int(x * 310 / bg.shape[1] + 0.5), score
+
+
+def captcha_encrypt(text, secret_key):
+    if not secret_key:
+        return text
+    key = secret_key.encode("utf-8")
+    data = text.encode("utf-8")
+    size = 16 - len(data) % 16
+    padded = data + bytes([size]) * size
+    try:
+        from Crypto.Cipher import AES
+        encrypted = AES.new(key, AES.MODE_ECB).encrypt(padded)
+    except ImportError:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        encryptor = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
+        encrypted = encryptor.update(padded) + encryptor.finalize()
+    return base64.b64encode(encrypted).decode("ascii")
+
+
+def solve_captcha(token, post, attempts=3):
+    last_error = ""
+    for attempt in range(1, attempts + 1):
+        try:
+            challenge = post("/smhd/captcha/get", {"captchaType": "blockPuzzle"}, token=token)
+            if str(challenge.get("repCode")) != "0000":
+                raise RuntimeError(challenge.get("repMsg") or "获取验证码失败")
+            data = challenge.get("repData") or {}
+            if not data.get("token"):
+                raise ValueError("验证码响应缺少 token")
+            x, score = match_puzzle(data["originalImageBase64"], data["jigsawImageBase64"])
+            point = json.dumps({"x": x, "y": 5}, separators=(",", ":"))
+            key = data.get("secretKey") or ""
+            result = post("/smhd/captcha/check", {
+                "captchaType": "blockPuzzle", "token": data["token"],
+                "pointJson": captcha_encrypt(point, key),
+            }, token=token)
+            if str(result.get("repCode")) != "0000":
+                raise RuntimeError(result.get("repMsg") or "滑块校验失败")
+            print(f"✅ 滑块验证通过（第 {attempt} 次，匹配度 {score:.3f}）")
+            return captcha_encrypt(data["token"] + "---" + point, key)
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise RuntimeError("自动滑块缺少依赖，请安装 Pillow、numpy、pycryptodome") from exc
+        except (ValueError, KeyError, RuntimeError) as exc:
+            last_error = str(exc)
+            print(f"⚠️ 滑块验证第 {attempt}/{attempts} 次失败：{last_error}")
+            if attempt < attempts:
+                time.sleep(1)
+    raise RuntimeError(f"自动滑块验证失败（已尝试 {attempts} 次）：{last_error}")
+
+
 def do_sign(token):
-    return api_post("/b2c/member/sign/task", {}, token=token)
+    verification = solve_captcha(token, api_post)
+    return api_post("/b2c/member/sign/task", {"captchaVerification": verification}, token=token)
 
 
 def points_balance(token, union_id):
