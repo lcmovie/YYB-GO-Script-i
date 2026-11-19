@@ -262,6 +262,9 @@ class AutoCookieManager:
                     "Content-Type": "application/json",
                     "User-Agent": "Mozilla/5.0 MicroMessenger/8.0.50",
                 }
+                _api_key = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
+                if _api_key:
+                    headers["Authorization"] = _api_key if " " in _api_key else "Bearer " + _api_key
 
                 r = self.session.post(url, json=payload, headers=headers, timeout=30)
                 j = r.json()
