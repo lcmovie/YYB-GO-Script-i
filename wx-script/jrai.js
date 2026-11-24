@@ -453,7 +453,6 @@ async function runAccount(entry, index) {
   const ch = await applyChannel(ctx);
   result.channel = ch;
   if (ch && ch.bound) log(`[${ctx.who}] 渠道关系已同步`);
-  else if (ch && ch.skipped) log(`[${ctx.who}] 渠道关系已存在，无需重复同步`);
 
   // 签到
   const home = await api('/welfare/home', { token: ctx.token });
