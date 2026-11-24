@@ -1,6 +1,6 @@
 // name:红色火箭
 // cron: 26 10,13 * * *
-// 红色火箭（华泰基金指慧家） 2026.11.02 单文件版
+// 红色火箭（华泰基金指慧家） 2026.11.24 单文件版
 //
 // 使用：复制本文件到青龙，添加定时任务 task 实际目录/hshj.js。
 // 必填 YYB_SERVER：你自己的已授权 YYB 地址@账号ref，多账号换行；例如 http://127.0.0.1:8000@1
@@ -801,7 +801,7 @@ const OCR_RESOURCES = {
     'common_old.onnx': 'b8f2ad9cbc1f2e3922a6cb9459e30824e7e2467f3fb4fd61420640e34ea0bf68',
     'common.onnx': '33b5cd351ee94e73a6bf8fa18c415ed8b819b3ffd342e267c30d8ad8334e34e8',
 };
-const OCR_CHARSETS = {"default":{"78":"2","409":"7","462":"-","2382":"–","2879":"9","3766":"？","4410":"1","4450":"/","4569":"*","5225":"X","5260":"=","5378":"×","5806":"4","5807":"?","5961":"6","6178":"+","6736":"x","6749":"0","6977":"5","6979":"8","6995":"÷","7721":"3"},"beta":{"13":"6","235":"=","309":"3","521":"X","689":"x","770":"？","772":"/","1581":"?","2851":"2","3332":"-","3606":"4","4018":"1","4494":"–","4640":"÷","4725":"9","4733":"0","4919":"8","5223":"5","6470":"+","6732":"×","6794":"7","7502":"*"}};
+const OCR_CHARSETS = {"default":{"78":"2","409":"7","462":"-","2382":"–","2879":"9","3766":"？","4410":"1","4450":"/","4569":"*","5225":"X","5260":"=","5378":"×","5806":"4","5807":"?","5961":"6","6178":"+","6736":"x","6749":"0","6977":"5","6979":"8","6995":"÷","7721":"3","357":"F","687":"D","747":"M","761":"C","806":"r","821":"Y","1066":"b","1107":"c","1583":"J","1614":"I","1638":"f","1769":"v","2041":"i","2089":"l","2203":"B","2525":"E","2663":"u","3072":"k","3466":"s","3930":"P","3963":"Z","4050":"n","4488":"G","4617":"m","4666":"K","4730":"z","4771":"A","4810":"W","5027":"p","5046":"T","5418":"O","5554":"H","5726":"d","5734":"V","6185":"j","6216":"N","6257":"e","6386":"S","6601":"Q","6612":"y","6672":"L","6939":"o","7136":"w","7198":"a","7262":"R","7284":"U","7405":"q","7723":"t","8119":"g","8196":"h"},"beta":{"13":"6","235":"=","309":"3","521":"X","689":"x","770":"？","772":"/","1581":"?","2851":"2","3332":"-","3606":"4","4018":"1","4494":"–","4640":"÷","4725":"9","4733":"0","4919":"8","5223":"5","6470":"+","6732":"×","6794":"7","7502":"*","55":"f","209":"p","210":"L","297":"Y","306":"w","311":"F","320":"m","598":"G","782":"i","897":"T","901":"N","1073":"v","1151":"c","1204":"B","1503":"n","1849":"Q","1965":"H","2113":"K","2185":"W","2341":"P","2376":"r","2457":"l","2547":"E","2621":"Z","2714":"s","3073":"z","3128":"D","3157":"O","4102":"t","4393":"b","4429":"o","4588":"u","4730":"j","5428":"e","5461":"A","5629":"R","5690":"g","5737":"k","5855":"S","6554":"I","6810":"d","6887":"V","7216":"J","7266":"a","7412":"h","7576":"q","7712":"U","7844":"M","7877":"y","7961":"C"}};
 const OCR_CACHE = process.env.HSJJ_OCR_CACHE || pathMod.join(__dirname, '.cache', 'hshj-ocr-v1');
 let ocrPreparing, ocrRuntime, ocrSetupError;
 const ocrSessions = new Map();
@@ -1021,13 +1021,32 @@ function visibleOcrMinus(image) {
     }
     return false;
 }
-async function recognizeCaptcha(encoded) {
+// 字母数字图的上下留白和孤立圆圈会影响整图识别，取墨迹最密集的横向带。
+function textCaptchaBand(image) {
+    const gray = new Uint8Array(image.w * image.h), rows = new Uint32Array(image.h);
+    for (let y = 0; y < image.h; y++) for (let x = 0; x < image.w; x++) {
+        const i = y * image.w + x, p = i * 3;
+        gray[i] = Math.min(image.data[p], image.data[p + 1], image.data[p + 2]);
+        if (gray[i] < 210) rows[y]++;
+    }
+    const height = Math.min(image.h, Math.max(24, Math.ceil(image.h * .45)));
+    let best = 0, score = 0, maximum = -1;
+    for (let y = 0; y < image.h; y++) {
+        score += rows[y];
+        if (y >= height) score -= rows[y - height];
+        if (y >= height - 1 && score > maximum) { maximum = score; best = y - height + 1; }
+    }
+    return { w: image.w, h: height, channels: 1, data: gray.slice(best * image.w, (best + height) * image.w) };
+}
+async function recognizeCaptcha(encoded, mode = 'arithmetic') {
     if (typeof encoded !== 'string' || encoded.length > 180000) return null;
     const base64 = encoded.replace(/^data:image\/png;base64,/, '');
     if (!/^[A-Za-z0-9+/\s]*={0,2}$/.test(base64)) return null;
     const image = decodeOcrPng(Buffer.from(base64, 'base64')), prefix = cropOcrImage(image);
-    const variants = [image, grayOcrImage(image, true), prefix, grayOcrImage(prefix, true)], minus = visibleOcrMinus(image);
-    const votes = new Map();
+    const variants = mode === 'text' ? [image, grayOcrImage(image, true), textCaptchaBand(image)]
+        : [image, grayOcrImage(image, true), prefix, grayOcrImage(prefix, true)];
+    const minus = visibleOcrMinus(image);
+    const votes = new Map(), textModels = new Map();
     for (const beta of [false, true]) {
         const session = await getOcrSession(beta), charset = OCR_CHARSETS[beta ? 'beta' : 'default'];
         for (let i = 0; i < variants.length; i++) {
@@ -1045,18 +1064,24 @@ async function recognizeCaptcha(encoded) {
                 previous = index;
             }
             text = text.normalize('NFKC').replace(/\s/g, '').split('=')[0];
-            let parsed = calculateCaptcha(text);
-            if (!parsed && minus && i >= 2) {
+            let parsed = mode === 'text'
+                ? (/^[A-Za-z0-9]{4,6}$/.test(text) ? { expression: text, answer: text } : null)
+                : calculateCaptcha(text);
+            if (mode === 'arithmetic' && !parsed && minus && i >= 2) {
                 const m = text.match(/^(\d{1,2})[^\d](\d{1,2})$/);
                 if (m) parsed = calculateCaptcha(m[1] + '-' + m[2]);
             }
             if (parsed) {
                 const count = (votes.get(parsed.expression) || 0) + 1; votes.set(parsed.expression, count);
-                if (count >= 2) return parsed;
+                if (mode === 'text') {
+                    if (!textModels.has(parsed.answer)) textModels.set(parsed.answer, new Set());
+                    textModels.get(parsed.answer).add(beta);
+                } else if (count >= 2) return parsed;
             }
         }
     }
-    return null;
+    const agreed = [...textModels].filter(([, models]) => models.size === 2);
+    return agreed.length === 1 ? { expression: agreed[0][0], answer: agreed[0][0] } : null;
 }
 
 
@@ -1081,9 +1106,16 @@ async function checkTaskVerification(session, verificationCodeType, label) {
             return { ok: false };
         }
         try {
-            const result = await recognizeCaptcha(response.data.verifyCodeBase64);
+            const prompt = String(response.data.verificationCodeType || '');
+            const mode = /答案/.test(prompt) ? 'arithmetic' : /验证码/.test(prompt) ? 'text' : '';
+            if (!mode) {
+                addTaskIssue(session, label + '验证码提示类型未知，请在小程序手动完成');
+                return { ok: false };
+            }
+            const started = Date.now();
+            const result = await recognizeCaptcha(response.data.verifyCodeBase64, mode);
             if (result) {
-                log('  🔎 ' + label + '验证码本地识别: ' + result.expression + '=' + result.answer);
+                log('  🔎 ' + label + '验证码本地识别(' + mode + '): ' + result.expression + '=' + result.answer + '，耗时' + (Date.now() - started) + 'ms');
                 return { ok: true, required: true, submitCode: result.answer, requestId: response.data.requestId };
             }
             log('  ⚠️ ' + label + '验证码识别不确定，准备获取新图（最多3张）');
@@ -1375,6 +1407,10 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
         }
         addTaskIssue(session, '答题提交结果未知，尚未查到兑换记录，请稍后复核');
         return { success: false };
+    }
+    if (String(resp?.code) === '7005') {
+        const reason = String(resp.msg || resp.message || '').replace(/https?:\/\/\S+|[A-Za-z0-9_-]{16,}/g, '[已隐藏]').slice(0, 120);
+        log('  ⚠️ 答题返回7005：' + (reason || '服务端未提供原因') + '，验证码=' + Boolean(verification.required));
     }
     if (verification.required && /验证码/.test(String(resp.msg || resp.message || ''))) {
         if (await retryRejectedCaptcha(resp, verification, session, '1', '答题')) return await doRoeReward(session, wxid, cache, cacheKey, activityEntry);
