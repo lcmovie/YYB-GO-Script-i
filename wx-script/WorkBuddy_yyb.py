@@ -11,7 +11,7 @@ cron: 31 7,12,23 * * *
 修改作者：lcmovie https://github.com/lcmovie/YYB-GO-Script-i
 修改后主要适配：https://github.com/525815266/YYB-Go-Enhanced，实现无感取码，自动打卡 + 全部成长任务！
 ════════════════════════════════════════════════════════════════
-🌱 WorkBuddy Daily - 全能签到脚本 v3.48（YYB 无感取码版）
+🌱 WorkBuddy Daily - 全能签到脚本 v3.53（YYB 无感取码版）
 ════════════════════════════════════════════════════════════════
 
 📌 这是什么
@@ -76,7 +76,7 @@ cron: 31 7,12,23 * * *
    PUSH_PLUS_TOKEN / PLUSPLUS_TOKEN / PUSH_KEY / QYWX_KEY / BARK_PUSH
                         【可选】脚本自带通知通道（青龙 notify.py 未配置时回落）
 
-📦 任务清单（参考上游 v3.48，以下任务以实际下发为准）
+📦 任务清单（参考上游 v3.53，以下任务以实际下发为准）
    ☁️ 已适配成长任务：每日签到 · 设计创意模式 · 探索优秀灵感 · 桌面端对话 ·
       尝鲜热门技能 · 体验资料库 · 腾讯轻量云专家 · 和平精英主题 · 发现应用 ·
       企鹅教师助手 · GLM-5.2模型对话 · 和AI聊天5次 · 夜猫子活动 · 召唤3次专家团 ·
@@ -161,9 +161,9 @@ try:
 except Exception:
     pass
 
-VERSION = "1.9.6"
-UPSTREAM_VERSION = "3.48"
-UPSTREAM_COMMIT = "94e7f14832fc02760e97f641ab0fc9fa30871126"
+VERSION = "1.9.7"
+UPSTREAM_VERSION = "3.53"
+UPSTREAM_COMMIT = "35ea8e35a4982c796f002102555d60be2bedac9a"
 APP_ID = "wx907c65e5e107ddcf"                     # WorkBuddy 小程序 AppID
 LOGIN_URL = "https://www.codebuddy.cn/v2/plugin/login/token"
 PROFILE_URL = "https://www.codebuddy.cn/v2/as/wechatmp/user/profile"
@@ -1826,10 +1826,14 @@ def _finish_credit_sample(s, summary, log):
         before, after = summary.get("credits_before"), summary.get("credits_after")
         if before is not None and after is not None:
             summary["credits_delta"] = str(_credit_decimal(after) - _credit_decimal(before))
+        _sample_credit_expiry(s, summary)
         for line in _credit_lines(summary):
             log(line.strip())
     except Exception as exc:
         log("   ⚠️余额收尾异常（%s），保留原始业务结果" % type(exc).__name__)
+    for key in ("credits_expiry", "credits_expiry_warning"):
+        if summary.get(key):
+            log("   " + summary[key])
 
 def _settle_before_play(s, log):
     # 单独判断每个开关，避免某一个黑名单项目屏蔽其他已启用玩法。
@@ -1840,6 +1844,262 @@ def _settle_before_play(s, log):
         claim_ready_tasks(s, log)
     except Exception as exc:
         log("   ⚠️玩法前领奖异常（%s），继续后续流程" % type(exc).__name__)
+
+
+CREDITS_PAGE_SIZE = 1000
+CREDITS_PRODUCT_CODE = "p_tcaca"
+CREDITS_PACKAGE_STATUS = (0, 3)
+CREDITS_EXPIRY_WINDOW_DAYS = 365 * 101
+CREDITS_MAX_PAGES = 20
+
+
+def _credit_parse_end(value):
+    try:
+        result = datetime.datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        if result.tzinfo is not None:
+            result = result.astimezone(datetime.timezone(datetime.timedelta(hours=8)))
+        return result.replace(tzinfo=None)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _credit_precise_num(account, key):
+    for name in (key + "Precise", key):
+        if name in account:
+            try:
+                return _credit_decimal(account[name])
+            except (ValueError, ArithmeticError):
+                pass
+    return None
+
+
+def _credit_account_remain(account, monthly=False):
+    if "CycleCapacityRemain" in account or "CycleCapacityRemainPrecise" in account:
+        return _credit_precise_num(account, "CycleCapacityRemain")
+    return None if monthly else _credit_precise_num(account, "CapacityRemain")
+
+
+def _credit_is_monthly(account):
+    value = account.get("CapacityType")
+    if value is not None:
+        try:
+            return _credit_decimal(value) == 4
+        except (ValueError, ArithmeticError):
+            pass
+    cycle = _credit_parse_end(account.get("CycleEndTime"))
+    end = _credit_parse_end(account.get("DeductionEndTime"))
+    return bool(cycle and end and end - cycle > datetime.timedelta(days=2))
+
+
+def _credit_account_end(account, monthly):
+    if monthly:
+        return (_credit_parse_end(account.get("CycleEndTime"))
+                or _credit_parse_end(account.get("DeductionEndTime")))
+    return (_credit_parse_end(account.get("ExpiredTime"))
+            or _credit_parse_end(account.get("CycleEndTime")))
+
+
+def _credit_expiry_line(accounts, now=None, days=7):
+    """按北京时间和积分种类聚合到期批次；不改变现有套餐余额口径。"""
+    now = now or beijing_now()
+    if now.tzinfo is not None:
+        now = now.astimezone(datetime.timezone(datetime.timedelta(hours=8)))
+    now = now.replace(tzinfo=None)
+    buckets = {}
+    for account in accounts or []:
+        if not isinstance(account, dict):
+            continue
+        monthly = _credit_is_monthly(account)
+        remain = _credit_account_remain(account, monthly)
+        end = _credit_account_end(account, monthly)
+        if remain is None or remain <= 0 or end is None or end <= now:
+            continue
+        key = (end, monthly)
+        buckets[key] = buckets.get(key, Decimal(0)) + remain
+    ordered = [(end, monthly, remain) for (end, monthly), remain in sorted(buckets.items())]
+    if not ordered:
+        return "", ""
+    horizon = now + datetime.timedelta(days=days)
+    soon = [item for item in ordered if item[0] <= horizon]
+    later = [item for item in ordered if item[0] > horizon]
+
+    def segment(item):
+        end, monthly, remain = item
+        left = (end.date() - now.date()).days
+        when = "今天" if left == 0 else "%d 天后" % left
+        return "%s %s %s 分（%s）" % (
+            end.strftime("%Y-%m-%d %H:%M"), "月包清零" if monthly else "赠分到期",
+            _format_credit(remain), when)
+
+    shown = soon[:2]
+    parts = [segment(item) for item in shown]
+    if len(soon) > 2:
+        parts.append("%d 天内共 %d 批 %s 分" % (
+            days, len(soon), _format_credit(sum((item[2] for item in soon), Decimal(0)))))
+    for monthly in (False, True):
+        item = next((item for item in later if item[1] == monthly), None)
+        if item is not None:
+            parts.append(segment(item))
+    warning = ""
+    if soon:
+        warning = "⚠️ 积分到期预警：%s 分将在 %d 天内失效（最早 %s）" % (
+            _format_credit(sum((item[2] for item in soon), Decimal(0))), days,
+            soon[0][0].strftime("%Y-%m-%d %H:%M"))
+    return "⏰ " + "｜".join(parts), warning
+
+
+def _credit_resource_data(response):
+    payload = _json_or_empty(response)
+    if (not 200 <= response.status_code < 300 or isinstance(payload.get("code"), bool)
+            or not _api_code_ok(payload.get("code"))):
+        raise SafeError("积分到期查询回执无效")
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise SafeError("积分到期查询缺少数据")
+    if "Response" in data:
+        inner = data["Response"]
+        if not isinstance(inner, dict) or inner.get("Error"):
+            raise SafeError("积分到期查询资源错误")
+        data = inner.get("Data")
+    if isinstance(data, dict) and "Accounts" in data and data["Accounts"] is None:
+        data = dict(data, Accounts=[])
+    if not isinstance(data, dict) or not isinstance(data.get("Accounts"), list):
+        raise SafeError("积分到期查询缺少资源列表")
+    if any(not isinstance(row, dict) for row in data["Accounts"]):
+        raise SafeError("积分到期资源行无效")
+    return data
+
+
+def queryCreditExpiry(s, meta=None):
+    """只读计费资源，分页完整后才生成提醒；异常不影响现有余额查询。"""
+    now = beijing_now().replace(tzinfo=None)
+    body = {"PageSize": CREDITS_PAGE_SIZE, "ProductCode": CREDITS_PRODUCT_CODE,
+            "Status": list(CREDITS_PACKAGE_STATUS),
+            "PackageEndTimeRangeBegin": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "PackageEndTimeRangeEnd": (now + datetime.timedelta(
+                days=CREDITS_EXPIRY_WINDOW_DAYS)).strftime("%Y-%m-%d %H:%M:%S")}
+    accounts, seen = [], set()
+    if meta is not None:
+        meta.clear()
+    try:
+        for page in range(1, CREDITS_MAX_PAGES + 1):
+            response = api_retry(s, "POST", BASE + "/billing/meter/get-user-resource",
+                                 body=dict(body, PageNumber=page), retries=3, gap=2.0)
+            data = _credit_resource_data(response)
+            rows = data["Accounts"]
+            total = data.get("TotalCount")
+            if total is not None:
+                if isinstance(total, bool) or not re.fullmatch(r"\d+", str(total)):
+                    raise SafeError("积分到期分页总数无效")
+                total = int(total)
+            fingerprint = json.dumps(rows, sort_keys=True, separators=(",", ":"))
+            if rows and fingerprint in seen:
+                raise SafeError("积分到期分页重复")
+            seen.add(fingerprint)
+            accounts.extend(rows)
+            if total is not None:
+                if len(accounts) > total:
+                    raise SafeError("积分到期分页总数不一致")
+                # TotalCount 是时间窗口过滤前的数量；整批请求能覆盖该总数时，
+                # Accounts 少于 TotalCount 是正常过滤结果，不能补发并重复累计。
+                if len(accounts) == total or (page == 1 and total <= CREDITS_PAGE_SIZE):
+                    break
+                if not rows:
+                    raise SafeError("积分到期分页缺失")
+            elif len(rows) < CREDITS_PAGE_SIZE:
+                break
+        else:
+            raise SafeError("积分到期分页超过上限")
+        if meta is not None:
+            meta.update(loaded=True, account_rows=len(accounts), pages=page)
+        return _credit_expiry_line(accounts, now)
+    except Exception as exc:
+        if meta is not None:
+            meta.update(loaded=False)
+        return "", "积分到期查询失败（%s）" % type(exc).__name__
+
+
+def _sample_credit_expiry(s, summary):
+    meta = {}
+    line, warning = queryCreditExpiry(s, meta)
+    summary["credits_expiry"] = line
+    summary["credits_expiry_warning"] = warning
+    summary["credits_expiry_loaded"] = meta.get("loaded", False)
+    if not meta.get("loaded"):
+        issues = summary.setdefault("task_errors", [])
+        if warning and warning not in issues:
+            issues.append(warning)
+
+
+def _terminal_task_sources(s, desktop):
+    sources = {"desktop": {"ok": True, "rows": desktop}}
+    for name, headers, path in (("mp", MP_HEADER, "/v2/activity/growth/tasks"),
+                                ("level", None, "/activity/growth/tasks")):
+        try:
+            sources[name] = {"ok": True, "rows": growth_task_rows(s, headers=headers, path=path)}
+        except (SafeError, requests.RequestException):
+            sources[name] = {"ok": False, "rows": []}
+    return sources
+
+
+def _task_source_text(counts):
+    return " / ".join("%s%s" % (label, counts[key] if counts[key] is not None else "未确认")
+                      for key, label in (("desktop", "桌面"), ("mp", "小程序"), ("level", "等级"))
+                      if key in counts)
+
+
+def _summarize_task_completion(rows, confirmations=None):
+    confirmations = confirmations if isinstance(confirmations, dict) else {}
+    done, rest = 0, []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        code = row.get("task_code") or row.get("code")
+        if not code:
+            continue
+        if _row_claimed(row) or confirmations.get(code) is True:
+            done += 1
+        else:
+            rest.append(code)
+    return done, rest
+
+
+def _log_task_expiry_reminders(rows, log, confirmations=None, today=None):
+    """最终补领后三源实时回读；完成未领奖仍提醒，不涉及活动邀请项。"""
+    confirmations = confirmations if isinstance(confirmations, dict) else {}
+    today = today or beijing_today()
+    grouped = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        code = row.get("task_code") or row.get("code")
+        if not isinstance(code, str) or not code or code.startswith("campaign"):
+            continue
+        grouped.setdefault(code, []).append(row)
+    soon = []
+    for code, items in grouped.items():
+        if confirmations.get(code) is True or any(_row_claimed(row) for row in items):
+            continue
+        ends = []
+        for row in items:
+            if row.get("locked"):
+                continue
+            value = str(row.get("valid_end") or "")[:10]
+            try:
+                ends.append(datetime.date.fromisoformat(value))
+            except (TypeError, ValueError):
+                pass
+        if not ends:
+            continue
+        end = min(ends)
+        left = (end - today).days
+        if left <= 7:
+            soon.append((code, end.isoformat(), "已过期" if left < 0 else "%d 天后到期" % left))
+    if soon:
+        log("   ⏰ 任务有效期提醒（未完成/未领奖）:")
+        for code, end, when in soon[:6]:
+            log("      · %s %s（%s）" % (code, end, when))
+    return soon
 
 
 def queryCredits(s, meta=None):
@@ -3896,6 +4156,8 @@ def _create_skill_share_channel(s, uid, skill):
     data = data if isinstance(data, dict) else {}
     share_code = data.get("share_code")
     share_code = share_code.strip() if isinstance(share_code, str) else ""
+    channel_id = data.get("channel_id")
+    channel_id = channel_id.strip() if isinstance(channel_id, str) else ""
     link = ""
     ways = data.get("ways")
     for way in ways if isinstance(ways, list) else []:
@@ -3903,48 +4165,41 @@ def _create_skill_share_channel(s, uid, skill):
             value = way.get("resource_ref")
             link = value.strip() if isinstance(value, str) else ""
             break
-    if not share_code or not link:
+    if not share_code or not link or not channel_id:
         return {
             "success": False,
             "http": response.status_code,
-            "message": "分享接口缺少 share_code 或 link",
+            "message": "分享接口缺少 channel_id、share_code 或 link",
         }
     return {
         "success": True,
         "shareCode": share_code,
-        "channelId": str(data.get("channel_id") or ""),
+        "channelId": channel_id,
     }
 
 
-def _skill_share_channel_events(skill_id, skill_name, share_code):
+def _skill_share_channel_events(skill_id, skill_name, channel_id):
     common = {
         "skillId": skill_id,
         "skillName": skill_name,
         "skillType": "market",
+        "skillSource": "market",
     }
     now = int(time.time() * 1000)
     return [
         {
             "eventCode": "skill_share_channel_action",
             **common,
-            "action": "link",
-            "panelAction": "click",
-            "panelType": "clipboard",
-            "isSuccessful": True,
-            "cost": 0,
-            "id": share_code,
-            "actionAt": now,
-        },
-        {
-            "eventCode": "skill_share_channel_action",
-            **common,
-            "action": "link",
+            "action": "wechat",
             "panelAction": "success",
-            "panelType": "clipboard",
+            "panelType": "mini_program_card",
             "isSuccessful": True,
             "cost": 0,
-            "id": share_code,
+            "id": channel_id,
             "actionAt": now,
+            "entry": "skill_detail",
+            "status": "safe",
+            "actionSuccessful": True,
         },
     ]
 
@@ -3983,7 +4238,7 @@ def t_skill_share(s, uid, nick, log):
             log("   分享技能给好友：创建渠道失败（HTTP %s，业务码 %s）" % (
                 channel.get("http", "?"), channel.get("code", "?")))
             return
-        events = _skill_share_channel_events(skill["id"], skill["name"], channel["shareCode"])
+        events = _skill_share_channel_events(skill["id"], skill["name"], channel["channelId"])
         report_status = report_desktop_events(s, uid, nick, events)
         if not 200 <= report_status < 300:
             log("   分享技能给好友：事件上报失败（HTTP %s）" % report_status)
@@ -4580,10 +4835,8 @@ def t_campaigns(s, uid, nick, log):
 
 
 def t_unknown_tasks(s, uid, nick, log):
-    """任务列表体检：动态发现新任务 + 未完成任务的有效期预警
+    """任务列表体检：动态发现新任务；有效期提醒在最终补领后生成
 
-    服务端任务行带 valid_start / valid_end（如 Buddy_App_QQ 至 2026-10-10）——
-    过期后就领不到了，所以对「未完成且 7 天内到期 / 已过期」的任务给出 ⏰ 提示。
     桌面 /v2、小程序 /v2、等级族无 /v2 三源并不互为超集，合并后按 code 去重；
     单侧失败不阻断另一侧或后续补领。
     """
@@ -4643,28 +4896,6 @@ def t_unknown_tasks(s, uid, nick, log):
             log("   ⚠️新任务需手动: %s %s (%s) — 涉及真实捐款" % (code, title, desc))
         else:
             log("   ⚠️未覆盖新任务: %s %s (%s) — 请反馈更新脚本" % (code, title, desc))
-    # 有效期预警：未完成但即将过期（或已过期）的任务
-    today = beijing_today()
-    soon = []
-    for t in rows:
-        if not isinstance(t, dict) or (t.get("accept_status") or t.get("status")) in ("claimed", "completed"):
-            continue
-        ve = str(t.get("valid_end") or "")[:10]
-        if len(ve) < 10:
-            continue
-        try:
-            d = datetime.date(*[int(x) for x in ve.split("-")])
-        except Exception:
-            continue
-        left = (d - today).days
-        if left < 0:
-            soon.append((t.get("task_code") or t.get("code") or "", ve, "已过期"))
-        elif left <= 7:
-            soon.append((t.get("task_code") or t.get("code") or "", ve, "%d 天后到期" % left))
-    if soon:
-        log("   ⏰ 任务有效期提醒（未完成）:")
-        for code, ve, when in soon[:6]:
-            log("      · %s %s（%s）" % (code, ve, when))
 
 # ---------- 桌面端换血任务（Windows 走真实桌面，非 Windows 走指纹） ----------
 _INFO_DIR = os.path.join(os.path.expanduser("~"), "AppData", "Local", "CodeBuddyExtension", "Data", "Public", "auth")
@@ -5489,7 +5720,7 @@ def query_account(client, account):
         checked = None
         sd = {}
         issues.append("签到状态查询失败")
-    return {"idx": account.number, "note": account.ref, "query": True,
+    summary = {"idx": account.number, "note": account.ref, "query": True,
             "credits": credits, "usage": usage, "level": prof.get("level", "?"),
             "energy": "?", "streak": "?", "checkin_streak": sd.get("streak_days", "?"),
             "done": 0, "total": 0, "rest": [], "checked": checked is True,
@@ -5497,6 +5728,8 @@ def query_account(client, account):
             "checkin": "今日已签到" if checked is True else (
                 "今日未签到" if checked is False else "签到状态未知"),
             "enterprise": kind == "enterprise", "error": ""}
+    _sample_credit_expiry(s, summary)
+    return summary
 
 
 def run_account(idx, client, account, do_desktop):
@@ -5765,14 +5998,19 @@ def run_account(idx, client, account, do_desktop):
             log("   ⚠️任务终态读取失败，完成数量未确认")
             return msgs, summary
         summary["tasks_loaded"] = True
-        done = sum(1 for t in st_all if isinstance(t, dict) and t.get("accept_status") in ("claimed", "completed"))
-        rest = [task_cn(t.get("task_code", "")) for t in st_all if isinstance(t, dict) and t.get("accept_status") not in ("claimed", "completed")]
+        terminal_sources = _terminal_task_sources(s, st_all)
+        summary["source_counts"] = {key: len(value["rows"]) if value["ok"] else None
+                                    for key, value in terminal_sources.items()}
+        terminal_rows = [row for value in terminal_sources.values() for row in value["rows"]]
+        _log_task_expiry_reminders(terminal_rows, log, _claim_attempts(s))
+        done, rest = _summarize_task_completion(st_all, _claim_attempts(s))
         prof2 = (_json_or_empty(s.get(BASE + "/v2/activity/growth/profile", timeout=25,
                                            verify=False)).get("data") or {})
         summary.update({"done": done, "total": len(st_all), "rest": rest,
                         "level": prof2.get("level", "?"), "energy": energy})
-        log("🏁 %s: 完成%s/%s 等级%s 剩余: %s" % (note, done, len(st_all), prof2.get("level", "?"),
-                                                 ", ".join(rest) if rest else "无"))
+        log("🏁 %s: 桌面成长任务完成%s/%s（任务行 %s） 等级%s 剩余: %s" % (
+            note, done, len(st_all), _task_source_text(summary["source_counts"]),
+            prof2.get("level", "?"), ", ".join(task_cn(code) for code in rest) if rest else "无"))
         return msgs, summary
     except Exception as exc:
         summary["error"] = str(exc) if isinstance(exc, SafeError) else "账号流程异常（%s）" % type(exc).__name__
@@ -5819,6 +6057,11 @@ def build_summary(summaries):
             icon = "✅" if sm.get("checked_in") else ("ℹ️" if sm.get("query") else "⚠️")
             lines.append("   %s %s" % (icon, checkin))
         lines.extend(_credit_lines(sm))
+        for key in ("credits_expiry", "credits_expiry_warning"):
+            if sm.get(key):
+                lines.append("   " + sm[key])
+        if sm.get("source_counts"):
+            lines.append("   🧭 任务行: " + _task_source_text(sm["source_counts"]))
         for campaign in sm.get("campaigns") or []:
             if not campaign["loaded"]:
                 lines.append("   ⚠️ %s：活动读取失败" % campaign["label"])
@@ -5845,16 +6088,16 @@ def build_summary(summaries):
         elif total == 0:
             lines.append("   ℹ️ 当前任务列表为空")
         elif rest_cn:
-            lines.append("   ⏳ 未完成: %s" % "、".join(rest_cn))
+            lines.append("   ⏳ 桌面任务未完成: %s" % "、".join(rest_cn))
         else:
-            lines.append("   ✅ 当前任务列表全部完成（%s/%s）" % (done, total))
+            lines.append("   ✅ 桌面成长任务已全部领取（%s/%s）" % (done, total))
         issues = sm.get("task_errors") or []
         if issues:
             lines.append("   ⚠️ 本轮任务/查询异常 %d 项（见运行日志）" % len(issues))
             lines.extend("      · " + issue for issue in issues[:3])
         lines.append("")
     lines.append("📊 ══ 总计 ══")
-    lines.append("👥 共%d个账号，任务完成 %d/%d 项" % (len(summaries), total_done, total_tasks))
+    lines.append("👥 共%d个账号，桌面成长任务完成 %d/%d 项" % (len(summaries), total_done, total_tasks))
     all_rest = {}
     for sm in summaries:
         for r in (sm.get("rest") or []):
