@@ -1429,6 +1429,29 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
         if (await retryRejectedCaptcha(resp, verification, session, '1', '答题')) return await doRoeReward(session, wxid, cache, cacheKey, activityEntry);
         return { success: false };
     }
+    if (String(resp?.code) === '7005' && /微信小程序|重新启动/.test(String(resp.msg || resp.message || ''))) {
+        if (session._roeSessionRefresh) {
+            addTaskIssue(session, '答题业务会话重建后仍被拒绝，请在小程序手动完成');
+            return { success: false };
+        }
+        session._roeSessionRefresh = true;
+        session._roeCryptoRetry = true;
+        try {
+            const fresh = await refreshProtocolSession(wxid, cache, cacheKey, '服务端要求重新启动小程序，重建业务会话（限一次）');
+            if (!fresh) {
+                addTaskIssue(session, '答题业务会话重建未完成，请稍后重试');
+                return { success: false };
+            }
+            Object.assign(session, fresh);
+            // 旧会话的取图预算不能阻止新会话获取自己的验证码。
+            if (session.verificationAttempts) session.verificationAttempts['1'] = 0;
+            session.captchaRetryCount = 0;
+            return await doRoeReward(session, wxid, cache, cacheKey, activityEntry);
+        } catch (error) {
+            addTaskIssue(session, '答题业务会话重建失败，请稍后重试');
+            return { success: false };
+        }
+    }
     if (resp?.code === '7005' && !session._roeCryptoRetry) {
         session._roeCryptoRetry = true;
         log('  🔄 小程序返回7005，重新获取加密参数后重试一次');
@@ -1438,7 +1461,12 @@ async function doRoeReward(session, wxid, cache, cacheKey, activityEntry = null)
         session._roeSessionRefresh = true;
         try {
             const fresh = await refreshProtocolSession(wxid, cache, cacheKey, '新密钥仍被拒绝，同步小程序业务会话（限一次）');
-            if (fresh) { Object.assign(session, fresh); return await doRoeReward(session, wxid, cache, cacheKey, activityEntry); }
+            if (fresh) {
+                Object.assign(session, fresh);
+                if (session.verificationAttempts) session.verificationAttempts['1'] = 0;
+                session.captchaRetryCount = 0;
+                return await doRoeReward(session, wxid, cache, cacheKey, activityEntry);
+            }
         } catch (e) { log('  ⚠️ 小程序会话同步失败：' + e.message); }
     }
     if (String(resp?.code) === '200') {
