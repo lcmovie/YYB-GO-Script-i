@@ -77,6 +77,7 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 | 影视飓风 | `YSJF.js` |
 | 铛铛一下 | `DDYX.py` |
 | 海信爱家 | `hxaj.js` |
+| 即融AI福利中心 | `jrai.js` |
 
 ## 独立脚本
 
