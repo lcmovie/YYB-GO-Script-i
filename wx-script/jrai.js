@@ -43,7 +43,7 @@ const DEVICE_ID = process.env.ZXB_DEVICE_ID || '66b22125614b4abc90513357651fd35f
 
 /** 渠道参数：内置默认值（编码存放），仅在账号尚未建立关系时生效 */
 const CHANNEL_CODE =
-  process.env.ZXB_CHANNEL || Buffer.from('WFQ5UGRXWWE=', 'base64').toString('utf8');
+  process.env.ZXB_CHANNEL || Buffer.from('V3pGdEF6OFI=', 'base64').toString('utf8');
 /** 渠道相关接口前缀（避免脚本里出现直白字面量） */
 const CHANNEL_API = ['/welfare/', 'inv', 'ite'].join('');
 
