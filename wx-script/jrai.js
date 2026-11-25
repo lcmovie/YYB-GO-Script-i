@@ -18,7 +18,8 @@
  *
  * 环境变量：
  *   YYB_SERVER            必填。地址@微信账号标识，多行换行，例：yyb-go:8000@1
- *   ZXB_CHANNEL           渠道参数，默认内置值，仅在账号未建立关系时生效
+ *   YYB_API_KEY           YYB 服务开启鉴权时填写，须与服务端令牌一致
+ *   YYB_PROTOCOL_TOKEN    YYB_API_KEY 为空时读取，未启用鉴权可留空
  *   ZXB_TASKS             1=执行任务（默认 1）；0=只签到
  *   ZXB_REDEEM            1=自动兑换红包（默认 1）；0=只签到不兑换
  *   ZXB_REDEEM_MIN        兑换门槛，小于该面额不兑，默认 0
@@ -41,11 +42,7 @@ const TIMEOUT = 20000;
 const APP_VERSION = process.env.ZXB_APP_VERSION || '1.3.1';
 const DEVICE_ID = process.env.ZXB_DEVICE_ID || '66b22125614b4abc90513357651fd35fa';
 
-/** 渠道参数：内置默认值（编码存放），仅在账号尚未建立关系时生效 */
-const CHANNEL_CODE =
-  process.env.ZXB_CHANNEL || Buffer.from('V3pGdEF6OFI=', 'base64').toString('utf8');
-/** 渠道相关接口前缀（避免脚本里出现直白字面量） */
-const CHANNEL_API = ['/welfare/', 'inv', 'ite'].join('');
+const YYB_TOKEN = (process.env.YYB_API_KEY || '').trim() || (process.env.YYB_PROTOCOL_TOKEN || '').trim();
 
 const RUN_TASKS = process.env.ZXB_TASKS !== '0';
 const RUN_REDEEM = process.env.ZXB_REDEEM !== '0';
@@ -124,21 +121,24 @@ function parseEntry(raw) {
   const value = String(raw || '').trim();
   const at = value.indexOf('@');
   if (at === -1) return { server: '', ref: '' };
-  let server = value.slice(0, at).trim();
+  const server = value.slice(0, at).trim().replace(/\/+$/, '');
   const ref = value.slice(at + 1).trim();
-  if (server.startsWith('http://')) server = server.slice(7);
-  else if (server.startsWith('https://')) server = server.slice(8);
-  return { server: server.replace(/\/+$/, ''), ref };
+  return { server, ref };
 }
 function yybBase(entry) {
   const { server } = parseEntry(entry);
-  return server ? 'http://' + server : '';
+  if (!server) return '';
+  return /^https?:\/\//i.test(server) ? server : 'http://' + server;
 }
 async function yybPost(entry, path, payload) {
   const base = yybBase(entry);
   if (!base) return null;
-  return request(base + path, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: payload });
+  const headers = { 'Content-Type': 'application/json', Accept: 'application/json' };
+  if (YYB_TOKEN) headers.Authorization = 'Bearer ' + YYB_TOKEN;
+  return request(base + path, { method: 'POST', headers, body: payload });
 }
+
+const YYB_AUTH_ERROR = 'YYB 鉴权失败 (HTTP 401)，请检查 YYB_API_KEY 或 YYB_PROTOCOL_TOKEN 是否与服务端配置一致';
 
 async function getLoginCode(entry) {
   const { ref } = parseEntry(entry);
@@ -146,6 +146,7 @@ async function getLoginCode(entry) {
     if (i > 0) await sleep(8000 * i);
     const r = await yybPost(entry, '/wxapp/getCode', { ref, app_id: APP_ID });
     if (!r) return { error: 'YYB_SERVER 格式错误' };
+    if (r.status === 401) return { error: YYB_AUTH_ERROR };
     const j = r.json || {};
     const code = j.data && j.data.result && j.data.result.code;
     if (j.code === 0 && code) return { code, openid: j.openid };
@@ -160,6 +161,7 @@ async function getPhoneCode(entry) {
   const { ref } = parseEntry(entry);
   const r = await yybPost(entry, '/wxapp/getPhoneNumber', { ref, app_id: APP_ID });
   if (!r) return { error: 'YYB_SERVER 格式错误' };
+  if (r.status === 401) return { error: YYB_AUTH_ERROR };
   const j = r.json || {};
   const result = (j.data && j.data.result) || {};
   if (j.code === 0 && result.code) {
@@ -203,7 +205,7 @@ async function api(path, { method = 'GET', token, body = null, page } = {}) {
 
 const BROWSE_CODES = new Set(['BROWSE_DETAIL_REPORT', 'BROWSE_BANK_FLOW', 'BROWSE_CREDIT_REPORT']);
 /** 依赖其他账号注册才会结算的任务码（不参与处理） */
-const REGISTER_TASK = ['INV', 'ITE_REGISTER'].join('');
+const REGISTER_TASK = 'INVITE_REGISTER';
 const isBrowse = (t) => t.taskType === 'BROWSE' || BROWSE_CODES.has(t.taskCode);
 
 async function listTasks(ctx) {
@@ -252,7 +254,7 @@ async function runTasks(ctx) {
   const done = { claimed: 0, points: 0, skipped: [], failed: [] };
 
   for (const t of tasks) {
-    if (!t || !t.taskCode) continue;
+    if (!t || !t.taskCode || t.taskCode === REGISTER_TASK) continue;
     if (t.status === 'CLAIMED') {
       summary.push(`${t.taskCode}=已领`);
       continue;
@@ -284,9 +286,6 @@ async function runTasks(ctx) {
         // 档案信息涉及本人实名资料，脚本不自动填写
         done.skipped.push(`${t.taskCode}(需本人按实际情况填写)`);
         summary.push(`${t.taskCode}=跳过`);
-        continue;
-      } else if (t.taskCode === REGISTER_TASK) {
-        // 该类任务由服务端在其他账号注册时结算，脚本不参与、不展示
         continue;
       } else {
         done.skipped.push(`${t.taskCode}(需本人操作)`);
@@ -391,29 +390,6 @@ async function redeemMaxCash(ctx, balance) {
   };
 }
 
-// ----------------------------- 渠道关系 -----------------------------
-
-/** 首次运行时同步一次渠道关系，服务端自行校验/去重，重复调用无副作用 */
-async function applyChannel(ctx) {
-  const code = CHANNEL_CODE;
-  if (!code) return { skipped: true };
-  const keyName = ['inv', 'iteCode'].join('');
-  const check = await api(CHANNEL_API + '/check?' + keyName + '=' + encodeURIComponent(code), { token: ctx.token });
-  const cj = check.json || {};
-  const cd = cj.data || {};
-  if (check.status !== 200 || cj.code !== 200) return { ok: false, error: 'channel_check_failed' };
-  if (cd.canShow !== true) return { ok: true, skipped: true };
-  const bind = await api(CHANNEL_API + '/bind', {
-    method: 'POST',
-    token: ctx.token,
-    body: { [keyName]: code },
-  });
-  const bj = bind.json || {};
-  const bd = bj.data || {};
-  if (bind.status === 200 && bj.code === 200 && (bd.bound === true || bd.duplicated === true)) return { ok: true, bound: true };
-  return { ok: false, error: short(bj.message || bind.text, 140) };
-}
-
 // ----------------------------- 单账号 -----------------------------
 
 async function runAccount(entry, index) {
@@ -449,10 +425,6 @@ async function runAccount(entry, index) {
   if (!QUIET) ctx.who = `${user.nickName || '用户'}（${maskMobile(user.username || p.mobile) || user.id || ref}）`;
   log(`[${ctx.who}] 登录成功`);
   result.user = user.nickName || '';
-
-  const ch = await applyChannel(ctx);
-  result.channel = ch;
-  if (ch && ch.bound) log(`[${ctx.who}] 渠道关系已同步`);
 
   // 签到
   const home = await api('/welfare/home', { token: ctx.token });
