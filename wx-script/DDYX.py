@@ -17,6 +17,7 @@
   8. 品赞代理，业务请求优先代理，失败直连兜底
 
 环境变量：
+  YYB_PROTOCOL_TOKEN     可选，YYB 开启协议鉴权时填写，兼容 YYB_API_KEY
   YYB_SERVER             必填：wxcode服务地址，多地址换行填写
   PLUSPLUS_TOKEN    PushPlus token，可选
   PROXY_API         品赞代理提取 API，可选
@@ -327,17 +328,14 @@ def parse_yyb_go_entry(raw_value):
     server = server.strip()
     ref = ref.strip()
 
-    if server.startswith("http://"):
-        server = server[7:]
-    elif server.startswith("https://"):
-        server = server[8:]
-
     server = server.rstrip("/")
 
     if not server or not ref:
         print(f"❌ 配置错误：YYB_SERVER 缺少地址或微信账号标识，当前值：{raw_value}")
         return None, None
 
+    if not server.startswith(("http://", "https://")):
+        server = "http://" + server
     return server, ref
 
 def get_code(server: str) -> str | None:
@@ -345,13 +343,15 @@ def get_code(server: str) -> str | None:
     if not parsed_server or not ref:
         return None
 
-    url = f"http://{parsed_server}/wxapp/getCode"
+    url = f"{parsed_server}/wxapp/getCode"
+    token = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
     print(f"[{parsed_server}] 请求YYB Go获取code：{url}")
 
     try:
         res = requests.post(
             url,
             json={"ref": ref, "app_id": APPID},
+            headers={"Authorization": "Bearer " + token} if token else {},
             timeout=20,
             proxies={"http": None, "https": None},
         )

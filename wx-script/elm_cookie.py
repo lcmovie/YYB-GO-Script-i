@@ -12,6 +12,7 @@ cron: 15 6,20 * * *
 青龙环境变量：
   YYB_SERVER            必填，YYB-Go-Enhanced地址@微信账号标识，多账号每行一条
                         例：http://yyb-go:8000@1
+  YYB_PROTOCOL_TOKEN    可选，YYB 开启协议鉴权时填写，兼容 YYB_API_KEY
   elm_accounts_json     可选，显式账号数组，优先于 YYB_SERVER 行内的账号
                         例：[{"ref":"1"},{"ref":"2"}]
   elm_cookie_ENV_NAME   可选，Cookie 写入的变量名，默认 ELEME_COOKIE
@@ -276,8 +277,10 @@ def find_code(value):
 
 
 def get_code(account, yyb):
+    token = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
+    headers = {"Authorization": "Bearer " + token} if token else {}
     payload = yyb.request("POST", account["server"] + "/wxapp/getCode",
-                          {"ref": account["ref"], "app_id": APP_ID}, json_body=True)
+                          {"ref": account["ref"], "app_id": APP_ID}, headers=headers, json_body=True)
     if type(payload.get("code")) is not int or payload["code"] != 0:
         raise FlowError("YYB getCode 失败；若登录缓存过期，请在 YYB 重新扫码")
     code = find_code(payload.get("data"))

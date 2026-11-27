@@ -1,4 +1,5 @@
 // name: 影视飓风
+// YYB_PROTOCOL_TOKEN 可选，YYB 开启协议鉴权时填写，兼容 YYB_API_KEY。
 // cron: 40 6,18 * * *
 const axios = require("axios");
 const fs = require("fs");
@@ -22,18 +23,19 @@ function parseYybGoEntry(rawValue) {
     }
     let server = value.slice(0, atIndex).trim();
     const ref = value.slice(atIndex + 1).trim();
-    if (server.startsWith("http://")) server = server.slice(7);
-    else if (server.startsWith("https://")) server = server.slice(8);
     server = server.replace(/\/+$/, "");
     if (!server || !ref) return { server: "", ref: "" };
+    if (!/^https?:\/\//i.test(server)) server = "http://" + server;
     return { server, ref };
 }
 async function getCode(server) {
     const { server: parsedServer, ref } = parseYybGoEntry(server);
     if (!parsedServer || !ref) return null;
-    const url = "http://" + parsedServer + "/wxapp/getCode";
+    const url = parsedServer + "/wxapp/getCode";
+    const token = (process.env.YYB_API_KEY || "").trim() || (process.env.YYB_PROTOCOL_TOKEN || "").trim();
+    const headers = token ? { Authorization: "Bearer " + token } : {};
     try {
-        const { data } = await axios.post(url, { ref, app_id: MINI_APP_ID }, { timeout: 20000, proxy: false });
+        const { data } = await axios.post(url, { ref, app_id: MINI_APP_ID }, { headers, timeout: 20000, proxy: false });
         const code = data && data.data && data.data.result && data.data.result.code;
         if (!data || data.code !== 0 || !code) {
             console.log(parsedServer + " 获取code失败: " + JSON.stringify(data));

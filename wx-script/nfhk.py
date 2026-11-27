@@ -12,7 +12,7 @@ cron: 6 8 * * *
 青龙环境变量：
   YYB_SERVER           必填，YYB-Go-Enhanced地址@微信账号标识，多账号每行一条
                        例：yyb-go:8000@1
-  YYB_API_KEY          可选，对应 YYB_PROTOCOL_TOKEN，设置后带 Authorization 头
+  YYB_API_KEY          可选，也可填写 YYB_PROTOCOL_TOKEN，值为 YYB 服务端协议令牌
   NFHK_DRY_RUN         可选，=1 只查询不签到（建议首次这样试）
   NFHK_ENABLE_SIGN     可选，默认 1；=0 只查询不签到
   NFHK_ENABLE_AWARD    可选，默认 1；=0 关闭「自动领取待领奖品」
@@ -463,9 +463,9 @@ def yyb_get_code(host: str, ref: str) -> Tuple[str, str]:
     """YYB 取 wx.login code → (code, openid)。"""
     url = host.rstrip("/") + "/wxapp/getCode"
     headers = {"User-Agent": _CURRENT_UA, "Content-Type": "application/json"}
-    api_key = (os.getenv("YYB_API_KEY", "") or "").strip()
+    api_key = os.getenv("YYB_API_KEY", "").strip() or os.getenv("YYB_PROTOCOL_TOKEN", "").strip()
     if api_key:
-        headers["Authorization"] = api_key
+        headers["Authorization"] = api_key if api_key.startswith("Bearer ") else "Bearer " + api_key
     r = requests.post(url, json={"app_id": APP_NO, "ref": str(ref)}, headers=headers, timeout=TIMEOUT)
     dbg("YYB getCode", r.status_code, preview(r.text, 300))
     if r.status_code != 200:
