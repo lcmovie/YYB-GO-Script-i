@@ -10,7 +10,7 @@ cron: 35 9 * * *
 
 环境变量：
   YYB_SERVER     必填，格式：YYB-Go-Enhanced 地址@微信账号标识；多账号每行一条
-  YYB_API_KEY    可选，YYB 协议令牌
+  YYB_PROTOCOL_TOKEN / YYB_API_KEY    可选，二选一。YYB 开启取码鉴权时填写服务端令牌原文，未开启时留空。
   HL_DRY_RUN     可选，=1 时仅查询，不执行签到
   HL_ENABLE_SIGN 可选，默认 1；=0 时仅查询奖励金
 

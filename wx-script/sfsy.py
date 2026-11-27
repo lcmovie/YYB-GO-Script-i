@@ -15,6 +15,7 @@
    脚本自动拼接 /wxapp/getCode，请求 POST {server}/wxapp/getCode
 
 2. 可选变量：
+   YYB_PROTOCOL_TOKEN   YYB 开启取码鉴权时填写服务端令牌原文，兼容 YYB_API_KEY；未开启时留空。
    sf_wx_appid        顺丰小程序 appid（默认 wxd4185d00bf7e08ac）
    sf_proxy_api_url   品赞代理 API 地址，开启后每账号自动获取代理
    sf_auto_cookie     自动获取Cookie开关（默认 1）
